@@ -47,6 +47,12 @@ pub enum LinkMessageType {
     /// Periodic heartbeat for link liveness detection.
     /// No payload — the msg_type byte alone is sufficient.
     Heartbeat = 0x51,
+    /// Probe a candidate path to a peer under the existing session.
+    /// Payload is a [`PathMessage`].
+    PathProbe = 0x52,
+    /// Answer to a [`LinkMessageType::PathProbe`], sent back on the path
+    /// the probe arrived on. Payload is a [`PathMessage`].
+    PathAck = 0x53,
 }
 
 impl LinkMessageType {
@@ -62,6 +68,8 @@ impl LinkMessageType {
             0x31 => Some(LinkMessageType::LookupResponse),
             0x50 => Some(LinkMessageType::Disconnect),
             0x51 => Some(LinkMessageType::Heartbeat),
+            0x52 => Some(LinkMessageType::PathProbe),
+            0x53 => Some(LinkMessageType::PathAck),
             _ => None,
         }
     }
@@ -84,8 +92,78 @@ impl fmt::Display for LinkMessageType {
             LinkMessageType::LookupResponse => "LookupResponse",
             LinkMessageType::Disconnect => "Disconnect",
             LinkMessageType::Heartbeat => "Heartbeat",
+            LinkMessageType::PathProbe => "PathProbe",
+            LinkMessageType::PathAck => "PathAck",
         };
         write!(f, "{}", name)
+    }
+}
+
+// ============================================================================
+// Path Probe / Path Ack
+// ============================================================================
+
+/// Payload shared by `PathProbe` (0x52) and `PathAck` (0x53).
+///
+/// A probe is an ordinary encrypted frame under the current session, sent on
+/// a candidate transport. The receiver, having decrypted it against the
+/// session found by index, has proof the peer is reachable there: it adds
+/// the path and answers with an ack **on that same path**. The prober's
+/// receipt of the ack proves the reverse direction. One round trip, no
+/// handshake, no new key material, no index allocation.
+///
+/// ## Wire Format
+///
+/// | Offset | Field         | Size    | Notes                                   |
+/// |--------|---------------|---------|-----------------------------------------|
+/// | 0      | msg_type      | 1 byte  | 0x52 or 0x53                            |
+/// | 1      | probe_id      | 4 bytes | LE; the ack echoes the probe's          |
+/// | 5      | flags         | 1 byte  | bit 0: `remote_active`                  |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathMessage {
+    /// Per-path sequence chosen by the prober; the ack carries it back.
+    pub probe_id: u32,
+    /// "This path is where I currently send." Costs one bit and is a free
+    /// detection signal: a peer that stops sending here may have stopped
+    /// hearing us here too.
+    pub remote_active: bool,
+}
+
+impl PathMessage {
+    /// Encoded size including the msg_type byte.
+    pub const WIRE_SIZE: usize = 6;
+
+    const FLAG_REMOTE_ACTIVE: u8 = 0x01;
+
+    /// Encode as a `PathProbe` link message (msg_type included).
+    pub fn encode_probe(&self) -> [u8; Self::WIRE_SIZE] {
+        self.encode(LinkMessageType::PathProbe)
+    }
+
+    /// Encode as a `PathAck` link message (msg_type included).
+    pub fn encode_ack(&self) -> [u8; Self::WIRE_SIZE] {
+        self.encode(LinkMessageType::PathAck)
+    }
+
+    fn encode(&self, kind: LinkMessageType) -> [u8; Self::WIRE_SIZE] {
+        let mut out = [0u8; Self::WIRE_SIZE];
+        out[0] = kind.to_byte();
+        out[1..5].copy_from_slice(&self.probe_id.to_le_bytes());
+        if self.remote_active {
+            out[5] |= Self::FLAG_REMOTE_ACTIVE;
+        }
+        out
+    }
+
+    /// Decode from the link-layer payload (after the msg_type byte).
+    pub fn decode(payload: &[u8]) -> Result<Self, Error> {
+        let mut reader = crate::proto::codec::Reader::new(payload);
+        let probe_id = reader.read_u32_le()?;
+        let flags = reader.read_u8()?;
+        Ok(Self {
+            probe_id,
+            remote_active: flags & Self::FLAG_REMOTE_ACTIVE != 0,
+        })
     }
 }
 

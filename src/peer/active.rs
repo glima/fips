@@ -69,6 +69,36 @@ impl fmt::Display for ConnectivityState {
     }
 }
 
+/// Where a path is in its life. See `reference/fips-multi-path-switchover.md` §4, §7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathState {
+    /// Added, probe outstanding or never answered. Never eligible to carry
+    /// traffic: an unmeasured path is not assumed good.
+    Probing,
+    /// The peer has acknowledged a probe on this path: both directions work.
+    Live,
+    /// A hard signal (carrier, send error, failed ack) says the path may be
+    /// gone. Selection acts on this at once because the standby is warm.
+    Suspect,
+    /// Confirmed gone. Kept with its history so a returning transport does
+    /// not start from scratch.
+    Dead,
+}
+
+/// Probe bookkeeping for one path: what is outstanding, and when the next
+/// one may go.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProbeState {
+    /// The next `probe_id` to use. Per path, both directions.
+    next_id: u32,
+    /// `(probe_id, sent_at_ms)` of the probe awaiting its ack.
+    outstanding: Option<(u32, u64)>,
+    /// Probes sent since the last ack, for the backoff.
+    unanswered: u32,
+    /// Earliest monotonic ms at which another probe may be sent.
+    next_at_ms: u64,
+}
+
 /// One transport-level path to a peer.
 ///
 /// Path identity is the transport instance: one transport holds at most one
@@ -77,15 +107,26 @@ impl fmt::Display for ConnectivityState {
 /// the peer; a path carries only what is bound to the medium it runs over.
 /// See `reference/fips-multi-path-switchover.md` §1–2.
 ///
-/// Today a peer holds at most one path, added at promotion. The probe
-/// exchange that adds further paths under the existing session is the next
-/// step of that design; nothing here assumes a single path.
+/// The first path is added at promotion, proven by the handshake. Further
+/// ones are added by the probe exchange under the existing session (§4).
 #[derive(Debug)]
 pub struct PeerPath {
     /// The transport instance this path runs over.
     transport_id: TransportId,
     /// The peer's current address on that transport (roams).
     addr: TransportAddr,
+    state: PathState,
+    /// Monotonic ms of the last authentic frame heard on this path. Free:
+    /// any authentic frame proves the peer can reach us here.
+    rx_live_at_ms: Option<u64>,
+    /// Monotonic ms of the last ack proving the peer hears us here. Needs
+    /// the echo: hearing the peer is a hint, not proof our direction works.
+    tx_live_at_ms: Option<u64>,
+    /// The peer's last word on whether this is the path it sends on.
+    remote_active: bool,
+    /// Most recent probe round trip on this path, ms.
+    last_rtt_ms: Option<u64>,
+    probe: ProbeState,
 
     /// Unix UDP fast-path: per-path `connect()`-ed socket (paired with
     /// the listen socket via `SO_REUSEPORT`). The kernel demux prefers
@@ -105,10 +146,16 @@ pub struct PeerPath {
 }
 
 impl PeerPath {
-    fn new(transport_id: TransportId, addr: TransportAddr) -> Self {
+    fn new(transport_id: TransportId, addr: TransportAddr, state: PathState) -> Self {
         Self {
             transport_id,
             addr,
+            state,
+            rx_live_at_ms: None,
+            tx_live_at_ms: None,
+            remote_active: false,
+            last_rtt_ms: None,
+            probe: ProbeState::default(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             connected_udp: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -124,6 +171,44 @@ impl PeerPath {
     /// The peer's current address on this path.
     pub fn addr(&self) -> &TransportAddr {
         &self.addr
+    }
+
+    /// Where the path is in its life.
+    pub fn state(&self) -> PathState {
+        self.state
+    }
+
+    /// Monotonic ms of the last authentic frame heard on this path.
+    pub fn rx_live_at_ms(&self) -> Option<u64> {
+        self.rx_live_at_ms
+    }
+
+    /// Monotonic ms of the last ack proving the peer hears us here.
+    pub fn tx_live_at_ms(&self) -> Option<u64> {
+        self.tx_live_at_ms
+    }
+
+    /// Whether the peer last said it sends on this path.
+    pub fn remote_active(&self) -> bool {
+        self.remote_active
+    }
+
+    /// Most recent probe round trip on this path, ms.
+    pub fn last_rtt_ms(&self) -> Option<u64> {
+        self.last_rtt_ms
+    }
+
+    /// Whether a probe may be sent now, per the backoff.
+    pub fn probe_due(&self, now_ms: u64) -> bool {
+        now_ms >= self.probe.next_at_ms
+    }
+
+    /// Reset the probe backoff so the next tick may probe at once. Called
+    /// when the transport's presence cycles: the medium has changed, so what
+    /// went unanswered before says nothing about now.
+    pub fn reset_probe_backoff(&mut self) {
+        self.probe.unanswered = 0;
+        self.probe.next_at_ms = 0;
     }
 
     /// Drop the connected socket and its drain. The drain goes first so
@@ -431,7 +516,11 @@ impl ActivePeer {
         send.noise_session = Some(noise_session);
         send.our_index = Some(our_index);
         send.their_index = Some(their_index);
-        send.paths.push(PeerPath::new(transport_id, current_addr));
+        let mut path = PeerPath::new(transport_id, current_addr, PathState::Live);
+        let now_ms = crate::time::mono_ms();
+        path.rx_live_at_ms = Some(now_ms);
+        path.tx_live_at_ms = Some(now_ms);
+        send.paths.push(path);
         send.active = Some(0);
         send.link_stats = link_stats;
         send.mmp = Some(MmpPeerState::new(
@@ -737,10 +826,141 @@ impl ActivePeer {
             path.transport_id = transport_id;
             path.addr = addr;
         } else {
-            self.send.paths.push(PeerPath::new(transport_id, addr));
+            self.send
+                .paths
+                .push(PeerPath::new(transport_id, addr, PathState::Live));
             self.send.active = Some(0);
         }
         true
+    }
+
+    // === Path set ===
+
+    /// The path on `transport_id`, if the peer has one.
+    pub fn path_on(&self, transport_id: TransportId) -> Option<&PeerPath> {
+        self.send
+            .paths
+            .iter()
+            .find(|path| path.transport_id == transport_id)
+    }
+
+    fn path_on_mut(&mut self, transport_id: TransportId) -> Option<&mut PeerPath> {
+        self.send
+            .paths
+            .iter_mut()
+            .find(|path| path.transport_id == transport_id)
+    }
+
+    /// Add a `Probing` path on `transport_id` at `addr`, or return the one
+    /// already there. The only way a path is created after promotion: both
+    /// ends of the probe exchange call this, the prober before it sends and
+    /// the receiver when a probe arrives.
+    pub fn add_path(&mut self, transport_id: TransportId, addr: TransportAddr) -> &mut PeerPath {
+        let idx = match self
+            .send
+            .paths
+            .iter()
+            .position(|path| path.transport_id == transport_id)
+        {
+            Some(idx) => idx,
+            None => {
+                self.send
+                    .paths
+                    .push(PeerPath::new(transport_id, addr, PathState::Probing));
+                self.send.paths.len() - 1
+            }
+        };
+        &mut self.send.paths[idx]
+    }
+
+    /// An authentic frame arrived on `transport_id`: the path there, if any,
+    /// is `rx_live` as of `now_ms`.
+    pub fn note_path_rx(&mut self, transport_id: TransportId, now_ms: u64) {
+        if let Some(path) = self.path_on_mut(transport_id) {
+            path.rx_live_at_ms = Some(now_ms);
+        }
+    }
+
+    /// Take the next probe to send on `transport_id`: its `probe_id`, and
+    /// whether the path is the one we send on. Records it as outstanding and
+    /// advances the backoff; `None` if the peer has no path there or the
+    /// backoff has not expired. `backoff_cap_ms` bounds the retry interval,
+    /// which doubles from `base_ms` per unanswered probe.
+    pub fn take_probe(
+        &mut self,
+        transport_id: TransportId,
+        now_ms: u64,
+        base_ms: u64,
+        backoff_cap_ms: u64,
+    ) -> Option<(u32, bool)> {
+        let active = self.transport_id() == Some(transport_id);
+        let path = self.path_on_mut(transport_id)?;
+        if !path.probe_due(now_ms) {
+            return None;
+        }
+        let id = path.probe.next_id;
+        path.probe.next_id = path.probe.next_id.wrapping_add(1);
+        path.probe.outstanding = Some((id, now_ms));
+        let shift = path.probe.unanswered.min(16);
+        let delay = base_ms.saturating_mul(1u64 << shift).min(backoff_cap_ms);
+        path.probe.next_at_ms = now_ms.saturating_add(delay.max(1));
+        path.probe.unanswered = path.probe.unanswered.saturating_add(1);
+        Some((id, active))
+    }
+
+    /// A `PathProbe` arrived on `transport_id` from `addr`. Adds the path if
+    /// it is new, roams its address if not, marks it `rx_live` and records
+    /// what the peer said about sending here.
+    pub fn note_path_probe(
+        &mut self,
+        transport_id: TransportId,
+        addr: TransportAddr,
+        remote_active: bool,
+        now_ms: u64,
+    ) {
+        let path = self.add_path(transport_id, addr.clone());
+        if path.addr != addr {
+            path.addr = addr;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            path.clear_connected_udp();
+        }
+        path.rx_live_at_ms = Some(now_ms);
+        path.remote_active = remote_active;
+    }
+
+    /// A `PathAck` arrived on `transport_id`. If it answers the outstanding
+    /// probe, the path is `tx_live` and `Live`, the backoff is cleared and
+    /// the round trip is sampled. Returns the RTT sample in ms, or `None`
+    /// if the ack matched nothing (a stale or duplicate ack is ignored).
+    pub fn note_path_ack(
+        &mut self,
+        transport_id: TransportId,
+        probe_id: u32,
+        remote_active: bool,
+        now_ms: u64,
+    ) -> Option<u64> {
+        let path = self.path_on_mut(transport_id)?;
+        let (outstanding_id, sent_at_ms) = path.probe.outstanding?;
+        if outstanding_id != probe_id {
+            return None;
+        }
+        path.probe.outstanding = None;
+        path.probe.unanswered = 0;
+        path.probe.next_at_ms = 0;
+        let rtt_ms = now_ms.saturating_sub(sent_at_ms);
+        path.last_rtt_ms = Some(rtt_ms);
+        path.rx_live_at_ms = Some(now_ms);
+        path.tx_live_at_ms = Some(now_ms);
+        path.remote_active = remote_active;
+        path.state = PathState::Live;
+        Some(rtt_ms)
+    }
+
+    /// Clear the probe backoff on every path over `transport_id`.
+    pub fn reset_probe_backoff_on(&mut self, transport_id: TransportId) {
+        if let Some(path) = self.path_on_mut(transport_id) {
+            path.reset_probe_backoff();
+        }
     }
 
     // === Handshake Resend ===

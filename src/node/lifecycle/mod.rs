@@ -779,6 +779,10 @@ impl Node {
         // dataplane maps are unmutated, so the core's per-peer cap sees a stable
         // in-flight count — the same guarantee the old collect-then-dial had.
         let mut transport_neighbors: Vec<Candidate> = Vec::new();
+        // Live peers beaconing on a transport we hold no path to them over.
+        // Probed after the loop: the probe sends, and the loop borrows the
+        // transport table.
+        let mut path_candidates: Vec<(NodeAddr, TransportId, TransportAddr)> = Vec::new();
         for (transport_id, transport) in &self.transports {
             if !transport.is_operational() {
                 continue;
@@ -840,6 +844,12 @@ impl Node {
                     // again. What is given up is switching away from a link
                     // that is working, which is not a thing worth doing.
                     if self.active_peer_link_is_live(&node_addr) {
+                        // A live peer beaconing on a transport we hold no
+                        // path to it over is a path to add, not a link to
+                        // replace: probe it under the existing session
+                        // instead of dialling. The prober-side backoff is
+                        // inside `maybe_probe_path`.
+                        path_candidates.push((node_addr, candidate_transport_id, remote_addr));
                         continue;
                     }
                     if self.is_connecting_to_peer_on_path(
@@ -865,6 +875,11 @@ impl Node {
                     active_refresh: connected,
                 });
             }
+        }
+
+        for (node_addr, transport_id, remote_addr) in path_candidates {
+            self.maybe_probe_path(node_addr, transport_id, remote_addr)
+                .await;
         }
 
         if transport_neighbors.is_empty() {

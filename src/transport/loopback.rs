@@ -50,6 +50,9 @@ pub struct LoopbackTransport {
     mtu: u16,
     /// Shared address-to-receiver registry.
     registry: LoopbackRegistry,
+    /// Beacons a test has queued for the next `discover()` drain, standing
+    /// in for the transport-neighbor beacons a real transport hears.
+    discovered: Mutex<Vec<DiscoveredPeer>>,
 }
 
 impl LoopbackTransport {
@@ -75,7 +78,16 @@ impl LoopbackTransport {
             my_addr,
             mtu,
             registry,
+            discovered: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Queue a beacon for the next `discover()` drain, as if this transport
+    /// had heard `addr` announce `pubkey_hint`.
+    pub fn inject_discovered(&self, addr: TransportAddr, pubkey_hint: secp256k1::XOnlyPublicKey) {
+        let mut peer = DiscoveredPeer::new(self.transport_id, addr);
+        peer.pubkey_hint = Some(pubkey_hint);
+        self.discovered.lock().unwrap().push(peer);
     }
 
     /// This transport's synthetic loopback address.
@@ -169,6 +181,11 @@ impl Transport for LoopbackTransport {
     }
 
     fn discover(&self) -> Result<Vec<DiscoveredPeer>, TransportError> {
-        Ok(Vec::new())
+        Ok(std::mem::take(&mut *self.discovered.lock().unwrap()))
+    }
+
+    /// Beacons a test injects are meant to be acted on.
+    fn auto_connect(&self) -> bool {
+        true
     }
 }

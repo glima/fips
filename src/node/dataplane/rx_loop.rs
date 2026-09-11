@@ -410,7 +410,12 @@ impl Node {
                         // Not policy-filtered: whether an interface's absence
                         // is normal is a statement about node *health*, not
                         // about whether the routes over it still work.
-                        if !edge.present {
+                        if edge.present {
+                            // The medium came back: whatever went unanswered
+                            // on it before says nothing about now, so the
+                            // next discovery tick may probe it at once.
+                            self.reset_probe_backoff_on_transport(edge.transport_id);
+                        } else {
                             let reaped =
                                 self.reap_peers_on_transport(edge.transport_id).await;
                             if reaped > 0 {

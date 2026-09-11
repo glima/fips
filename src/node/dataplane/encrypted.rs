@@ -277,6 +277,7 @@ impl Node {
             }
             address_changed =
                 peer.set_current_addr(packet.transport_id, packet.remote_addr.clone());
+            peer.note_path_rx(packet.transport_id, now_ms);
             peer.link_stats_mut()
                 .record_recv(packet.data.len(), packet.timestamp_ms);
             peer.touch(packet.timestamp_ms);
@@ -298,8 +299,13 @@ impl Node {
         let _ = address_changed;
 
         // Dispatch to link message handler
-        self.dispatch_link_message(&node_addr, link_message, ce_flag)
-            .await;
+        self.dispatch_link_message(
+            &node_addr,
+            link_message,
+            ce_flag,
+            (packet.transport_id, &packet.remote_addr),
+        )
+        .await;
     }
 
     /// Log a decryption failure with replay suppression.
@@ -377,6 +383,7 @@ impl Node {
         if let Some(peer) = self.peers.get_mut(node_addr) {
             peer.reset_decrypt_failures();
             address_changed = peer.set_current_addr(transport_id, remote_addr.clone());
+            peer.note_path_rx(transport_id, now_ms);
             peer.link_stats_mut()
                 .record_recv(packet_len, packet_timestamp_ms);
             peer.touch(packet_timestamp_ms);
@@ -398,8 +405,13 @@ impl Node {
             let _ = address_changed;
         }
         let link_message = &fmp_plaintext[INNER_TIMESTAMP_LEN..];
-        self.dispatch_link_message(node_addr, link_message, ce_flag)
-            .await;
+        self.dispatch_link_message(
+            node_addr,
+            link_message,
+            ce_flag,
+            (transport_id, remote_addr),
+        )
+        .await;
     }
 
     /// Process a decrypt-worker bounce (FMP plaintext only — the

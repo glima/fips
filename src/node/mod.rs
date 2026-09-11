@@ -3675,6 +3675,41 @@ impl Node {
         plaintext: &[u8],
         ce_flag: bool,
     ) -> Result<(), NodeError> {
+        self.send_encrypted_link_message_via(node_addr, plaintext, ce_flag, None)
+            .await
+    }
+
+    /// Like `send_encrypted_link_message` but on a chosen path rather than
+    /// the peer's active one.
+    ///
+    /// The path probe exchange uses this to reach a peer over a transport it
+    /// is not (yet) sending on. Same session, same counter, same key: only
+    /// the transport and address differ.
+    pub(super) async fn send_encrypted_link_message_on_path(
+        &mut self,
+        node_addr: &NodeAddr,
+        plaintext: &[u8],
+        transport_id: TransportId,
+        remote_addr: TransportAddr,
+    ) -> Result<(), NodeError> {
+        self.send_encrypted_link_message_via(
+            node_addr,
+            plaintext,
+            false,
+            Some((transport_id, remote_addr)),
+        )
+        .await
+    }
+
+    /// The one send path for encrypted link messages. `via` picks the
+    /// transport and address; `None` means the peer's active path.
+    async fn send_encrypted_link_message_via(
+        &mut self,
+        node_addr: &NodeAddr,
+        plaintext: &[u8],
+        ce_flag: bool,
+        via: Option<(TransportId, TransportAddr)>,
+    ) -> Result<(), NodeError> {
         let peer = self
             .peers
             .get_mut(node_addr)
@@ -3684,17 +3719,24 @@ impl Node {
             node_addr: *node_addr,
             reason: "no their_index".into(),
         })?;
-        let transport_id = peer.transport_id().ok_or_else(|| NodeError::SendFailed {
-            node_addr: *node_addr,
-            reason: "no transport_id".into(),
-        })?;
-        let remote_addr = peer
-            .current_addr()
-            .cloned()
-            .ok_or_else(|| NodeError::SendFailed {
-                node_addr: *node_addr,
-                reason: "no current_addr".into(),
-            })?;
+        let on_active_path = via.is_none();
+        let (transport_id, remote_addr) = match via {
+            Some(target) => target,
+            None => {
+                let transport_id = peer.transport_id().ok_or_else(|| NodeError::SendFailed {
+                    node_addr: *node_addr,
+                    reason: "no transport_id".into(),
+                })?;
+                let remote_addr =
+                    peer.current_addr()
+                        .cloned()
+                        .ok_or_else(|| NodeError::SendFailed {
+                            node_addr: *node_addr,
+                            reason: "no current_addr".into(),
+                        })?;
+                (transport_id, remote_addr)
+            }
+        };
 
         // Prepend 4-byte session-relative timestamp (inner header)
         let timestamp_ms = peer.session_elapsed_ms();
@@ -3712,8 +3754,16 @@ impl Node {
         // Snapshot the per-peer connect()-ed UDP socket BEFORE the
         // session borrow so the encrypt-worker dispatch can refcount-
         // clone the Arc without re-borrowing self.peers later.
+        // The connected socket is pinned to the active path's 5-tuple, so a
+        // send on any other path must go through the listen socket.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let connected_socket = peer.connected_udp();
+        let connected_socket = if on_active_path {
+            peer.connected_udp()
+        } else {
+            None
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = on_active_path;
 
         let session = peer
             .noise_session_mut()
