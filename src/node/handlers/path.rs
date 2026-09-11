@@ -15,9 +15,10 @@
 
 use crate::NodeAddr;
 use crate::node::Node;
+use crate::peer::PathWithdrawal;
 use crate::proto::link::PathMessage;
 use crate::transport::{TransportAddr, TransportId};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 impl Node {
     /// Probe `transport_id`/`remote_addr` as a path to a live peer, if the
@@ -200,6 +201,127 @@ impl Node {
                 "Path ack matched no outstanding probe"
             ),
         }
+    }
+
+    /// A transport's presence went away: withdraw the path every peer held
+    /// over it. Returns how many peers were reaped for want of another path.
+    ///
+    /// For each peer: the path goes `Dead` with its history kept. If it was
+    /// a standby, nothing else happens. If it was the active path and an
+    /// eligible standby exists, traffic moves there now, under the same
+    /// session, and the switch side effects run
+    /// ([`apply_path_switch`](Self::apply_path_switch)). Only a peer with
+    /// no eligible path left is reaped, through the same routed link-dead
+    /// teardown the liveness reaper uses.
+    ///
+    /// The peer machine sees nothing while any path remains: a switch is
+    /// not a link event. Deliberately undamped, like the reap it grew from.
+    pub(in crate::node) async fn withdraw_transport(&mut self, transport_id: TransportId) -> usize {
+        let now_ms = crate::time::mono_ms();
+        let affected: Vec<NodeAddr> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.path_on(transport_id).is_some())
+            .map(|(node_addr, _)| *node_addr)
+            .collect();
+        if affected.is_empty() {
+            return 0;
+        }
+
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let mut reaped = 0;
+        for node_addr in affected {
+            let outcome = match self.peers.get_mut(&node_addr) {
+                Some(peer) => peer.withdraw_path(transport_id, now_ms),
+                None => continue,
+            };
+            match outcome {
+                PathWithdrawal::NoPath => {}
+                PathWithdrawal::Standby => debug!(
+                    peer = %self.peer_display_name(&node_addr),
+                    %transport_id,
+                    "Standby path withdrawn: its interface went away"
+                ),
+                PathWithdrawal::Switched { from, to } => {
+                    info!(
+                        peer = %self.peer_display_name(&node_addr),
+                        from_transport = %from.0,
+                        to_transport = %to.0,
+                        to_addr = %to.1,
+                        "Active path withdrawn: traffic moved to the standby, session kept"
+                    );
+                    self.apply_path_switch(&node_addr, to);
+                }
+                PathWithdrawal::NoAlternative => {
+                    self.reap_peer_without_path(node_addr, transport_id, wall_ms)
+                        .await;
+                    reaped += 1;
+                }
+            }
+        }
+        reaped
+    }
+
+    /// Everything that follows the peer's active path changing to `to`.
+    ///
+    /// A switch is also an MTU change, and three things size traffic from
+    /// the peer's transport without re-running on their own
+    /// (`reference/fips-multi-path-switchover.md` §5):
+    ///
+    /// - the peer's `path_mtu_lookup` seed, which only ever tightens within
+    ///   a link and would leave one cable→BLE excursion clamping every new
+    ///   flow to this peer at the BLE MTU after fail-back; its relinked
+    ///   branch is the hook, so re-seed from the new path;
+    /// - the per-session source MTU, which tightens on the next send anyway
+    ///   but only loosens after tens of seconds; tighten it now for every
+    ///   session this peer is the next hop of, so the TUN gate answers with
+    ///   PTB instead of losing the first packet per flow at the transport;
+    /// - the node-wide MSS ceiling.
+    ///
+    /// The link record follows the traffic so everything that reports the
+    /// peer's transport and address by link stays truthful; the control
+    /// machine is keyed on the link and is untouched.
+    pub(in crate::node) fn apply_path_switch(
+        &mut self,
+        node_addr: &NodeAddr,
+        to: (TransportId, TransportAddr),
+    ) {
+        let (transport_id, addr) = to;
+        if let Some(link_id) = self.peers.get(node_addr).map(|p| p.link_id())
+            && let Some(link) = self.links.get_mut(&link_id)
+        {
+            self.addr_to_link.retain(|_, mapped| *mapped != link_id);
+            link.rebind(transport_id, addr.clone());
+            self.addr_to_link
+                .insert((transport_id, addr.clone()), link_id);
+        }
+
+        self.seed_path_mtu_for_link_peer(node_addr, transport_id, &addr);
+
+        let link_mtu = self
+            .transports
+            .get(&transport_id)
+            .map(|t| t.link_mtu(&addr));
+        if let Some(link_mtu) = link_mtu {
+            let dests: Vec<NodeAddr> = self.sessions.keys().copied().collect();
+            for dest in dests {
+                let via_peer = self
+                    .find_next_hop(&dest)
+                    .is_some_and(|hop| hop.node_addr() == node_addr);
+                if !via_peer {
+                    continue;
+                }
+                if let Some(mmp) = self.sessions.get_mut(&dest).and_then(|s| s.mmp_mut()) {
+                    mmp.path_mtu.seed_source_mtu(link_mtu);
+                }
+            }
+        }
+
+        self.refresh_tun_mss_ceiling();
     }
 
     /// A transport's presence came back: clear the probe backoff on every

@@ -558,10 +558,10 @@ impl Node {
         node_addr: &crate::NodeAddr,
         transport_id: crate::transport::TransportId,
     ) {
-        let on_path = self.peers.get(node_addr).is_some_and(|peer| {
-            peer.transport_id()
-                .is_none_or(|bound| bound == transport_id)
-        });
+        let on_path = self
+            .peers
+            .get(node_addr)
+            .is_some_and(|peer| peer.paths().is_empty() || peer.path_on(transport_id).is_some());
         if !on_path {
             trace!(
                 peer = %self.peer_display_name(node_addr),

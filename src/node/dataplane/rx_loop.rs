@@ -417,7 +417,7 @@ impl Node {
                             self.reset_probe_backoff_on_transport(edge.transport_id);
                         } else {
                             let reaped =
-                                self.reap_peers_on_transport(edge.transport_id).await;
+                                self.withdraw_transport(edge.transport_id).await;
                             if reaped > 0 {
                                 info!(
                                     transport_id = %edge.transport_id,

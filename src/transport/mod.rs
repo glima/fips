@@ -564,6 +564,15 @@ impl Link {
         link
     }
 
+    /// Point the link at another transport and address.
+    ///
+    /// A peer whose active path switched keeps its link (the control machine
+    /// is keyed on it); the record follows the traffic.
+    pub fn rebind(&mut self, transport_id: TransportId, remote_addr: TransportAddr) {
+        self.transport_id = transport_id;
+        self.remote_addr = remote_addr;
+    }
+
     /// Get the link ID.
     pub fn link_id(&self) -> LinkId {
         self.link_id

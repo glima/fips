@@ -506,3 +506,223 @@ async fn the_active_path_is_not_probed() {
         "the handshake proved the active path"
     );
 }
+
+// ============================================================================
+// Presence loss withdraws a path (design §5–6)
+// ============================================================================
+
+/// A dual-homed pair with the wifi path `Live` at both ends: each side has
+/// probed the other and heard the ack.
+async fn pair_with_wifi_live() -> (Vec<TestNode>, TransportAddr, TransportAddr) {
+    let (mut nodes, wifi_0, wifi_1) = dual_homed_pair().await;
+    let addr_0 = *nodes[0].node.node_addr();
+    let addr_1 = *nodes[1].node.node_addr();
+    nodes[1]
+        .node
+        .maybe_probe_path(addr_0, wifi(), wifi_0.clone())
+        .await;
+    nodes[0]
+        .node
+        .maybe_probe_path(addr_1, wifi(), wifi_1.clone())
+        .await;
+    for _ in 0..4 {
+        if process_available_packets(&mut nodes).await == 0 {
+            break;
+        }
+    }
+    for (node, peer) in [(&nodes[0], addr_1), (&nodes[1], addr_0)] {
+        let path = node.node.get_peer(&peer).unwrap().path_on(wifi()).unwrap();
+        assert_eq!(path.state(), PathState::Live, "precondition");
+        assert!(path.tx_live_at_ms().is_some(), "precondition");
+    }
+    (nodes, wifi_0, wifi_1)
+}
+
+#[tokio::test]
+async fn losing_the_active_transport_moves_traffic_to_the_live_standby() {
+    let (mut nodes, wifi_0, _wifi_1) = pair_with_wifi_live().await;
+    let addr_0 = *nodes[0].node.node_addr();
+    let cable = nodes[1].transport_id;
+
+    let reaped = nodes[1].node.withdraw_transport(cable).await;
+    assert_eq!(reaped, 0, "a peer with a live standby is not reaped");
+
+    let peer = nodes[1].node.get_peer(&addr_0).expect("peer survives");
+    assert_eq!(peer.transport_id(), Some(wifi()), "traffic moved");
+    assert_eq!(peer.current_addr(), Some(&wifi_0));
+    assert_eq!(peer.path_on(cable).unwrap().state(), PathState::Dead);
+    assert_eq!(peer.paths().len(), 2, "the dead path keeps its history");
+
+    // The link record follows the traffic.
+    let link = nodes[1].node.get_link(&peer.link_id()).expect("link kept");
+    assert_eq!(link.transport_id(), wifi());
+    assert_eq!(link.remote_addr(), &wifi_0);
+    assert!(
+        nodes[1]
+            .node
+            .addr_to_link
+            .contains_key(&(wifi(), wifi_0.clone()))
+    );
+
+    // The path MTU seed now describes the wifi.
+    let seeded_by = nodes[1]
+        .node
+        .path_mtu_seeded_by
+        .read()
+        .unwrap()
+        .get(&crate::FipsAddress::from_node_addr(&addr_0))
+        .copied();
+    assert_eq!(seeded_by, Some(wifi()));
+
+    // The same session carries on: a frame sent now goes out on the wifi
+    // and decrypts at the far end, which never saw a switch.
+    let before = nodes[0].packet_rx.len();
+    nodes[1]
+        .node
+        .send_encrypted_link_message(&addr_0, &[0x51])
+        .await
+        .expect("send over the standby");
+    assert_eq!(nodes[0].packet_rx.len(), before + 1);
+    let packet = nodes[0].packet_rx.try_recv().unwrap();
+    assert_eq!(packet.transport_id, wifi());
+    nodes[0].node.handle_encrypted_frame(packet).await;
+    let far = nodes[0]
+        .node
+        .get_peer(nodes[1].node.node_addr())
+        .expect("no re-peering");
+    assert_eq!(far.consecutive_decrypt_failures(), 0);
+    assert_eq!(far.transport_id(), Some(cable), "the far end did not move");
+}
+
+#[tokio::test]
+async fn losing_the_active_transport_with_only_a_probing_standby_reaps() {
+    let (mut nodes, wifi_0, _wifi_1) = dual_homed_pair().await;
+    let addr_0 = *nodes[0].node.node_addr();
+    let cable = nodes[1].transport_id;
+
+    // Probe sent, ack never processed: the wifi path is unproven.
+    nodes[1]
+        .node
+        .maybe_probe_path(addr_0, wifi(), wifi_0.clone())
+        .await;
+    assert_eq!(
+        nodes[1]
+            .node
+            .get_peer(&addr_0)
+            .unwrap()
+            .path_on(wifi())
+            .unwrap()
+            .state(),
+        PathState::Probing
+    );
+
+    let reaped = nodes[1].node.withdraw_transport(cable).await;
+    assert_eq!(reaped, 1, "an unproven path is not a path to switch to");
+    assert!(nodes[1].node.get_peer(&addr_0).is_none());
+}
+
+#[tokio::test]
+async fn losing_a_standby_leaves_traffic_where_it_is() {
+    let (mut nodes, _wifi_0, _wifi_1) = pair_with_wifi_live().await;
+    let addr_0 = *nodes[0].node.node_addr();
+    let cable = nodes[1].transport_id;
+
+    let reaped = nodes[1].node.withdraw_transport(wifi()).await;
+    assert_eq!(reaped, 0);
+    let peer = nodes[1].node.get_peer(&addr_0).unwrap();
+    assert_eq!(peer.transport_id(), Some(cable));
+    let dead = peer.path_on(wifi()).unwrap();
+    assert_eq!(dead.state(), PathState::Dead);
+    assert!(dead.last_rtt_ms().is_some(), "history kept");
+    assert!(!dead.is_eligible());
+}
+
+#[tokio::test]
+async fn a_dead_path_is_reprobed_when_its_transport_returns_and_forgotten_after_the_grace() {
+    let (mut nodes, wifi_0, _wifi_1) = pair_with_wifi_live().await;
+    let addr_0 = *nodes[0].node.node_addr();
+
+    nodes[1].node.withdraw_transport(wifi()).await;
+
+    // Presence returns: the next discovery tick probes it again, and the
+    // ack brings it back Live with its history.
+    nodes[1].node.reset_probe_backoff_on_transport(wifi());
+    nodes[1]
+        .node
+        .maybe_probe_path(addr_0, wifi(), wifi_0.clone())
+        .await;
+    assert_eq!(process_available_packets(&mut nodes).await, 1);
+    assert_eq!(process_available_packets(&mut nodes).await, 1);
+    assert_eq!(
+        nodes[1]
+            .node
+            .get_peer(&addr_0)
+            .unwrap()
+            .path_on(wifi())
+            .unwrap()
+            .state(),
+        PathState::Live
+    );
+
+    // Dead again, and this time the grace expires.
+    nodes[1].node.withdraw_transport(wifi()).await;
+    let now = crate::time::mono_ms();
+    let peer = nodes[1].node.get_peer_mut(&addr_0).unwrap();
+    peer.prune_dead_paths(now, 60_000);
+    assert!(
+        peer.path_on(wifi()).is_some(),
+        "inside the grace, history kept"
+    );
+    peer.prune_dead_paths(now + 60_001, 60_000);
+    assert!(
+        peer.path_on(wifi()).is_none(),
+        "past the grace, a fresh path"
+    );
+    assert_eq!(peer.paths().len(), 1);
+    assert_eq!(peer.transport_id(), Some(nodes[1].transport_id));
+}
+
+#[tokio::test]
+async fn a_rekey_msg1_on_a_standby_path_is_recognised_as_the_established_peer() {
+    let (nodes, wifi_0, _wifi_1) = pair_with_wifi_live().await;
+    assert!(
+        nodes[1].node.is_established_link_msg1(wifi(), &wifi_0),
+        "the peer sends its rekey on the path *it* uses, which may be our standby"
+    );
+    assert!(
+        !nodes[1]
+            .node
+            .is_established_link_msg1(wifi(), &TransportAddr::from_string("loopback:none"))
+    );
+}
+
+#[tokio::test]
+async fn garbage_on_a_standby_path_counts_against_the_peer() {
+    let (mut nodes, _wifi_0, wifi_1) = pair_with_wifi_live().await;
+    let addr_1 = *nodes[1].node.node_addr();
+    let our_index = nodes[0]
+        .node
+        .get_peer(&addr_1)
+        .unwrap()
+        .our_index()
+        .unwrap();
+    for counter in 0..3u64 {
+        nodes[0]
+            .node
+            .handle_encrypted_frame(ReceivedPacket::new(
+                wifi(),
+                wifi_1.clone(),
+                garbage_frame(our_index, counter),
+            ))
+            .await;
+    }
+    assert_eq!(
+        nodes[0]
+            .node
+            .get_peer(&addr_1)
+            .unwrap()
+            .consecutive_decrypt_failures(),
+        3,
+        "a path in the set is a transport the peer is on"
+    );
+}

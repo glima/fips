@@ -99,6 +99,23 @@ struct ProbeState {
     next_at_ms: u64,
 }
 
+/// What withdrawing a path did to the peer's send side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathWithdrawal {
+    /// The peer had no path on that transport.
+    NoPath,
+    /// A standby went `Dead`; traffic was never on it.
+    Standby,
+    /// The active path went `Dead` and an eligible path took over.
+    Switched {
+        from: (TransportId, TransportAddr),
+        to: (TransportId, TransportAddr),
+    },
+    /// The active path went `Dead` and nothing eligible remains: the peer
+    /// is unreachable and the caller reaps it.
+    NoAlternative,
+}
+
 /// One transport-level path to a peer.
 ///
 /// Path identity is the transport instance: one transport holds at most one
@@ -126,6 +143,8 @@ pub struct PeerPath {
     remote_active: bool,
     /// Most recent probe round trip on this path, ms.
     last_rtt_ms: Option<u64>,
+    /// When the path went `Dead`, for the history grace period.
+    dead_since_ms: Option<u64>,
     probe: ProbeState,
 
     /// Unix UDP fast-path: per-path `connect()`-ed socket (paired with
@@ -155,6 +174,7 @@ impl PeerPath {
             tx_live_at_ms: None,
             remote_active: false,
             last_rtt_ms: None,
+            dead_since_ms: None,
             probe: ProbeState::default(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             connected_udp: None,
@@ -196,6 +216,12 @@ impl PeerPath {
     /// Most recent probe round trip on this path, ms.
     pub fn last_rtt_ms(&self) -> Option<u64> {
         self.last_rtt_ms
+    }
+
+    /// Whether the path may carry our traffic: `Live`, and the peer has
+    /// acknowledged hearing us on it.
+    pub fn is_eligible(&self) -> bool {
+        self.state == PathState::Live && self.tx_live_at_ms.is_some()
     }
 
     /// Whether a probe may be sent now, per the backoff.
@@ -953,7 +979,106 @@ impl ActivePeer {
         path.tx_live_at_ms = Some(now_ms);
         path.remote_active = remote_active;
         path.state = PathState::Live;
+        path.dead_since_ms = None;
         Some(rtt_ms)
+    }
+
+    /// Whether the peer has a path on `transport_id` at `addr`, whichever
+    /// path it is. The msg1 classifier asks this: a rekey from the peer
+    /// arrives on the path *the peer* sends on, which need not be ours.
+    pub fn is_reachable_at(&self, transport_id: TransportId, addr: &TransportAddr) -> bool {
+        self.path_on(transport_id)
+            .is_some_and(|path| path.addr == *addr)
+    }
+
+    /// The transport `transport_id` went away: the path on it is `Dead`.
+    ///
+    /// The path keeps its history (RTT, liveness marks) so a returning
+    /// transport is re-probed rather than re-measured from nothing; the
+    /// history expires with [`prune_dead_paths`](Self::prune_dead_paths).
+    /// If the withdrawn path was the active one, the best eligible path takes
+    /// over: `Live` and `tx_live`, lowest last RTT first. With no eligible
+    /// path the active index is left where it was and the caller reaps the
+    /// peer; a `Probing` path is never promoted, because nothing has proven
+    /// it carries anything.
+    pub fn withdraw_path(&mut self, transport_id: TransportId, now_ms: u64) -> PathWithdrawal {
+        let Some(idx) = self
+            .send
+            .paths
+            .iter()
+            .position(|path| path.transport_id == transport_id)
+        else {
+            return PathWithdrawal::NoPath;
+        };
+        {
+            let path = &mut self.send.paths[idx];
+            path.state = PathState::Dead;
+            path.dead_since_ms = Some(now_ms);
+            path.probe.outstanding = None;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            path.clear_connected_udp();
+        }
+        if self.send.active != Some(idx) {
+            return PathWithdrawal::Standby;
+        }
+        let from = {
+            let path = &self.send.paths[idx];
+            (path.transport_id, path.addr.clone())
+        };
+        let best = self
+            .send
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(i, path)| *i != idx && path.is_eligible())
+            .min_by_key(|(_, path)| path.last_rtt_ms.unwrap_or(u64::MAX))
+            .map(|(i, _)| i);
+        match best {
+            Some(next) => {
+                self.send.active = Some(next);
+                let path = &self.send.paths[next];
+                PathWithdrawal::Switched {
+                    from,
+                    to: (path.transport_id, path.addr.clone()),
+                }
+            }
+            None => PathWithdrawal::NoAlternative,
+        }
+    }
+
+    /// Forget `Dead` paths older than `grace_ms`. The active path is never
+    /// pruned, whatever its state: the peer is reaped, not trimmed.
+    pub fn prune_dead_paths(&mut self, now_ms: u64, grace_ms: u64) {
+        let Some(active) = self.send.active else {
+            return;
+        };
+        let keep: Vec<bool> = self
+            .send
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                i == active
+                    || path.state != PathState::Dead
+                    || path
+                        .dead_since_ms
+                        .is_none_or(|since| now_ms.saturating_sub(since) < grace_ms)
+            })
+            .collect();
+        if keep.iter().all(|k| *k) {
+            return;
+        }
+        let mut i = 0;
+        let mut new_active = active;
+        self.send.paths.retain(|_| {
+            let k = keep[i];
+            if !k && i < active {
+                new_active -= 1;
+            }
+            i += 1;
+            k
+        });
+        self.send.active = Some(new_active);
     }
 
     /// Clear the probe backoff on every path over `transport_id`.

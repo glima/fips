@@ -8,7 +8,7 @@
 mod active;
 pub(crate) mod machine;
 
-pub use active::{ActivePeer, ConnectivityState, PathState, PeerPath};
+pub use active::{ActivePeer, ConnectivityState, PathState, PathWithdrawal, PeerPath};
 
 use crate::NodeAddr;
 use crate::transport::LinkId;

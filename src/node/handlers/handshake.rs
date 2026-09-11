@@ -207,9 +207,13 @@ impl Node {
         {
             return true;
         }
-        if self.peers.values().any(|p| {
-            p.transport_id() == Some(transport_id) && p.current_addr() == Some(remote_addr)
-        }) {
+        // Any path, not only the one we send on: a rekey msg1 arrives on the
+        // path the *peer* sends on.
+        if self
+            .peers
+            .values()
+            .any(|p| p.is_reachable_at(transport_id, remote_addr))
+        {
             return true;
         }
         false
@@ -282,9 +286,7 @@ impl Node {
         // yields an identity when it matches.
         self.peers
             .values()
-            .find(|p| {
-                p.transport_id() == Some(transport_id) && p.current_addr() == Some(remote_addr)
-            })
+            .find(|p| p.is_reachable_at(transport_id, remote_addr))
             .map(|p| Msg1Waiver::Expect(*p.node_addr()))
             .unwrap_or(Msg1Waiver::Unattributed)
     }
