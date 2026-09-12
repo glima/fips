@@ -198,6 +198,10 @@ class NetemManager:
                 transport = self.topology.transport_for_edge(node_id, peer_id)
                 if transport == "ethernet":
                     eth_peers.append(peer_id)
+                    # A dual edge also has a UDP half over the bridge, which
+                    # gets its own HTB class like any IP peer.
+                    if self.topology.is_dual_udp_edge(node_id, peer_id):
+                        ip_peers[peer_id] = self.topology.nodes[peer_id].docker_ip
                 else:
                     ip_peers[peer_id] = self.topology.nodes[peer_id].docker_ip
 
@@ -218,6 +222,11 @@ class NetemManager:
                     netem_handle = f"{idx + 10}:"
 
                     policy = self._policy_for_edge(node_id, peer_id)
+                    if (
+                        self.topology.is_dual_udp_edge(node_id, peer_id)
+                        and self.config.dual_udp_policy is not None
+                    ):
+                        policy = self.config.dual_udp_policy
                     params = self._sample_policy(policy)
 
                     rate = self._htb_rate(node_id, peer_id)

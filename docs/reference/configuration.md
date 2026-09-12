@@ -457,8 +457,9 @@ calibration.
 |-----------|------|---------|-------------|
 | `node.path.switch_margin` | f64 | `1.3` | Discretionary switch margin `K`: the active path's score must exceed the best standby's by this factor. Encodes the fail-back policy: a cable returning under working wifi (1.00 vs about 1.10) is under `K`, so traffic stays until the wifi degrades. |
 | `node.path.switch_dwell_secs` | u64 | `2` | The margin must hold this long before a discretionary switch. Also how long the link cost the tree sees is held at its pre-switch value after any switch. |
+| `node.path.standby_heartbeat_ms` | u64 | `1000` | Heartbeat interval on a standby path. A standby is only as warm as its last echo; this bounds how stale a proven standby can be when the active path dies. |
 | `node.path.min_samples` | u32 | `2` | RTT samples a standby needs before it is eligible. |
-| `node.path.active_heartbeat_ms` | u64 | `200` | Heartbeat interval on a path that either side sends on. Standbys use `node.heartbeat_interval_secs`. A heartbeat unanswered for two of these on a path the peer has acknowledged before marks it suspect, and selection leaves it at once. Both the interval and the timeout stretch with a path's own measured round trip, so a Tor or Nym path is neither flooded nor declared dead every round trip. The first probe on a path, and one a minute after, is padded to the link MTU so a medium that passes small frames and drops large ones never proves itself. |
+| `node.path.active_heartbeat_ms` | u64 | `200` | Heartbeat interval on a path that either side sends on. A heartbeat unanswered for two of these on a path the peer has acknowledged before, with nothing heard from the peer on it either, marks it suspect, and selection leaves it at once; a late echo on a path still carrying the peer's frames is counted as loss only. Both the interval and the timeout stretch with a path's own measured round trip, so a Tor or Nym path is neither flooded nor declared dead every round trip. The first probe on a path, and one a minute after, is padded to the link MTU so a medium that passes small frames and drops large ones never proves itself. |
 
 A path losing its transport (interface gone), carrier (cable unplugged), or a
 route (`ENETUNREACH` on send) is left immediately when another proven path
@@ -1314,6 +1315,7 @@ node:
     switch_dwell_secs: 2             # D: margin must hold this long
     min_samples: 2                   # N: RTT samples before a standby is eligible
     active_heartbeat_ms: 200         # heartbeat on a path either side sends on
+    standby_heartbeat_ms: 1000       # heartbeat on a standby path
   limits:
     max_connections: 256
     max_peers: 128

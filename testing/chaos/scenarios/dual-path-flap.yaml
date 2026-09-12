@@ -41,13 +41,20 @@ topology:
     adjacency:
       - [n01, n02, ethernet+udp]
 
-# Mild and equal on both paths: the variable under test is one path going
-# away, not one path being worse. With equal scores the pair should never
-# switch on its own; only the flaps move traffic.
+# The cable is mild; the UDP half carries 40 ms each way. Score is
+# etx × (1 + min_rtt/100): about 1.0 on the cable against about 1.8 over
+# UDP, well past the 1.3 margin, so the pair moves onto the cable soon after
+# both paths are live (the UDP static dial lands first) and returns to it
+# after each flap once the cable is proven again. Every flap therefore hits
+# the *active* path, and the fail-back is exercised too.
 netem:
   enabled: true
   default_policy:
     delay_ms: [1, 3]
+    jitter_ms: [0, 1]
+    loss_pct: [0, 0.2]
+  dual_udp_policy:
+    delay_ms: [40, 40]
     jitter_ms: [0, 1]
     loss_pct: [0, 0.2]
 
@@ -83,17 +90,20 @@ assertions:
   min_traffic:
     min_sessions_ok: 2
 
-  # Two to three flaps in 180 s at the interval above. Each flap moves both
-  # nodes off the cable (2), and the return may move them back (2 more) or
-  # not, per the margin. Floor: the first flap moved something. Ceiling:
-  # three flaps, both directions, both nodes, and nothing else.
+  # Three to four flaps in 180 s at the interval above. Each flap moves both
+  # nodes off the cable (2) and its return moves them back (2): four per
+  # flap, plus the initial move onto the cable (2). Floor: the first flap
+  # moved something. Ceiling: four flaps, both directions, both nodes, the
+  # initial move, and nothing else.
   path_switches:
-    min_total: 2
-    max_total: 12
+    min_total: 4
+    max_total: 18
 
   max_errors:
     max_total: 0
 
 logging:
-  rust_log: "info"
+  # The path handler at debug: "Path suspect" and "Sent path probe" are what
+  # the switch latency is read from.
+  rust_log: "info,fips::node::handlers::path=debug"
   output_dir: "./sim-results"

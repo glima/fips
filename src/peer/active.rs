@@ -1442,7 +1442,10 @@ impl ActivePeer {
     /// echo: on a path the peer has acknowledged before, that is a hard
     /// signal and the path goes `Suspect` (a never-acknowledged path is an
     /// old node, not a dead path; it keeps the discovery backoff instead).
-    /// Each timeout is one lost sample for the path's ETX. Both the interval
+    /// Each timeout is one lost sample for the path's ETX, and a verdict
+    /// only if the peer has also been silent on the path for the timeout:
+    /// a late echo on a path still carrying the peer's frames is load, not
+    /// death. Both the interval
     /// and the timeout stretch with the path's measured round trip, so a
     /// circuit whose round trip exceeds `fast_ms` is neither flooded nor
     /// declared dead every round trip: interval is at least the min RTT,
@@ -1479,7 +1482,15 @@ impl ActivePeer {
                 path.probe.outstanding = None;
                 if path.acked_once {
                     path.etx = smooth_etx(path.etx, false);
-                    if path.state == PathState::Live {
+                    // A late echo on a path we are still hearing the peer on
+                    // is a loss sample, not a verdict: under load the echo
+                    // queues behind data and comes back late while the path
+                    // is plainly carrying traffic. Only a path silent in
+                    // both directions for the timeout goes Suspect.
+                    let heard_recently = path
+                        .rx_live_at_ms
+                        .is_some_and(|rx| now_ms.saturating_sub(rx) < timeout_ms);
+                    if path.state == PathState::Live && !heard_recently {
                         path.state = PathState::Suspect;
                         plan.suspects.push(path.transport_id);
                     }

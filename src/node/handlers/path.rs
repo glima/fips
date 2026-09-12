@@ -24,11 +24,7 @@ impl Node {
     /// The selection knobs, from `node.path.*`.
     pub(in crate::node) fn path_policy(&self) -> PathPolicy {
         let cfg = &self.config().node.path;
-        let standby_ms = self
-            .config()
-            .node
-            .heartbeat_interval_secs
-            .saturating_mul(1000);
+        let standby_ms = cfg.standby_heartbeat_ms.max(1);
         PathPolicy {
             margin: cfg.switch_margin,
             dwell_ms: cfg.switch_dwell_secs.saturating_mul(1000),
@@ -372,11 +368,11 @@ impl Node {
             now_ms,
             window_ms,
         ) {
-            Some(rtt_ms) if !was_live => debug!(
+            Some(rtt_ms) if !was_live => info!(
                 peer = %self.peer_display_name(from),
                 transport_id = %transport_id,
                 rtt_ms,
-                "Path live"
+                "Path live: the peer answers on this transport"
             ),
             Some(rtt_ms) => trace!(
                 peer = %self.peer_display_name(from),
@@ -536,12 +532,7 @@ impl Node {
 
         let now_ms = crate::time::mono_ms();
         let fast_ms = self.config().node.path.active_heartbeat_ms.max(50);
-        let slow_ms = self
-            .config()
-            .node
-            .heartbeat_interval_secs
-            .saturating_mul(1000)
-            .max(fast_ms);
+        let slow_ms = self.config().node.path.standby_heartbeat_ms.max(fast_ms);
         // Two fast intervals: one echo lost is loss, two is a path. Stretched
         // per path by its own round trip inside `plan_heartbeats`.
         let timeout_ms = fast_ms.saturating_mul(2);

@@ -100,6 +100,10 @@ class NetemConfig:
     default_policy: NetemPolicy = field(default_factory=NetemPolicy)
     link_policies: list[LinkPolicyOverride] = field(default_factory=list)
     mutation: NetemMutationConfig = field(default_factory=NetemMutationConfig)
+    # Policy for the UDP half of ``ethernet+udp`` dual edges. The Ethernet
+    # half takes the edge's ordinary policy. ``None`` means the UDP half
+    # gets the default policy too.
+    dual_udp_policy: NetemPolicy | None = None
 
 
 @dataclass
@@ -429,7 +433,7 @@ _SECTION_KEYS = {
         "num_nodes", "algorithm", "params", "ensure_connected", "subnet",
         "ip_start", "default_transport", "transport_mix", "pin_root",
     },
-    "netem": {"enabled", "default_policy", "link_policies", "mutation"},
+    "netem": {"enabled", "default_policy", "link_policies", "mutation", "dual_udp_policy"},
     "netem.link_policies[]": {"edges", "policy", "policy_name"},
     "netem.mutation": {"interval_secs", "fraction", "policies", "exclude_edges"},
     "link_flaps": {
@@ -572,6 +576,10 @@ def load_scenario(path: str) -> Scenario:
     if "default_policy" in nc:
         s.netem.default_policy = _parse_netem_policy(
             nc["default_policy"], "netem.default_policy"
+        )
+    if "dual_udp_policy" in nc:
+        s.netem.dual_udp_policy = _parse_netem_policy(
+            nc["dual_udp_policy"], "netem.dual_udp_policy"
         )
     if "link_policies" in nc:
         for lp_data in nc["link_policies"]:
