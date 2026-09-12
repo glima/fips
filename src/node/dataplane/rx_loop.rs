@@ -121,6 +121,13 @@ impl Node {
 
         let tick_period = Duration::from_secs(self.config().node.tick_interval_secs);
         let mut tick = tokio::time::interval(tick_period);
+        // The fast path tick: per-path heartbeats and the carrier edge. Its
+        // own timer because the maintenance tick is seconds and a dead path
+        // is meant to be noticed inside one.
+        let mut path_tick = tokio::time::interval(Duration::from_millis(
+            self.config().node.path.active_heartbeat_ms.max(50),
+        ));
+        path_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Set up control socket channel
         let (control_tx, mut control_rx) =
@@ -494,6 +501,9 @@ impl Node {
                         request.params.as_ref(),
                     ).await;
                     let _ = response_tx.send(response);
+                }
+                _ = path_tick.tick() => {
+                    self.run_path_heartbeats().await;
                 }
                 deadline = tick.tick() => {
                     // Tick-body instrumentation. The gate is read ONCE per tick

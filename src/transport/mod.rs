@@ -267,6 +267,20 @@ impl TransportError {
     /// which is a statement about the peer rather than about this node's
     /// ability to transmit, and the existing retry paths for them already sit
     /// at a different layer.
+    /// Whether the kernel refused the send for want of a route: the
+    /// interface is up but nothing is reachable through it. A hard signal
+    /// that the path is gone (`ENETUNREACH`, `EHOSTUNREACH`), distinct from
+    /// `is_transient`: the binder is not going to fix this.
+    pub fn is_unreachable(&self) -> bool {
+        match self {
+            Self::Io(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable
+            ),
+            _ => false,
+        }
+    }
+
     pub fn is_transient(&self) -> bool {
         match self {
             // The interface is absent or mid-rebind. The binder is polling for

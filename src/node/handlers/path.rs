@@ -415,6 +415,112 @@ impl Node {
         self.refresh_tun_mss_ceiling();
     }
 
+    /// The fast path tick: per-path heartbeats, the carrier edge, and the
+    /// selection that a `Suspect` mark may call for.
+    ///
+    /// Runs every `node.path.active_heartbeat_ms`. Detection is near-instant
+    /// for direct peers because each medium's own failure signal is used,
+    /// not a faster timer: carrier here, a failed echo from the heartbeat
+    /// plan, an unreachable send from the send path. All three mark a path
+    /// `Suspect`; selection acts on `Suspect` at once because the standby is
+    /// warm.
+    pub(in crate::node) async fn run_path_heartbeats(&mut self) {
+        self.poll_carrier_edges();
+
+        let now_ms = crate::time::mono_ms();
+        let fast_ms = self.config().node.path.active_heartbeat_ms.max(50);
+        let slow_ms = self
+            .config()
+            .node
+            .heartbeat_interval_secs
+            .saturating_mul(1000)
+            .max(fast_ms);
+        // Three fast intervals: one echo lost is loss, three is a path.
+        let timeout_ms = fast_ms.saturating_mul(3);
+
+        let mut sends = Vec::new();
+        for (node_addr, peer) in self.peers.iter_mut() {
+            let plan = peer.plan_heartbeats(now_ms, fast_ms, slow_ms, timeout_ms);
+            for transport_id in plan.suspects {
+                debug!(
+                    peer = %node_addr,
+                    %transport_id,
+                    "Path suspect: heartbeat echo timed out"
+                );
+            }
+            for send in plan.sends {
+                sends.push((*node_addr, send));
+            }
+        }
+        for (node_addr, send) in sends {
+            let probe = PathMessage {
+                probe_id: send.probe_id,
+                remote_active: send.remote_active,
+            };
+            if let Err(e) = self
+                .send_encrypted_link_message_on_path(
+                    &node_addr,
+                    &probe.encode_probe(),
+                    send.transport_id,
+                    send.addr,
+                )
+                .await
+            {
+                trace!(
+                    peer = %self.peer_display_name(&node_addr),
+                    transport_id = %send.transport_id,
+                    error = %e,
+                    "Path heartbeat send failed"
+                );
+            }
+        }
+
+        self.run_path_selection();
+    }
+
+    /// Read carrier on every interface-bound transport and mark the paths
+    /// over one that just lost it `Suspect`. Unplugging a cable drops
+    /// carrier on both NICs, so both ends see this inside one fast tick.
+    fn poll_carrier_edges(&mut self) {
+        let readings: Vec<(TransportId, bool)> = self
+            .transports
+            .iter()
+            .filter_map(|(id, t)| t.interface_presence().map(|p| (*id, p.carrier)))
+            .collect();
+        for (transport_id, carrier) in readings {
+            let previous = self.carrier_seen.insert(transport_id, carrier);
+            if previous == Some(true) && !carrier {
+                let mut marked = 0;
+                for peer in self.peers.values_mut() {
+                    if peer.mark_path_suspect(transport_id) {
+                        marked += 1;
+                    }
+                }
+                if marked > 0 {
+                    info!(%transport_id, paths = marked, "Carrier lost: paths suspect");
+                }
+            }
+        }
+    }
+
+    /// The kernel refused a send to the peer on `transport_id` for want of
+    /// a route: the path is `Suspect` now, not after an echo timeout.
+    pub(in crate::node) fn note_path_unreachable(
+        &mut self,
+        node_addr: &NodeAddr,
+        transport_id: TransportId,
+    ) {
+        if let Some(peer) = self.peers.get_mut(node_addr)
+            && peer.mark_path_suspect(transport_id)
+        {
+            debug!(
+                peer = %self.peer_display_name(node_addr),
+                %transport_id,
+                "Path suspect: send unreachable"
+            );
+        }
+    }
+
     /// A transport's presence came back: clear the probe backoff on every
     /// path over it so the next discovery tick may probe at once.
     pub(in crate::node) fn reset_probe_backoff_on_transport(&mut self, transport_id: TransportId) {

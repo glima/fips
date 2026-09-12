@@ -148,6 +148,26 @@ pub enum SwitchReason {
     Pinned,
 }
 
+/// One heartbeat probe to put on the wire, from
+/// [`ActivePeer::plan_heartbeats`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeartbeatSend {
+    pub transport_id: TransportId,
+    pub addr: TransportAddr,
+    pub probe_id: u32,
+    /// Whether this is the path we send on.
+    pub remote_active: bool,
+}
+
+/// What one pass of [`ActivePeer::plan_heartbeats`] decided.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeartbeatPlan {
+    /// Probes to send now.
+    pub sends: Vec<HeartbeatSend>,
+    /// Paths whose outstanding probe timed out and went `Suspect`.
+    pub suspects: Vec<TransportId>,
+}
+
 /// Selection moved the active path from `from` to `to`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathSwitch {
@@ -1093,6 +1113,11 @@ impl ActivePeer {
             path.clear_connected_udp();
         }
         path.rx_live_at_ms = Some(now_ms);
+        if path.remote_active && !remote_active {
+            // The peer stopped sending here. It may have stopped hearing us
+            // here too: a hint, so probe now, never `Suspect` (design §7).
+            path.probe.next_at_ms = 0;
+        }
         path.remote_active = remote_active;
     }
 
@@ -1115,7 +1140,6 @@ impl ActivePeer {
         }
         path.probe.outstanding = None;
         path.probe.unanswered = 0;
-        path.probe.next_at_ms = 0;
         let rtt_ms = now_ms.saturating_sub(sent_at_ms);
         path.last_rtt_ms = Some(rtt_ms);
         path.record_rtt(now_ms, rtt_ms, rtt_window_ms);
@@ -1339,6 +1363,106 @@ impl ActivePeer {
         if let Some(path) = self.path_on_mut(transport_id) {
             path.role = role;
         }
+    }
+
+    /// A hard signal (carrier lost, unreachable on send) says the path on
+    /// `transport_id` may be gone: `Suspect`, so selection leaves it now
+    /// and a later ack restores it. Only a `Live` path can become suspect.
+    pub fn mark_path_suspect(&mut self, transport_id: TransportId) -> bool {
+        match self.path_on_mut(transport_id) {
+            Some(path) if path.state == PathState::Live => {
+                path.state = PathState::Suspect;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Decide this tick's per-path heartbeats (design §7).
+    ///
+    /// Every path that is not `Dead` is heartbeated with a `PathProbe`
+    /// whose `probe_id` is the path's sequence: fast (`fast_ms`) on a path
+    /// that either side sends on, slow (`slow_ms`) on a standby, one probe
+    /// in flight per path. A probe unanswered for `timeout_ms` is a failed
+    /// echo: on a path the peer has acknowledged before, that is a hard
+    /// signal and the path goes `Suspect` (a never-acknowledged path is an
+    /// old node, not a dead path; it keeps the discovery backoff instead).
+    /// Each timeout is one lost sample for the path's ETX.
+    ///
+    /// The silence hint: our active path silent for two of the peer's
+    /// intervals on it while a standby hears the peer triggers a probe now,
+    /// never `Suspect` (see §7 for the loop that would otherwise follow).
+    pub fn plan_heartbeats(
+        &mut self,
+        now_ms: u64,
+        fast_ms: u64,
+        slow_ms: u64,
+        timeout_ms: u64,
+    ) -> HeartbeatPlan {
+        let mut plan = HeartbeatPlan::default();
+        let active = self.send.active;
+        let newest_rx = self.send.paths.iter().filter_map(|p| p.rx_live_at_ms).max();
+        for (i, path) in self.send.paths.iter_mut().enumerate() {
+            if path.state == PathState::Dead {
+                continue;
+            }
+            let ours = active == Some(i);
+            let interval = if ours || path.remote_active {
+                fast_ms
+            } else {
+                slow_ms
+            };
+
+            if let Some((_, sent_at)) = path.probe.outstanding
+                && now_ms.saturating_sub(sent_at) >= timeout_ms
+            {
+                path.probe.outstanding = None;
+                if path.acked_once {
+                    path.etx = smooth_etx(path.etx, false);
+                    if path.state == PathState::Live {
+                        path.state = PathState::Suspect;
+                        plan.suspects.push(path.transport_id);
+                    }
+                    path.probe.next_at_ms = 0;
+                } else {
+                    path.probe.unanswered = path.probe.unanswered.saturating_add(1);
+                }
+            }
+
+            // Silence hint on our active path.
+            if ours
+                && let Some(last_rx) = path.rx_live_at_ms
+                && let Some(newest) = newest_rx
+            {
+                let peer_interval = if path.remote_active { fast_ms } else { slow_ms };
+                if newest > last_rx && now_ms.saturating_sub(last_rx) >= 2 * peer_interval {
+                    path.probe.next_at_ms = 0;
+                }
+            }
+
+            if path.probe.outstanding.is_some() || now_ms < path.probe.next_at_ms {
+                continue;
+            }
+            let id = path.probe.next_id;
+            path.probe.next_id = path.probe.next_id.wrapping_add(1);
+            path.probe.outstanding = Some((id, now_ms));
+            let delay = if path.acked_once {
+                interval
+            } else {
+                // Discovery backoff: doubles per unanswered probe, capped at
+                // the standby interval.
+                let shift = path.probe.unanswered.min(16);
+                interval.saturating_mul(1u64 << shift).min(slow_ms)
+            };
+            path.probe.next_at_ms = now_ms.saturating_add(delay.max(1));
+            plan.sends.push(HeartbeatSend {
+                transport_id: path.transport_id,
+                addr: path.addr.clone(),
+                probe_id: id,
+                remote_active: ours,
+            });
+        }
+        plan
     }
 
     /// Forget `Dead` paths older than `grace_ms`. The active path is never

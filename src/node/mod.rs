@@ -631,6 +631,9 @@ pub struct Node {
     /// the peer entry itself. Pruned on insert; see
     /// `EPOCH_RESTART_MIN_INTERVAL_SECS`.
     restart_dampener: HashMap<NodeAddr, std::time::Instant>,
+    /// Last carrier reading per interface-bound transport, for the carrier
+    /// edge the fast path tick detects. Absent until first read.
+    carrier_seen: HashMap<TransportId, bool>,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -916,6 +919,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
+            carrier_seen: HashMap::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -1089,6 +1093,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
+            carrier_seen: HashMap::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -3901,28 +3906,29 @@ impl Node {
             }
         }
 
-        let bytes_sent = transport
-            .send(&remote_addr, &wire_packet)
-            .await
-            .map_err(|e| match e {
-                TransportError::MtuExceeded { packet_size, mtu } => NodeError::MtuExceeded {
-                    node_addr: *node_addr,
-                    packet_size,
-                    mtu,
-                },
-                // Preserve the transport's own classification instead of
-                // flattening every non-MTU failure into one string. A caller
-                // that wants to keep its half-built state across an interface
-                // flap can only do that if the distinction survives to it.
-                other if other.is_transient() => NodeError::SendUnavailable {
-                    node_addr: *node_addr,
-                    reason: format!("transport send: {}", other),
-                },
-                other => NodeError::SendFailed {
-                    node_addr: *node_addr,
-                    reason: format!("transport send: {}", other),
-                },
-            })?;
+        let sent = transport.send(&remote_addr, &wire_packet).await;
+        if sent.as_ref().is_err_and(|e| e.is_unreachable()) {
+            self.note_path_unreachable(node_addr, transport_id);
+        }
+        let bytes_sent = sent.map_err(|e| match e {
+            TransportError::MtuExceeded { packet_size, mtu } => NodeError::MtuExceeded {
+                node_addr: *node_addr,
+                packet_size,
+                mtu,
+            },
+            // Preserve the transport's own classification instead of
+            // flattening every non-MTU failure into one string. A caller
+            // that wants to keep its half-built state across an interface
+            // flap can only do that if the distinction survives to it.
+            other if other.is_transient() => NodeError::SendUnavailable {
+                node_addr: *node_addr,
+                reason: format!("transport send: {}", other),
+            },
+            other => NodeError::SendFailed {
+                node_addr: *node_addr,
+                reason: format!("transport send: {}", other),
+            },
+        })?;
 
         // Update send statistics
         if let Some(peer) = self.peers.get_mut(node_addr) {
