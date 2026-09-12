@@ -1481,7 +1481,15 @@ impl ActivePeer {
             {
                 path.probe.outstanding = None;
                 if path.acked_once {
-                    path.etx = smooth_etx(path.etx, false);
+                    // Loss is sampled while the path is Live. Once it is
+                    // Suspect the state already says it is down, and every
+                    // further timeout is the same outage, not a lossier
+                    // medium; counting them would keep a returning cable
+                    // scoring like a bad link for the next minute and stall
+                    // the fail-back.
+                    if path.state == PathState::Live {
+                        path.etx = smooth_etx(path.etx, false);
+                    }
                     // A late echo on a path we are still hearing the peer on
                     // is a loss sample, not a verdict: under load the echo
                     // queues behind data and comes back late while the path

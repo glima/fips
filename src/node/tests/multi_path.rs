@@ -1468,3 +1468,32 @@ async fn a_peer_closing_our_active_path_moves_our_traffic() {
     );
     assert_eq!(peer.path_on(cable).unwrap().state(), PathState::Dead);
 }
+
+#[test]
+fn an_outage_does_not_keep_charging_the_path_s_etx() {
+    let mut peer = dual_path_peer(1, 5);
+    let t0 = 1_000_000;
+    let plan = peer.plan_heartbeats(t0, FAST, SLOW, TIMEOUT);
+    let wifi_id = plan
+        .sends
+        .iter()
+        .find(|s| s.transport_id == tid(WIFI))
+        .unwrap()
+        .probe_id;
+    peer.note_path_ack(tid(WIFI), wifi_id, false, 1, t0 + 5, u64::MAX);
+    // The cable goes silent: first timeout is one loss and the Suspect mark.
+    let plan = peer.plan_heartbeats(t0 + TIMEOUT, FAST, SLOW, TIMEOUT);
+    assert_eq!(plan.suspects, vec![tid(CABLE)]);
+    let after_one = peer.path_on(tid(CABLE)).unwrap().etx();
+    // Sixteen more seconds of timeouts while Suspect: no further charge.
+    let mut now = t0 + TIMEOUT;
+    for _ in 0..16 {
+        now += 1_000;
+        peer.plan_heartbeats(now, FAST, SLOW, TIMEOUT);
+    }
+    assert_eq!(
+        peer.path_on(tid(CABLE)).unwrap().etx(),
+        after_one,
+        "an outage is one event, not a lossy medium"
+    );
+}
