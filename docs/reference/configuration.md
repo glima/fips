@@ -455,14 +455,15 @@ calibration.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `node.path.switch_margin` | f64 | `1.5` | Discretionary switch margin `K`: the active path's score must exceed the best standby's by this factor. Encodes the fail-back policy: a cable returning under working wifi (1.00 vs about 1.10) is under `K`, so traffic stays until the wifi degrades. |
-| `node.path.switch_dwell_secs` | u64 | `5` | The margin must hold this long before a discretionary switch. Also how long the link cost the tree sees is held at its pre-switch value after any switch. |
-| `node.path.min_samples` | u32 | `3` | RTT samples a standby needs before it is eligible. |
-| `node.path.active_heartbeat_ms` | u64 | `250` | Heartbeat interval on a path that either side sends on. Standbys use `node.heartbeat_interval_secs`. A heartbeat unanswered for three of these on a path the peer has acknowledged before marks it suspect, and selection leaves it at once. |
+| `node.path.switch_margin` | f64 | `1.3` | Discretionary switch margin `K`: the active path's score must exceed the best standby's by this factor. Encodes the fail-back policy: a cable returning under working wifi (1.00 vs about 1.10) is under `K`, so traffic stays until the wifi degrades. |
+| `node.path.switch_dwell_secs` | u64 | `2` | The margin must hold this long before a discretionary switch. Also how long the link cost the tree sees is held at its pre-switch value after any switch. |
+| `node.path.min_samples` | u32 | `2` | RTT samples a standby needs before it is eligible. |
+| `node.path.active_heartbeat_ms` | u64 | `200` | Heartbeat interval on a path that either side sends on. Standbys use `node.heartbeat_interval_secs`. A heartbeat unanswered for two of these on a path the peer has acknowledged before marks it suspect, and selection leaves it at once. Both the interval and the timeout stretch with a path's own measured round trip, so a Tor or Nym path is neither flooded nor declared dead every round trip. The first probe on a path, and one a minute after, is padded to the link MTU so a medium that passes small frames and drops large ones never proves itself. |
 
 A path losing its transport (interface gone), carrier (cable unplugged), or a
 route (`ENETUNREACH` on send) is left immediately when another proven path
-exists; only a peer with no path left is dropped. See
+exists, and the peer is told on a surviving path so it moves too rather than
+waiting for its own timeout; only a peer with no path left is dropped. See
 `fipsctl path` in [cli-fipsctl.md](cli-fipsctl.md).
 
 ### Bloom Filter (`node.bloom.*`)
@@ -1309,10 +1310,10 @@ node:
   link_dead_timeout_secs: 30
   # drain_timeout_secs: 2            # bounded Draining phase; absent = 2s
   path:
-    switch_margin: 1.5               # K: active score must exceed best standby's by this
-    switch_dwell_secs: 5             # D: margin must hold this long
-    min_samples: 3                   # N: RTT samples before a standby is eligible
-    active_heartbeat_ms: 250         # heartbeat on a path either side sends on
+    switch_margin: 1.3               # K: active score must exceed best standby's by this
+    switch_dwell_secs: 2             # D: margin must hold this long
+    min_samples: 2                   # N: RTT samples before a standby is eligible
+    active_heartbeat_ms: 200         # heartbeat on a path either side sends on
   limits:
     max_connections: 256
     max_peers: 128

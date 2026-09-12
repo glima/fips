@@ -16,7 +16,7 @@
 use crate::NodeAddr;
 use crate::node::Node;
 use crate::peer::{PathPolicy, PathSwitch, PathWithdrawal};
-use crate::proto::link::PathMessage;
+use crate::proto::link::{PathClose, PathCloseReason, PathMessage};
 use crate::transport::{TransportAddr, TransportId};
 use tracing::{debug, info, trace};
 
@@ -224,21 +224,25 @@ impl Node {
         }
         peer.add_path(transport_id, remote_addr.clone())
             .set_role(role);
-        let Some((probe_id, remote_active)) =
+        let Some((probe_id, remote_active, path_id)) =
             peer.take_probe(transport_id, now_ms, base_ms, cap_ms)
         else {
             return;
         };
         // The address the beacon carried is the one to reach the peer at
         // on this transport, and it may have moved since the path was added.
+        // Full-size: a path that cannot carry a data-sized frame must not
+        // prove itself with a small one.
         let probe = PathMessage {
             probe_id,
             remote_active,
+            path_id,
         };
+        let wire = self.pad_to_link_mtu(probe.encode_probe().to_vec(), transport_id, &remote_addr);
         match self
             .send_encrypted_link_message_on_path(
                 &node_addr,
-                &probe.encode_probe(),
+                &wire,
                 transport_id,
                 remote_addr.clone(),
             )
@@ -290,12 +294,17 @@ impl Node {
             transport_id,
             remote_addr.clone(),
             probe.remote_active,
+            probe.path_id,
             now_ms,
         );
         if was_new {
             peer.set_path_role(transport_id, role);
         }
         let ours_active = peer.transport_id() == Some(transport_id);
+        let our_path_id = peer
+            .path_on(transport_id)
+            .map(|p| p.local_id())
+            .unwrap_or(0);
         if was_new {
             debug!(
                 peer = %self.peer_display_name(from),
@@ -305,17 +314,20 @@ impl Node {
             );
         }
 
+        // The ack echoes the probe's size, so a full-size probe proves the
+        // path for data-sized frames in both directions.
         let ack = PathMessage {
             probe_id: probe.probe_id,
             remote_active: ours_active,
+            path_id: our_path_id,
         };
+        let mut wire = ack.encode_ack().to_vec();
+        let probe_len = payload.len() + 1;
+        if wire.len() < probe_len {
+            wire.resize(probe_len, 0);
+        }
         if let Err(e) = self
-            .send_encrypted_link_message_on_path(
-                from,
-                &ack.encode_ack(),
-                transport_id,
-                remote_addr.clone(),
-            )
+            .send_encrypted_link_message_on_path(from, &wire, transport_id, remote_addr.clone())
             .await
         {
             debug!(
@@ -356,6 +368,7 @@ impl Node {
             transport_id,
             ack.probe_id,
             ack.remote_active,
+            ack.path_id,
             now_ms,
             window_ms,
         ) {
@@ -419,11 +432,15 @@ impl Node {
             };
             match outcome {
                 PathWithdrawal::NoPath => {}
-                PathWithdrawal::Standby => debug!(
-                    peer = %self.peer_display_name(&node_addr),
-                    %transport_id,
-                    "Standby path withdrawn: its interface went away"
-                ),
+                PathWithdrawal::Standby => {
+                    debug!(
+                        peer = %self.peer_display_name(&node_addr),
+                        %transport_id,
+                        "Standby path withdrawn: its interface went away"
+                    );
+                    self.send_path_close(&node_addr, transport_id, PathCloseReason::InterfaceGone)
+                        .await;
+                }
                 PathWithdrawal::Switched { from, to } => {
                     info!(
                         peer = %self.peer_display_name(&node_addr),
@@ -433,6 +450,8 @@ impl Node {
                         "Active path withdrawn: traffic moved to the standby, session kept"
                     );
                     self.apply_path_switch(&node_addr, to);
+                    self.send_path_close(&node_addr, transport_id, PathCloseReason::InterfaceGone)
+                        .await;
                 }
                 PathWithdrawal::NoAlternative => {
                     self.reap_peer_without_path(node_addr, transport_id, wall_ms)
@@ -513,6 +532,7 @@ impl Node {
     /// warm.
     pub(in crate::node) async fn run_path_heartbeats(&mut self) {
         self.poll_carrier_edges();
+        self.flush_pending_path_closes().await;
 
         let now_ms = crate::time::mono_ms();
         let fast_ms = self.config().node.path.active_heartbeat_ms.max(50);
@@ -522,8 +542,9 @@ impl Node {
             .heartbeat_interval_secs
             .saturating_mul(1000)
             .max(fast_ms);
-        // Three fast intervals: one echo lost is loss, three is a path.
-        let timeout_ms = fast_ms.saturating_mul(3);
+        // Two fast intervals: one echo lost is loss, two is a path. Stretched
+        // per path by its own round trip inside `plan_heartbeats`.
+        let timeout_ms = fast_ms.saturating_mul(2);
 
         let mut sends = Vec::new();
         for (node_addr, peer) in self.peers.iter_mut() {
@@ -543,11 +564,16 @@ impl Node {
             let probe = PathMessage {
                 probe_id: send.probe_id,
                 remote_active: send.remote_active,
+                path_id: send.path_id,
             };
+            let mut wire = probe.encode_probe().to_vec();
+            if send.full_size {
+                wire = self.pad_to_link_mtu(wire, send.transport_id, &send.addr);
+            }
             if let Err(e) = self
                 .send_encrypted_link_message_on_path(
                     &node_addr,
-                    &probe.encode_probe(),
+                    &wire,
                     send.transport_id,
                     send.addr,
                 )
@@ -577,17 +603,143 @@ impl Node {
         for (transport_id, carrier) in readings {
             let previous = self.carrier_seen.insert(transport_id, carrier);
             if previous == Some(true) && !carrier {
-                let mut marked = 0;
-                for peer in self.peers.values_mut() {
+                let mut marked = Vec::new();
+                for (node_addr, peer) in self.peers.iter_mut() {
                     if peer.mark_path_suspect(transport_id) {
-                        marked += 1;
+                        marked.push(*node_addr);
                     }
                 }
-                if marked > 0 {
-                    info!(%transport_id, paths = marked, "Carrier lost: paths suspect");
+                if !marked.is_empty() {
+                    info!(%transport_id, paths = marked.len(), "Carrier lost: paths suspect");
+                    self.pending_path_closes
+                        .extend(marked.into_iter().map(|a| (a, transport_id)));
                 }
             }
         }
+    }
+
+    /// Tell `node_addr` that our path over `transport_id` is closing, on
+    /// whichever path we now send on. Best effort: the peer would learn
+    /// from the echo timeout anyway, this just makes it immediate. Nothing
+    /// is sent if that path is the one we send on (there is no other way to
+    /// reach the peer) or the peer never told us its id for it, which it
+    /// does with its first probe or ack on the path.
+    pub(in crate::node) async fn send_path_close(
+        &mut self,
+        node_addr: &NodeAddr,
+        transport_id: TransportId,
+        reason: PathCloseReason,
+    ) {
+        let Some(peer) = self.peers.get(node_addr) else {
+            return;
+        };
+        if peer.transport_id() == Some(transport_id) {
+            return;
+        }
+        let Some(remote_id) = peer.path_on(transport_id).and_then(|p| p.remote_id()) else {
+            return;
+        };
+        let close = PathClose {
+            path_id: remote_id,
+            reason,
+        };
+        if let Err(e) = self
+            .send_encrypted_link_message(node_addr, &close.encode())
+            .await
+        {
+            trace!(
+                peer = %self.peer_display_name(node_addr),
+                %transport_id,
+                error = %e,
+                "Path close send failed"
+            );
+        }
+    }
+
+    /// The peer is closing the path it calls `path_id` (a `PathClose`
+    /// arrived). Withdraw our side of it as if its transport had gone: Dead
+    /// with history, traffic moved if it was there. Advisory: the peer's
+    /// next probe on it revives it.
+    pub(in crate::node) async fn handle_path_close(&mut self, from: &NodeAddr, payload: &[u8]) {
+        let close = match PathClose::decode(payload) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(peer = %self.peer_display_name(from), error = %e, "Malformed path close");
+                return;
+            }
+        };
+        let now_ms = crate::time::mono_ms();
+        let policy = self.path_policy();
+        let Some(peer) = self.peers.get_mut(from) else {
+            return;
+        };
+        let Some((transport_id, outcome)) =
+            peer.withdraw_path_by_local_id(close.path_id, now_ms, &policy)
+        else {
+            trace!(peer = %self.peer_display_name(from), path_id = close.path_id, "Path close named no path");
+            return;
+        };
+        match outcome {
+            PathWithdrawal::NoPath => {}
+            PathWithdrawal::Standby => debug!(
+                peer = %self.peer_display_name(from),
+                %transport_id,
+                reason = ?close.reason,
+                "Peer closed a standby path"
+            ),
+            PathWithdrawal::Switched { from: was, to } => {
+                info!(
+                    peer = %self.peer_display_name(from),
+                    from_transport = %was.0,
+                    to_transport = %to.0,
+                    reason = ?close.reason,
+                    "Peer closed our active path: traffic moved to the standby, session kept"
+                );
+                self.apply_path_switch(from, to);
+            }
+            PathWithdrawal::NoAlternative => {
+                // The peer says the only path we have to it is going. Leave
+                // the peer to the echo timeout and the liveness reaper: a
+                // close is advisory, and the path may outlive the warning.
+                debug!(
+                    peer = %self.peer_display_name(from),
+                    %transport_id,
+                    reason = ?close.reason,
+                    "Peer closed our only path; waiting for liveness to confirm"
+                );
+            }
+        }
+    }
+
+    /// Flush the path closes the carrier poll queued (it holds the peer
+    /// table mutably and cannot send).
+    async fn flush_pending_path_closes(&mut self) {
+        let pending = std::mem::take(&mut self.pending_path_closes);
+        for (node_addr, transport_id) in pending {
+            self.send_path_close(&node_addr, transport_id, PathCloseReason::CarrierLost)
+                .await;
+        }
+    }
+
+    /// Pad a link message to fill the link MTU on `transport_id` to `addr`,
+    /// so the frame is data-sized: outer header, inner timestamp and AEAD
+    /// tag are accounted for.
+    fn pad_to_link_mtu(
+        &self,
+        mut wire: Vec<u8>,
+        transport_id: TransportId,
+        addr: &TransportAddr,
+    ) -> Vec<u8> {
+        let Some(transport) = self.transports.get(&transport_id) else {
+            return wire;
+        };
+        let overhead =
+            crate::proto::fmp::wire::ESTABLISHED_HEADER_SIZE + 4 + crate::noise::TAG_SIZE;
+        let room = usize::from(transport.link_mtu(addr)).saturating_sub(overhead);
+        if wire.len() < room {
+            wire.resize(room, 0);
+        }
+        wire
     }
 
     /// The kernel refused a send to the peer on `transport_id` for want of

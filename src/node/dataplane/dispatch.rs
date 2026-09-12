@@ -73,6 +73,10 @@ impl Node {
                 // PathAck
                 self.handle_path_ack(from, payload, arrival);
             }
+            0x54 => {
+                // PathClose
+                self.handle_path_close(from, payload).await;
+            }
             _ => {
                 debug!(msg_type = msg_type, "Unknown link message type");
             }

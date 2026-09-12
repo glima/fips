@@ -18,6 +18,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::Instant;
 
+/// How often a full-size (MTU-padded) probe goes out on a proven path.
+const FULL_SIZE_PROBE_INTERVAL_MS: u64 = 60_000;
+
 /// Fold one probe outcome into a path's ETX: the long EWMA (α = 1/32) of
 /// the delivery ratio, inverted and clamped like the link ETX. Per report a
 /// raw value is a flap generator on a lightly loaded link; the long average
@@ -157,6 +160,12 @@ pub struct HeartbeatSend {
     pub probe_id: u32,
     /// Whether this is the path we send on.
     pub remote_active: bool,
+    /// Our identifier for the path.
+    pub path_id: u32,
+    /// Pad this probe to the link MTU: the first probe on a path, and one a
+    /// minute after, so a medium that forwards small frames and drops large
+    /// ones never proves itself.
+    pub full_size: bool,
 }
 
 /// What one pass of [`ActivePeer::plan_heartbeats`] decided.
@@ -238,6 +247,14 @@ pub struct PeerPath {
     /// From the transport's config: a `Backup` path never carries traffic
     /// while a `Normal` one is eligible.
     role: TransportRole,
+    /// Our identifier for this path, carried in every probe and ack we
+    /// send on it, so the peer can name it in a `PathClose`.
+    local_id: u32,
+    /// The peer's identifier for its side of this path, learned from its
+    /// probes and acks.
+    remote_id: Option<u32>,
+    /// When a full-size probe last went out on this path.
+    last_full_probe_ms: Option<u64>,
     /// Operator override: wins selection while it is `tx_live`.
     pinned: bool,
 
@@ -274,6 +291,9 @@ impl PeerPath {
             etx: 1.0,
             acked_once: false,
             role: TransportRole::Normal,
+            local_id: rand::rng().random::<u32>(),
+            remote_id: None,
+            last_full_probe_ms: None,
             pinned: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             connected_udp: None,
@@ -341,6 +361,16 @@ impl PeerPath {
     /// Whether the peer has ever acknowledged a probe here.
     pub fn acked_once(&self) -> bool {
         self.acked_once
+    }
+
+    /// Our identifier for this path on the wire.
+    pub fn local_id(&self) -> u32 {
+        self.local_id
+    }
+
+    /// The peer's identifier for its side of this path, once heard.
+    pub fn remote_id(&self) -> Option<u32> {
+        self.remote_id
     }
 
     /// Minimum probe round trip inside the window, ms.
@@ -1085,7 +1115,7 @@ impl ActivePeer {
         now_ms: u64,
         base_ms: u64,
         backoff_cap_ms: u64,
-    ) -> Option<(u32, bool)> {
+    ) -> Option<(u32, bool, u32)> {
         let active = self.transport_id() == Some(transport_id);
         let path = self.path_on_mut(transport_id)?;
         if !path.probe_due(now_ms) {
@@ -1098,7 +1128,8 @@ impl ActivePeer {
         let delay = base_ms.saturating_mul(1u64 << shift).min(backoff_cap_ms);
         path.probe.next_at_ms = now_ms.saturating_add(delay.max(1));
         path.probe.unanswered = path.probe.unanswered.saturating_add(1);
-        Some((id, active))
+        let path_id = path.local_id;
+        Some((id, active, path_id))
     }
 
     /// A `PathProbe` arrived on `transport_id` from `addr`. Adds the path if
@@ -1109,6 +1140,7 @@ impl ActivePeer {
         transport_id: TransportId,
         addr: TransportAddr,
         remote_active: bool,
+        remote_id: u32,
         now_ms: u64,
     ) {
         let path = self.add_path(transport_id, addr.clone());
@@ -1116,6 +1148,13 @@ impl ActivePeer {
             path.addr = addr;
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             path.clear_connected_udp();
+        }
+        path.remote_id = Some(remote_id);
+        if path.state == PathState::Dead {
+            // The peer is probing a path we had given up on: it is back,
+            // unproven in our direction until its ack.
+            path.state = PathState::Probing;
+            path.dead_since_ms = None;
         }
         path.rx_live_at_ms = Some(now_ms);
         if path.remote_active && !remote_active {
@@ -1135,10 +1174,12 @@ impl ActivePeer {
         transport_id: TransportId,
         probe_id: u32,
         remote_active: bool,
+        remote_id: u32,
         now_ms: u64,
         rtt_window_ms: u64,
     ) -> Option<u64> {
         let path = self.path_on_mut(transport_id)?;
+        path.remote_id = Some(remote_id);
         let (outstanding_id, sent_at_ms) = path.probe.outstanding?;
         if outstanding_id != probe_id {
             return None;
@@ -1401,7 +1442,11 @@ impl ActivePeer {
     /// echo: on a path the peer has acknowledged before, that is a hard
     /// signal and the path goes `Suspect` (a never-acknowledged path is an
     /// old node, not a dead path; it keeps the discovery backoff instead).
-    /// Each timeout is one lost sample for the path's ETX.
+    /// Each timeout is one lost sample for the path's ETX. Both the interval
+    /// and the timeout stretch with the path's measured round trip, so a
+    /// circuit whose round trip exceeds `fast_ms` is neither flooded nor
+    /// declared dead every round trip: interval is at least the min RTT,
+    /// timeout at least three times the last RTT.
     ///
     /// The silence hint: our active path silent for two of the peer's
     /// intervals on it while a standby hears the peer triggers a probe now,
@@ -1422,10 +1467,11 @@ impl ActivePeer {
             }
             let ours = active == Some(i);
             let interval = if ours || path.remote_active {
-                fast_ms
+                fast_ms.max(path.min_rtt_ms().unwrap_or(0))
             } else {
                 slow_ms
             };
+            let timeout_ms = timeout_ms.max(path.last_rtt_ms.unwrap_or(0).saturating_mul(3));
 
             if let Some((_, sent_at)) = path.probe.outstanding
                 && now_ms.saturating_sub(sent_at) >= timeout_ms
@@ -1469,14 +1515,45 @@ impl ActivePeer {
                 interval.saturating_mul(1u64 << shift).min(slow_ms)
             };
             path.probe.next_at_ms = now_ms.saturating_add(delay.max(1));
+            let full_size = !path.acked_once
+                || path
+                    .last_full_probe_ms
+                    .is_none_or(|t| now_ms.saturating_sub(t) >= FULL_SIZE_PROBE_INTERVAL_MS);
+            if full_size {
+                path.last_full_probe_ms = Some(now_ms);
+            }
             plan.sends.push(HeartbeatSend {
                 transport_id: path.transport_id,
                 addr: path.addr.clone(),
                 probe_id: id,
                 remote_active: ours,
+                path_id: path.local_id,
+                full_size,
             });
         }
         plan
+    }
+
+    /// The peer closed the path we call `local_id` (a `PathClose` names
+    /// the receiver's id). Same as losing the transport under it: `Dead`
+    /// with history, traffic moved if it was there. Returns the transport
+    /// it was on alongside the outcome.
+    pub fn withdraw_path_by_local_id(
+        &mut self,
+        local_id: u32,
+        now_ms: u64,
+        policy: &PathPolicy,
+    ) -> Option<(TransportId, PathWithdrawal)> {
+        let transport_id = self
+            .send
+            .paths
+            .iter()
+            .find(|p| p.local_id == local_id)?
+            .transport_id;
+        Some((
+            transport_id,
+            self.withdraw_path(transport_id, now_ms, policy),
+        ))
     }
 
     /// Forget `Dead` paths older than `grace_ms`. The active path is never

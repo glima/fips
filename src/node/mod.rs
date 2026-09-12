@@ -634,6 +634,9 @@ pub struct Node {
     /// Last carrier reading per interface-bound transport, for the carrier
     /// edge the fast path tick detects. Absent until first read.
     carrier_seen: HashMap<TransportId, bool>,
+    /// Peers to tell that a path of ours is closing, queued by the carrier
+    /// poll and flushed on the same tick.
+    pending_path_closes: Vec<(NodeAddr, TransportId)>,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -920,6 +923,7 @@ impl Node {
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
             carrier_seen: HashMap::new(),
+            pending_path_closes: Vec::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -1094,6 +1098,7 @@ impl Node {
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
             carrier_seen: HashMap::new(),
+            pending_path_closes: Vec::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),

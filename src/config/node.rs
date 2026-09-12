@@ -1226,7 +1226,10 @@ pub struct PathConfig {
 
     /// Heartbeat interval on a path that either side sends on, in ms
     /// (`node.path.active_heartbeat_ms`). Standby paths use
-    /// `node.heartbeat_interval_secs`.
+    /// `node.heartbeat_interval_secs`. A floor: on a path whose round trip
+    /// is longer than this (Tor, Nym) the interval and the echo timeout
+    /// stretch with the measured round trip, so one setting serves a cable
+    /// and a circuit.
     #[serde(default = "PathConfig::default_active_heartbeat_ms")]
     pub active_heartbeat_ms: u64,
 }
@@ -1244,16 +1247,16 @@ impl Default for PathConfig {
 
 impl PathConfig {
     fn default_switch_margin() -> f64 {
-        1.5
+        1.3
     }
     fn default_switch_dwell_secs() -> u64 {
-        5
+        2
     }
     fn default_min_samples() -> u32 {
-        3
+        2
     }
     fn default_active_heartbeat_ms() -> u64 {
-        250
+        200
     }
 }
 

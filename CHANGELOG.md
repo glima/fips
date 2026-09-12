@@ -15,8 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index alone, so a frame from a known peer decrypts whichever transport
   delivered it. A peer holds a *path* per transport: the first from the
   handshake, further ones added by a `PathProbe`/`PathAck` exchange under the
-  existing session (two new inner link-message types, `0x52`/`0x53`; old
-  nodes drop them and the path stays unproven). The discovery gate probes a
+  existing session (three new inner link-message types, `0x52`/`0x53`/`0x54`;
+  old nodes drop them and the path stays unproven). The first probe on a
+  path and one a minute after are padded to the link MTU, so a medium that
+  passes small frames and drops large ones never proves itself. A node
+  that loses a path (interface gone, carrier lost) tells the peer with a
+  `PathClose` on a surviving path, so the peer moves at once rather than
+  after its own timeout. The discovery gate probes a
   live peer beaconing on a transport with no path to it, instead of
   re-dialling it. Every path is heartbeated on its own, fast on a path either
   side sends on and slow on a standby, and a lost carrier, a route gone on
