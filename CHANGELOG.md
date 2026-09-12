@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multi-path switchover: a peer reachable over more than one transport keeps
+  one Noise session and moves its traffic between transports on failure or
+  degradation, with no handshake. Encrypted frames are demuxed by session
+  index alone, so a frame from a known peer decrypts whichever transport
+  delivered it. A peer holds a *path* per transport: the first from the
+  handshake, further ones added by a `PathProbe`/`PathAck` exchange under the
+  existing session (two new inner link-message types, `0x52`/`0x53`; old
+  nodes drop them and the path stays unproven). The discovery gate probes a
+  live peer beaconing on a transport with no path to it, instead of
+  re-dialling it. Every path is heartbeated on its own, fast on a path either
+  side sends on and slow on a standby, and a lost carrier, a route gone on
+  send, an interface gone, or three unanswered heartbeats moves traffic to
+  the best proven standby inside a second; only a peer with no path left is
+  dropped. Selection is measured, not configured: per-path
+  `etx × (1 + min_rtt / 100)` with a margin and a dwell (`node.path.*`), so a
+  cable coming back under working wifi does not take traffic back until the
+  wifi degrades. A switch re-seeds the path MTU, tightens session MTUs and
+  holds the tree-visible link cost for the dwell so it does not ripple
+  mesh-wide. Operator overrides: `role: backup` on any transport, and
+  `fipsctl path show|pin|unpin`. `transports.udp.interface` binds a UDP
+  instance to one interface so two UDP instances can be two paths.
+  Design and calibration plan: `reference/fips-multi-path-switchover.md`.
+  Defaults are placeholders; the chaos scenarios that calibrate them are
+  still to be written.
+
+- An authentic frame arriving on a transport the peer has no path on no
+  longer re-pins the peer's send side to that transport, and a decrypt
+  failure on such a transport is not counted toward force-removal. Both
+  follow from index-only demux: without them an on-path relay rewriting a
+  source address, or twenty garbage frames carrying a sniffed index from
+  any bound transport, could move or tear down a peering.
+
 - Dynamic interface binding for the Ethernet transport. An interface-bound
   transport is now a long-lived object that is *sometimes bound*: the interface
   it names need not exist when the daemon starts, may appear minutes later, and
@@ -25,7 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on a wifi-only router) is bound and healthy rather than permanently
   `Degraded`, and starts carrying traffic the moment a port comes up. Whether
   an interface has carrier is reported separately as `interface.carrier` in
-  `show_transports`, never acted on.
+  `show_transports`; path selection reads it, presence does not.
 
   This closes the OpenWrt boot race (procd starts `fips` before wifi has
   created `fips-mesh0` / `fips-ap0`; both transports were skipped for the life

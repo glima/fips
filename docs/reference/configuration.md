@@ -441,6 +441,30 @@ Controls tree construction and parent selection.
 | `node.tree.flap_window_secs`           | u64   | `60`    | Sliding window for counting parent switches          |
 | `node.tree.flap_dampening_secs`        | u64   | `120`   | Extended hold-down duration when flap threshold exceeded |
 
+### Path Selection (`node.path.*`)
+
+A peer reachable over more than one transport keeps one Noise session and
+holds a *path* per transport. Further paths are added by a probe under the
+existing session (a beacon from a live peer on a transport with no path to
+it yet is probed, not dialled), each path is heartbeated on its own, and
+this node's traffic moves between them on failure or degradation with no
+handshake. Selection is measured, not configured: a path's score is
+`etx × (1 + min_rtt_ms / 100)` from its own probes. These knobs bound when a
+measured difference is acted on; their defaults are placeholders pending
+calibration.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `node.path.switch_margin` | f64 | `1.5` | Discretionary switch margin `K`: the active path's score must exceed the best standby's by this factor. Encodes the fail-back policy: a cable returning under working wifi (1.00 vs about 1.10) is under `K`, so traffic stays until the wifi degrades. |
+| `node.path.switch_dwell_secs` | u64 | `5` | The margin must hold this long before a discretionary switch. Also how long the link cost the tree sees is held at its pre-switch value after any switch. |
+| `node.path.min_samples` | u32 | `3` | RTT samples a standby needs before it is eligible. |
+| `node.path.active_heartbeat_ms` | u64 | `250` | Heartbeat interval on a path that either side sends on. Standbys use `node.heartbeat_interval_secs`. A heartbeat unanswered for three of these on a path the peer has acknowledged before marks it suspect, and selection leaves it at once. |
+
+A path losing its transport (interface gone), carrier (cable unplugged), or a
+route (`ENETUNREACH` on send) is left immediately when another proven path
+exists; only a peer with no path left is dropped. See
+`fipsctl path` in [cli-fipsctl.md](cli-fipsctl.md).
+
 ### Bloom Filter (`node.bloom.*`)
 
 | Parameter | Type | Default | Description |
@@ -640,6 +664,12 @@ adding entries and the precedence rules:
 
 ## Transports (`transports.*`)
 
+Every transport accepts `role: normal | backup` (default `normal`). A
+`backup` transport never carries a peer's traffic while any `normal` path to
+that peer is eligible, whatever the measurements say; it is a statement about
+the transport's purpose ("drop BLE when something better is stable"), not a
+rank. See `node.path.*`.
+
 ### UDP (`transports.udp.*`)
 
 | Parameter | Type | Default | Description |
@@ -652,6 +682,8 @@ adding entries and the precedence rules:
 | `transports.udp.public` | bool | `false` | If advertised: `true` publishes direct `host:port`; `false` publishes `udp:nat` rendezvous |
 | `transports.udp.external_addr` | string | *(none)* | Explicit advertise-as override. Bare IP (`"203.0.113.45"` — bind port is appended) or full `host:port`. Takes precedence over the bound address and STUN autodiscovery. Useful when the public IP isn't on a local interface (cloud 1:1 NAT, EIP) or to skip STUN for a deterministic value. |
 | `transports.udp.outbound_only` | bool | `false` | Pure-client posture. When `true`, the transport binds to `0.0.0.0:0` (kernel-assigned ephemeral port) regardless of `bind_addr`, refuses inbound handshake msg1, and is never advertised on Nostr regardless of `advertise_on_nostr`. |
+| `transports.udp.interface` | string | *(none)* | Bind the socket to one interface (e.g. `en0`), making this instance one path. Two instances bound to two interfaces give a peer reachable over both two paths. Linux binds both directions (`SO_BINDTODEVICE`); macOS binds egress only (`IP_BOUND_IF`), so inbound on a wildcard `bind_addr` still arrives from any interface there. Unsupported elsewhere (fails to start). |
+| `transports.udp.role` | string | `normal` | `normal` or `backup`; see above. |
 | `transports.udp.accept_connections` | bool | `true` | Accept inbound handshake msg1 from new peers. Combine with `outbound_only: false` and `accept_connections: false` (plus `auto_connect` on peer entries) for a node that initiates outbound links but rejects fresh inbound handshakes. The handshake handler carves out msg1 from peers already established on this transport so rekey continues to work. |
 
 ### Ethernet (`transports.ethernet.*`)
@@ -1276,6 +1308,11 @@ node:
   heartbeat_interval_secs: 10
   link_dead_timeout_secs: 30
   # drain_timeout_secs: 2            # bounded Draining phase; absent = 2s
+  path:
+    switch_margin: 1.5               # K: active score must exceed best standby's by this
+    switch_dwell_secs: 5             # D: margin must hold this long
+    min_samples: 3                   # N: RTT samples before a standby is eligible
+    active_heartbeat_ms: 250         # heartbeat on a path either side sends on
   limits:
     max_connections: 256
     max_peers: 128
