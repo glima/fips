@@ -1155,3 +1155,114 @@ async fn the_fast_tick_heartbeats_the_active_path_and_the_ack_measures_it() {
     let far = nodes[0].node.get_peer(nodes[1].node.node_addr()).unwrap();
     assert!(far.path_on(cable).unwrap().remote_active());
 }
+
+// ============================================================================
+// Tree dampening, fipsctl path, UDP interface (design §10, step 7)
+// ============================================================================
+
+#[test]
+fn a_switch_holds_the_reported_link_cost_for_the_dwell() {
+    let mut peer = dual_path_peer(200, 5);
+    let now = crate::time::mono_ms();
+    let before = peer.link_cost();
+    assert!(!peer.link_cost_held(now));
+    let p = PathPolicy {
+        dwell_ms: 60_000,
+        ..policy()
+    };
+    peer.pin_path(tid(WIFI));
+    peer.select_path(now, &p).expect("pinned switch");
+    assert!(peer.link_cost_held(now));
+    assert_eq!(peer.link_cost(), before, "held at the pre-switch cost");
+    assert!(!peer.link_cost_held(now + 60_001));
+
+    let p0 = PathPolicy {
+        dwell_ms: 0,
+        ..policy()
+    };
+    let mut peer = dual_path_peer(200, 5);
+    peer.pin_path(tid(WIFI));
+    peer.select_path(now, &p0).expect("pinned switch");
+    assert!(!peer.link_cost_held(now), "a zero dwell holds nothing");
+}
+
+#[tokio::test]
+async fn fipsctl_path_show_pin_and_unpin_go_through_the_control_api() {
+    let (nodes, _wifi_0, _wifi_1) = pair_with_wifi_live().await;
+    let mut nodes = nodes;
+    let npub_0 = nodes[0].node.identity().npub();
+
+    let shown = nodes[1].node.api_path_show(&npub_0).expect("known peer");
+    let paths = shown["paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(
+        paths.iter().filter(|p| p["active"] == true).count(),
+        1,
+        "exactly one active path"
+    );
+    assert!(paths.iter().all(|p| p["state"] == "live"));
+    assert!(paths.iter().all(|p| p["pinned"] == false));
+
+    let err = nodes[1].node.api_path_show("npub1notapeer").unwrap_err();
+    assert!(err.contains("invalid npub"), "{err}");
+
+    // Pin by numeric id (the loopback transports carry no name).
+    let pinned = nodes[1]
+        .node
+        .api_path_pin(&npub_0, &wifi().as_u32().to_string())
+        .expect("pin");
+    assert_eq!(pinned["pinned"], wifi().as_u32());
+    nodes[1].node.run_path_selection();
+    let addr_0 = *nodes[0].node.node_addr();
+    assert_eq!(
+        nodes[1].node.get_peer(&addr_0).unwrap().transport_id(),
+        Some(wifi()),
+        "the pin took on the next selection run"
+    );
+    let shown = nodes[1].node.api_path_show(&npub_0).unwrap();
+    assert!(
+        shown["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["pinned"] == true && p["active"] == true)
+    );
+
+    assert!(
+        nodes[1]
+            .node
+            .api_path_pin(&npub_0, "no-such-transport")
+            .is_err()
+    );
+    nodes[1].node.api_path_unpin(&npub_0).expect("unpin");
+    let shown = nodes[1].node.api_path_show(&npub_0).unwrap();
+    assert!(
+        shown["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["pinned"] == false)
+    );
+}
+
+#[test]
+fn udp_interface_config_parses() {
+    let cfg: crate::config::UdpConfig = serde_yaml::from_str("interface: en0\n").unwrap();
+    assert_eq!(cfg.interface.as_deref(), Some("en0"));
+    let cfg: crate::config::UdpConfig = serde_yaml::from_str("bind_addr: 0.0.0.0:1\n").unwrap();
+    assert!(cfg.interface.is_none());
+}
+
+#[test]
+fn binding_udp_to_a_missing_interface_fails_to_start() {
+    use crate::transport::udp::io::UdpRawSocket;
+    let err = UdpRawSocket::open_on_interface(
+        "127.0.0.1:0".parse().unwrap(),
+        65_536,
+        65_536,
+        Some("fips-absent-x0"),
+    )
+    .err()
+    .expect("an absent interface cannot be bound");
+    assert!(err.to_string().contains("fips-absent-x0"), "{err}");
+}

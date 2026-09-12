@@ -465,6 +465,10 @@ struct PeerSendState {
     /// When the active path first scored worse than the best standby by
     /// the margin; the discretionary dwell counts from here.
     discretionary_since_ms: Option<u64>,
+    /// `(cost, until_ms)`: the link cost reported to the tree is held at
+    /// its pre-switch value until `until_ms`, so a short switch (cable
+    /// flap, replug) does not ripple mesh-wide (design §10).
+    cost_hold: Option<(f64, u64)>,
     /// Link used to reach this peer.
     link_id: LinkId,
 
@@ -500,6 +504,7 @@ impl PeerSendState {
             paths: Vec::new(),
             active: None,
             discretionary_since_ms: None,
+            cost_hold: None,
             link_id,
             link_stats: LinkStats::new(),
             last_seen,
@@ -1202,6 +1207,7 @@ impl ActivePeer {
         };
         match self.best_alternative(idx, policy) {
             Some(next) => {
+                self.hold_link_cost(now_ms, policy.dwell_ms);
                 self.send.active = Some(next);
                 let path = &self.send.paths[next];
                 PathWithdrawal::Switched {
@@ -1275,10 +1281,12 @@ impl ActivePeer {
                 self.send.discretionary_since_ms = None;
                 return None;
             }
+            self.hold_link_cost(now_ms, policy.dwell_ms);
             return Some(self.switch_to(active, pin, SwitchReason::Pinned));
         }
         if !self.send.paths[active].is_eligible() {
             let next = self.best_alternative(active, policy)?;
+            self.hold_link_cost(now_ms, policy.dwell_ms);
             return Some(self.switch_to(active, next, SwitchReason::Mandatory));
         }
         let Some(active_score) = self.send.paths[active].score() else {
@@ -1318,7 +1326,13 @@ impl ActivePeer {
         if !active_is_backup_yielding && now_ms.saturating_sub(since) < policy.dwell_ms {
             return None;
         }
+        self.hold_link_cost(now_ms, policy.dwell_ms);
         Some(self.switch_to(active, next, SwitchReason::Discretionary))
+    }
+
+    /// Whether a post-switch cost hold is in force at `now_ms`.
+    pub fn link_cost_held(&self, now_ms: u64) -> bool {
+        self.send.cost_hold.is_some_and(|(_, until)| now_ms < until)
     }
 
     fn switch_to(&mut self, from: usize, to: usize, reason: SwitchReason) -> PathSwitch {
@@ -1657,10 +1671,24 @@ impl ActivePeer {
     ///
     /// Returns 1.0 (optimistic default) when MMP metrics are not yet
     /// available, matching depth-only parent selection behavior.
+    ///
+    /// Reads the smoothed (long EWMA) ETX rather than the per-report value:
+    /// after a path switch the next report spans the gap and produces one
+    /// ETX spike, which must not reach the tree. While a cost hold is in
+    /// force after a switch the pre-switch cost is returned instead.
     pub fn link_cost(&self) -> f64 {
+        if let Some((held, until_ms)) = self.send.cost_hold
+            && crate::time::mono_ms() < until_ms
+        {
+            return held;
+        }
+        self.raw_link_cost()
+    }
+
+    fn raw_link_cost(&self) -> f64 {
         match self.mmp() {
             Some(mmp) => {
-                let etx = mmp.metrics.etx;
+                let etx = mmp.metrics.smoothed_etx().unwrap_or(mmp.metrics.etx);
                 match mmp.metrics.srtt_ms() {
                     Some(srtt_ms) => etx * (1.0 + srtt_ms / 100.0),
                     None => 1.0,
@@ -1668,6 +1696,15 @@ impl ActivePeer {
             }
             None => 1.0,
         }
+    }
+
+    /// Hold the reported link cost at its current value for `hold_ms`.
+    fn hold_link_cost(&mut self, now_ms: u64, hold_ms: u64) {
+        if hold_ms == 0 {
+            return;
+        }
+        let cost = self.link_cost();
+        self.send.cost_hold = Some((cost, now_ms.saturating_add(hold_ms)));
     }
 
     /// Whether this peer has at least one MMP RTT measurement.

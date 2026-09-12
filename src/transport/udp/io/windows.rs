@@ -26,6 +26,21 @@ impl UdpRawSocket {
     /// Sets non-blocking mode and configures buffer sizes. The socket
     /// is bound immediately so `local_addr()` returns the actual
     /// assigned address (important when binding to port 0).
+    /// [`open`](Self::open); naming an interface is not supported here.
+    pub fn open_on_interface(
+        bind_addr: SocketAddr,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+        interface: Option<&str>,
+    ) -> Result<Self, TransportError> {
+        if let Some(name) = interface {
+            return Err(TransportError::NotSupported(format!(
+                "udp.interface ({name}) is supported on Linux and macOS only"
+            )));
+        }
+        Self::open(bind_addr, recv_buf_size, send_buf_size)
+    }
+
     pub fn open(
         bind_addr: SocketAddr,
         recv_buf_size: usize,

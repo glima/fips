@@ -75,7 +75,6 @@ impl Node {
 
     /// Pin a peer's traffic to its path on `transport_id`. Applies on the
     /// next selection run. `false` if the peer or the path is unknown.
-    #[allow(dead_code)] // wired by `fipsctl path pin`
     pub(crate) fn pin_peer_path(
         &mut self,
         node_addr: &NodeAddr,
@@ -87,7 +86,6 @@ impl Node {
     }
 
     /// Clear a peer's pin. `false` if the peer is unknown.
-    #[allow(dead_code)] // wired by `fipsctl path unpin`
     pub(crate) fn unpin_peer_path(&mut self, node_addr: &NodeAddr) -> bool {
         match self.peers.get_mut(node_addr) {
             Some(p) => {
@@ -96,6 +94,95 @@ impl Node {
             }
             None => false,
         }
+    }
+
+    fn resolve_peer_npub(&self, npub: &str) -> Result<NodeAddr, String> {
+        let identity = crate::PeerIdentity::from_npub(npub)
+            .map_err(|e| format!("invalid npub '{npub}': {e}"))?;
+        let node_addr = *identity.node_addr();
+        if !self.peers.contains_key(&node_addr) {
+            return Err(format!("peer not found: {npub}"));
+        }
+        Ok(node_addr)
+    }
+
+    /// A transport named by its instance name (`cable`, `main`) or its
+    /// numeric id.
+    fn resolve_transport_name(&self, name: &str) -> Result<TransportId, String> {
+        if let Some((id, _)) = self.transports.iter().find(|(_, t)| t.name() == Some(name)) {
+            return Ok(*id);
+        }
+        if let Ok(n) = name.parse::<u32>()
+            && self.transports.contains_key(&TransportId::new(n))
+        {
+            return Ok(TransportId::new(n));
+        }
+        Err(format!("transport not found: {name}"))
+    }
+
+    /// `fipsctl path show <peer>`: every path to the peer, per direction.
+    pub(crate) fn api_path_show(&self, npub: &str) -> Result<serde_json::Value, String> {
+        let node_addr = self.resolve_peer_npub(npub)?;
+        let peer = &self.peers[&node_addr];
+        let now_ms = crate::time::mono_ms();
+        let active = peer.transport_id();
+        let paths: Vec<serde_json::Value> = peer
+            .paths()
+            .iter()
+            .map(|path| {
+                let ago = |at: Option<u64>| at.map(|t| now_ms.saturating_sub(t));
+                serde_json::json!({
+                    "transport_id": path.transport_id().as_u32(),
+                    "transport": self
+                        .transports
+                        .get(&path.transport_id())
+                        .and_then(|t| t.name().map(str::to_string)),
+                    "addr": path.addr().to_string(),
+                    "state": format!("{:?}", path.state()).to_lowercase(),
+                    "active": Some(path.transport_id()) == active,
+                    "remote_active": path.remote_active(),
+                    "role": format!("{:?}", path.role()).to_lowercase(),
+                    "pinned": path.pinned(),
+                    "rx_live_ms_ago": ago(path.rx_live_at_ms()),
+                    "tx_live_ms_ago": ago(path.tx_live_at_ms()),
+                    "acked_once": path.acked_once(),
+                    "last_rtt_ms": path.last_rtt_ms(),
+                    "min_rtt_ms": path.min_rtt_ms(),
+                    "rtt_samples": path.rtt_samples(),
+                    "etx": path.etx(),
+                    "score": path.score(),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "peer": npub,
+            "link_cost": peer.link_cost(),
+            "link_cost_held": peer.link_cost_held(now_ms),
+            "paths": paths,
+        }))
+    }
+
+    /// `fipsctl path pin <peer> <transport>`.
+    pub(crate) fn api_path_pin(
+        &mut self,
+        npub: &str,
+        transport: &str,
+    ) -> Result<serde_json::Value, String> {
+        let node_addr = self.resolve_peer_npub(npub)?;
+        let transport_id = self.resolve_transport_name(transport)?;
+        if !self.pin_peer_path(&node_addr, transport_id) {
+            return Err(format!("peer {npub} has no path on transport {transport}"));
+        }
+        info!(peer = %self.peer_display_name(&node_addr), %transport_id, "Path pinned by operator");
+        Ok(serde_json::json!({ "pinned": transport_id.as_u32() }))
+    }
+
+    /// `fipsctl path unpin <peer>`.
+    pub(crate) fn api_path_unpin(&mut self, npub: &str) -> Result<serde_json::Value, String> {
+        let node_addr = self.resolve_peer_npub(npub)?;
+        self.unpin_peer_path(&node_addr);
+        info!(peer = %self.peer_display_name(&node_addr), "Path unpinned by operator");
+        Ok(serde_json::json!({ "pinned": serde_json::Value::Null }))
     }
 
     /// Probe `transport_id`/`remote_addr` as a path to a live peer, if the

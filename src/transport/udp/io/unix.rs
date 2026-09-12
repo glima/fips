@@ -41,10 +41,25 @@ impl UdpRawSocket {
     ///
     /// Enables `SO_RXQ_OVFL` for kernel drop counting (non-fatal if
     /// unsupported). Sets non-blocking mode for async integration.
+    #[cfg_attr(not(test), allow(dead_code))] // the transport names an interface option
     pub fn open(
         bind_addr: SocketAddr,
         recv_buf_size: usize,
         send_buf_size: usize,
+    ) -> Result<Self, TransportError> {
+        Self::open_on_interface(bind_addr, recv_buf_size, send_buf_size, None)
+    }
+
+    /// [`open`](Self::open), bound to `interface` if one is named.
+    ///
+    /// Linux: `SO_BINDTODEVICE`, both directions. macOS: `IP_BOUND_IF` /
+    /// `IPV6_BOUND_IF`, egress only. Elsewhere naming an interface is an
+    /// error rather than a silent no-op.
+    pub fn open_on_interface(
+        bind_addr: SocketAddr,
+        recv_buf_size: usize,
+        send_buf_size: usize,
+        interface: Option<&str>,
     ) -> Result<Self, TransportError> {
         let domain = if bind_addr.is_ipv4() {
             Domain::IPV4
@@ -56,6 +71,10 @@ impl UdpRawSocket {
 
         sock.set_nonblocking(true)
             .map_err(|e| TransportError::StartFailed(format!("set nonblocking failed: {}", e)))?;
+
+        if let Some(name) = interface {
+            bind_to_interface(&sock, name, bind_addr.is_ipv4())?;
+        }
 
         sock.bind(&bind_addr.into())
             .map_err(|e| TransportError::StartFailed(format!("bind failed: {}", e)))?;
@@ -492,4 +511,36 @@ mod tests {
         storage.ss_family = libc::AF_UNIX as libc::sa_family_t;
         assert!(sockaddr_to_socket_addr(&storage).is_err());
     }
+}
+
+/// Bind `sock` to the named interface, per platform.
+#[cfg(target_os = "linux")]
+fn bind_to_interface(sock: &Socket, name: &str, _v4: bool) -> Result<(), TransportError> {
+    sock.bind_device(Some(name.as_bytes()))
+        .map_err(|e| TransportError::StartFailed(format!("bind to interface {name} failed: {e}")))
+}
+
+/// Bind `sock` to the named interface, per platform.
+#[cfg(target_os = "macos")]
+fn bind_to_interface(sock: &Socket, name: &str, v4: bool) -> Result<(), TransportError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| TransportError::StartFailed(format!("invalid interface name {name:?}")))?;
+    // SAFETY: `c_name` is a valid NUL-terminated string for the call's duration.
+    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    let index = std::num::NonZeroU32::new(index)
+        .ok_or_else(|| TransportError::StartFailed(format!("interface {name} not found")))?;
+    let result = if v4 {
+        sock.bind_device_by_index_v4(Some(index))
+    } else {
+        sock.bind_device_by_index_v6(Some(index))
+    };
+    result.map_err(|e| TransportError::StartFailed(format!("bind to interface {name} failed: {e}")))
+}
+
+/// Bind `sock` to the named interface, per platform.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn bind_to_interface(_sock: &Socket, name: &str, _v4: bool) -> Result<(), TransportError> {
+    Err(TransportError::NotSupported(format!(
+        "udp.interface ({name}) is supported on Linux and macOS only"
+    )))
 }
