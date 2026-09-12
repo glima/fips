@@ -15,12 +15,89 @@
 
 use crate::NodeAddr;
 use crate::node::Node;
-use crate::peer::PathWithdrawal;
+use crate::peer::{PathPolicy, PathSwitch, PathWithdrawal};
 use crate::proto::link::PathMessage;
 use crate::transport::{TransportAddr, TransportId};
 use tracing::{debug, info, trace};
 
 impl Node {
+    /// The selection knobs, from `node.path.*`.
+    pub(in crate::node) fn path_policy(&self) -> PathPolicy {
+        let cfg = &self.config().node.path;
+        let standby_ms = self
+            .config()
+            .node
+            .heartbeat_interval_secs
+            .saturating_mul(1000);
+        PathPolicy {
+            margin: cfg.switch_margin,
+            dwell_ms: cfg.switch_dwell_secs.saturating_mul(1000),
+            min_samples: cfg.min_samples,
+            rtt_window_ms: standby_ms
+                .saturating_mul(u64::from(cfg.min_samples).max(1))
+                .saturating_mul(2)
+                .max(30_000),
+        }
+    }
+
+    /// The role of the transport `transport_id`, or `Normal` if it is not
+    /// registered.
+    fn transport_role(&self, transport_id: TransportId) -> crate::config::TransportRole {
+        self.transports
+            .get(&transport_id)
+            .map(|t| t.role())
+            .unwrap_or_default()
+    }
+
+    /// Run selection for every peer. Called from the tick. A switch here is
+    /// discretionary or pinned, or mandatory after a `Suspect` mark that
+    /// nothing else acted on; the presence edge runs its own.
+    pub(in crate::node) fn run_path_selection(&mut self) {
+        let policy = self.path_policy();
+        let now_ms = crate::time::mono_ms();
+        let switches: Vec<(NodeAddr, PathSwitch)> = self
+            .peers
+            .iter_mut()
+            .filter_map(|(addr, peer)| peer.select_path(now_ms, &policy).map(|s| (*addr, s)))
+            .collect();
+        for (node_addr, switch) in switches {
+            info!(
+                peer = %self.peer_display_name(&node_addr),
+                from_transport = %switch.from.0,
+                to_transport = %switch.to.0,
+                to_addr = %switch.to.1,
+                reason = ?switch.reason,
+                "Path switched, session kept"
+            );
+            self.apply_path_switch(&node_addr, switch.to);
+        }
+    }
+
+    /// Pin a peer's traffic to its path on `transport_id`. Applies on the
+    /// next selection run. `false` if the peer or the path is unknown.
+    #[allow(dead_code)] // wired by `fipsctl path pin`
+    pub(crate) fn pin_peer_path(
+        &mut self,
+        node_addr: &NodeAddr,
+        transport_id: TransportId,
+    ) -> bool {
+        self.peers
+            .get_mut(node_addr)
+            .is_some_and(|p| p.pin_path(transport_id))
+    }
+
+    /// Clear a peer's pin. `false` if the peer is unknown.
+    #[allow(dead_code)] // wired by `fipsctl path unpin`
+    pub(crate) fn unpin_peer_path(&mut self, node_addr: &NodeAddr) -> bool {
+        match self.peers.get_mut(node_addr) {
+            Some(p) => {
+                p.unpin_paths();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Probe `transport_id`/`remote_addr` as a path to a live peer, if the
     /// per-path backoff allows it.
     ///
@@ -49,6 +126,7 @@ impl Node {
             .saturating_mul(1000)
             .max(base_ms);
 
+        let role = self.transport_role(transport_id);
         let Some(peer) = self.peers.get_mut(&node_addr) else {
             return;
         };
@@ -57,7 +135,8 @@ impl Node {
             // alive by heartbeats, not probes.
             return;
         }
-        peer.add_path(transport_id, remote_addr.clone());
+        peer.add_path(transport_id, remote_addr.clone())
+            .set_role(role);
         let Some((probe_id, remote_active)) =
             peer.take_probe(transport_id, now_ms, base_ms, cap_ms)
         else {
@@ -115,6 +194,7 @@ impl Node {
         };
         let (transport_id, remote_addr) = arrival;
         let now_ms = crate::time::mono_ms();
+        let role = self.transport_role(transport_id);
         let Some(peer) = self.peers.get_mut(from) else {
             return;
         };
@@ -125,6 +205,9 @@ impl Node {
             probe.remote_active,
             now_ms,
         );
+        if was_new {
+            peer.set_path_role(transport_id, role);
+        }
         let ours_active = peer.transport_id() == Some(transport_id);
         if was_new {
             debug!(
@@ -175,13 +258,20 @@ impl Node {
         };
         let (transport_id, _) = arrival;
         let now_ms = crate::time::mono_ms();
+        let window_ms = self.path_policy().rtt_window_ms;
         let Some(peer) = self.peers.get_mut(from) else {
             return;
         };
         let was_live = peer
             .path_on(transport_id)
             .is_some_and(|p| p.state() == crate::peer::PathState::Live);
-        match peer.note_path_ack(transport_id, ack.probe_id, ack.remote_active, now_ms) {
+        match peer.note_path_ack(
+            transport_id,
+            ack.probe_id,
+            ack.remote_active,
+            now_ms,
+            window_ms,
+        ) {
             Some(rtt_ms) if !was_live => debug!(
                 peer = %self.peer_display_name(from),
                 transport_id = %transport_id,
@@ -218,6 +308,7 @@ impl Node {
     /// not a link event. Deliberately undamped, like the reap it grew from.
     pub(in crate::node) async fn withdraw_transport(&mut self, transport_id: TransportId) -> usize {
         let now_ms = crate::time::mono_ms();
+        let policy = self.path_policy();
         let affected: Vec<NodeAddr> = self
             .peers
             .iter()
@@ -236,7 +327,7 @@ impl Node {
         let mut reaped = 0;
         for node_addr in affected {
             let outcome = match self.peers.get_mut(&node_addr) {
-                Some(peer) => peer.withdraw_path(transport_id, now_ms),
+                Some(peer) => peer.withdraw_path(transport_id, now_ms, &policy),
                 None => continue,
             };
             match outcome {

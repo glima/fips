@@ -3,7 +3,7 @@
 //! Represents a fully authenticated peer after successful Noise handshake.
 //! ActivePeer holds tree state, Bloom filter, and routing information.
 
-use crate::config::MmpConfig;
+use crate::config::{MmpConfig, TransportRole};
 use crate::node::REKEY_JITTER_SECS;
 use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
 use crate::proto::bloom::BloomFilter;
@@ -14,8 +14,21 @@ use crate::utils::index::SessionIndex;
 use crate::{FipsAddress, NodeAddr, PeerIdentity};
 use rand::RngExt;
 use secp256k1::XOnlyPublicKey;
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::Instant;
+
+/// Fold one probe outcome into a path's ETX: the long EWMA (α = 1/32) of
+/// the delivery ratio, inverted and clamped like the link ETX. Per report a
+/// raw value is a flap generator on a lightly loaded link; the long average
+/// is what selection reads.
+fn smooth_etx(etx: f64, delivered: bool) -> f64 {
+    let alpha = crate::proto::mmp::EWMA_LONG_ALPHA;
+    let ratio = (1.0 / etx).clamp(0.01, 1.0);
+    let sample = if delivered { 1.0 } else { 0.0 };
+    let next = ratio + alpha * (sample - ratio);
+    (1.0 / next.max(0.01)).clamp(1.0, 100.0)
+}
 
 /// Draw a fresh per-session rekey jitter from `[-REKEY_JITTER_SECS, +REKEY_JITTER_SECS]`.
 fn draw_rekey_jitter() -> i64 {
@@ -99,6 +112,50 @@ struct ProbeState {
     next_at_ms: u64,
 }
 
+/// The knobs selection is bounded by. Built from `node.path.*`.
+#[derive(Clone, Copy, Debug)]
+pub struct PathPolicy {
+    /// Discretionary switch margin `K`.
+    pub margin: f64,
+    /// Discretionary switch dwell `D`, ms.
+    pub dwell_ms: u64,
+    /// RTT samples `N` a path needs before it is selectable.
+    pub min_samples: u32,
+    /// The min-RTT window, ms. At least `N` standby heartbeat intervals,
+    /// otherwise a standby never accumulates a min.
+    pub rtt_window_ms: u64,
+}
+
+impl PathPolicy {
+    /// Everything selectable at once; for tests.
+    pub const PERMISSIVE: Self = Self {
+        margin: 1.5,
+        dwell_ms: 0,
+        min_samples: 0,
+        rtt_window_ms: u64::MAX,
+    };
+}
+
+/// Why selection moved the active path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchReason {
+    /// The active path was not `tx_live`: switched at once, no margin.
+    Mandatory,
+    /// The active path scored worse than the best standby by the margin,
+    /// for the dwell.
+    Discretionary,
+    /// The operator pinned another path.
+    Pinned,
+}
+
+/// Selection moved the active path from `from` to `to`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathSwitch {
+    pub from: (TransportId, TransportAddr),
+    pub to: (TransportId, TransportAddr),
+    pub reason: SwitchReason,
+}
+
 /// What withdrawing a path did to the peer's send side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PathWithdrawal {
@@ -146,6 +203,23 @@ pub struct PeerPath {
     /// When the path went `Dead`, for the history grace period.
     dead_since_ms: Option<u64>,
     probe: ProbeState,
+    /// `(sampled_at_ms, rtt_ms)` probe round trips inside the min-RTT
+    /// window. Min, not smoothed: srtt inflates under load (wifi
+    /// bufferbloat) while an idle standby looks pristine, which is a
+    /// ping-pong generator; min RTT is a property of the medium.
+    rtt_window: VecDeque<(u64, u64)>,
+    /// Per-path expected transmission count, from the probe/heartbeat ack
+    /// ratio, long-EWMA smoothed. 1.0 until measured.
+    etx: f64,
+    /// Whether the peer has ever acknowledged a probe on this path. Gates
+    /// the failed-echo signal: a peer that never answers probes is an old
+    /// node, not a dead path.
+    acked_once: bool,
+    /// From the transport's config: a `Backup` path never carries traffic
+    /// while a `Normal` one is eligible.
+    role: TransportRole,
+    /// Operator override: wins selection while it is `tx_live`.
+    pinned: bool,
 
     /// Unix UDP fast-path: per-path `connect()`-ed socket (paired with
     /// the listen socket via `SO_REUSEPORT`). The kernel demux prefers
@@ -176,6 +250,11 @@ impl PeerPath {
             last_rtt_ms: None,
             dead_since_ms: None,
             probe: ProbeState::default(),
+            rtt_window: VecDeque::new(),
+            etx: 1.0,
+            acked_once: false,
+            role: TransportRole::Normal,
+            pinned: false,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             connected_udp: None,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -222,6 +301,65 @@ impl PeerPath {
     /// acknowledged hearing us on it.
     pub fn is_eligible(&self) -> bool {
         self.state == PathState::Live && self.tx_live_at_ms.is_some()
+    }
+
+    /// The transport's role, from its config.
+    pub fn role(&self) -> TransportRole {
+        self.role
+    }
+
+    /// Record the transport's role.
+    pub fn set_role(&mut self, role: TransportRole) {
+        self.role = role;
+    }
+
+    /// Whether the operator pinned traffic to this path.
+    pub fn pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Whether the peer has ever acknowledged a probe here.
+    pub fn acked_once(&self) -> bool {
+        self.acked_once
+    }
+
+    /// Minimum probe round trip inside the window, ms.
+    pub fn min_rtt_ms(&self) -> Option<u64> {
+        self.rtt_window.iter().map(|(_, rtt)| *rtt).min()
+    }
+
+    /// RTT samples inside the window.
+    pub fn rtt_samples(&self) -> u32 {
+        self.rtt_window.len() as u32
+    }
+
+    /// Per-path expected transmission count, smoothed.
+    pub fn etx(&self) -> f64 {
+        self.etx
+    }
+
+    /// The path's quality index, `etx × (1 + min_rtt_ms / 100)`, lower is
+    /// better. `None` until an RTT has been measured.
+    pub fn score(&self) -> Option<f64> {
+        self.min_rtt_ms()
+            .map(|rtt| self.etx * (1.0 + rtt as f64 / 100.0))
+    }
+
+    /// Whether selection may pick this path: eligible, with enough samples,
+    /// per `policy`.
+    pub fn is_selectable(&self, policy: &PathPolicy) -> bool {
+        self.is_eligible() && self.rtt_samples() >= policy.min_samples
+    }
+
+    fn record_rtt(&mut self, now_ms: u64, rtt_ms: u64, window_ms: u64) {
+        self.rtt_window.push_back((now_ms, rtt_ms));
+        while let Some((at, _)) = self.rtt_window.front() {
+            if now_ms.saturating_sub(*at) > window_ms {
+                self.rtt_window.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     /// Whether a probe may be sent now, per the backoff.
@@ -304,6 +442,9 @@ struct PeerSendState {
     /// Index into `paths` of the path *our* frames go out on. `None` only
     /// while `paths` is empty.
     active: Option<usize>,
+    /// When the active path first scored worse than the best standby by
+    /// the margin; the discretionary dwell counts from here.
+    discretionary_since_ms: Option<u64>,
     /// Link used to reach this peer.
     link_id: LinkId,
 
@@ -338,6 +479,7 @@ impl PeerSendState {
             session_start,
             paths: Vec::new(),
             active: None,
+            discretionary_since_ms: None,
             link_id,
             link_stats: LinkStats::new(),
             last_seen,
@@ -964,6 +1106,7 @@ impl ActivePeer {
         probe_id: u32,
         remote_active: bool,
         now_ms: u64,
+        rtt_window_ms: u64,
     ) -> Option<u64> {
         let path = self.path_on_mut(transport_id)?;
         let (outstanding_id, sent_at_ms) = path.probe.outstanding?;
@@ -975,6 +1118,9 @@ impl ActivePeer {
         path.probe.next_at_ms = 0;
         let rtt_ms = now_ms.saturating_sub(sent_at_ms);
         path.last_rtt_ms = Some(rtt_ms);
+        path.record_rtt(now_ms, rtt_ms, rtt_window_ms);
+        path.acked_once = true;
+        path.etx = smooth_etx(path.etx, true);
         path.rx_live_at_ms = Some(now_ms);
         path.tx_live_at_ms = Some(now_ms);
         path.remote_active = remote_active;
@@ -1001,7 +1147,12 @@ impl ActivePeer {
     /// path the active index is left where it was and the caller reaps the
     /// peer; a `Probing` path is never promoted, because nothing has proven
     /// it carries anything.
-    pub fn withdraw_path(&mut self, transport_id: TransportId, now_ms: u64) -> PathWithdrawal {
+    pub fn withdraw_path(
+        &mut self,
+        transport_id: TransportId,
+        now_ms: u64,
+        policy: &PathPolicy,
+    ) -> PathWithdrawal {
         let Some(idx) = self
             .send
             .paths
@@ -1025,15 +1176,7 @@ impl ActivePeer {
             let path = &self.send.paths[idx];
             (path.transport_id, path.addr.clone())
         };
-        let best = self
-            .send
-            .paths
-            .iter()
-            .enumerate()
-            .filter(|(i, path)| *i != idx && path.is_eligible())
-            .min_by_key(|(_, path)| path.last_rtt_ms.unwrap_or(u64::MAX))
-            .map(|(i, _)| i);
-        match best {
+        match self.best_alternative(idx, policy) {
             Some(next) => {
                 self.send.active = Some(next);
                 let path = &self.send.paths[next];
@@ -1043,6 +1186,158 @@ impl ActivePeer {
                 }
             }
             None => PathWithdrawal::NoAlternative,
+        }
+    }
+
+    /// The best path other than `exclude` to move traffic to, if any.
+    ///
+    /// Selectable paths first (eligible with `N` samples), lowest score,
+    /// `Normal` before `Backup`; failing that, any eligible path by last
+    /// RTT: a `Live` path with fewer than `N` samples beats no path. A
+    /// `Probing` path is never returned.
+    fn best_alternative(&self, exclude: usize, policy: &PathPolicy) -> Option<usize> {
+        let candidates = || {
+            self.send
+                .paths
+                .iter()
+                .enumerate()
+                .filter(move |(i, _)| *i != exclude)
+        };
+        let any_normal_selectable =
+            candidates().any(|(_, p)| p.is_selectable(policy) && p.role == TransportRole::Normal);
+        let selectable = candidates()
+            .filter(|(_, p)| {
+                p.is_selectable(policy)
+                    && (p.role == TransportRole::Normal || !any_normal_selectable)
+            })
+            .min_by(|(_, a), (_, b)| {
+                a.score()
+                    .unwrap_or(f64::MAX)
+                    .total_cmp(&b.score().unwrap_or(f64::MAX))
+            })
+            .map(|(i, _)| i);
+        if selectable.is_some() {
+            return selectable;
+        }
+        let any_normal_eligible =
+            candidates().any(|(_, p)| p.is_eligible() && p.role == TransportRole::Normal);
+        candidates()
+            .filter(|(_, p)| {
+                p.is_eligible() && (p.role == TransportRole::Normal || !any_normal_eligible)
+            })
+            .min_by_key(|(_, p)| p.last_rtt_ms.unwrap_or(u64::MAX))
+            .map(|(i, _)| i)
+    }
+
+    /// Run selection over the path set (design §8). Returns the switch if
+    /// the active path changed.
+    ///
+    /// - **Pinned:** a pinned path wins while it is `tx_live`.
+    /// - **Mandatory:** active path not `tx_live` (`Suspect`/`Dead`) →
+    ///   best alternative now, no margin, no dwell.
+    /// - **Discretionary:** `active.score > best.score × K`, sustained for
+    ///   the dwell → switch. Only selectable paths compete here, and only
+    ///   when the active path itself has a score.
+    /// - Ties keep the current path.
+    pub fn select_path(&mut self, now_ms: u64, policy: &PathPolicy) -> Option<PathSwitch> {
+        let active = self.send.active?;
+        let pinned = self
+            .send
+            .paths
+            .iter()
+            .position(|p| p.pinned && p.is_eligible());
+        if let Some(pin) = pinned {
+            if pin == active {
+                self.send.discretionary_since_ms = None;
+                return None;
+            }
+            return Some(self.switch_to(active, pin, SwitchReason::Pinned));
+        }
+        if !self.send.paths[active].is_eligible() {
+            let next = self.best_alternative(active, policy)?;
+            return Some(self.switch_to(active, next, SwitchReason::Mandatory));
+        }
+        let Some(active_score) = self.send.paths[active].score() else {
+            self.send.discretionary_since_ms = None;
+            return None;
+        };
+        let any_normal_selectable = self
+            .send
+            .paths
+            .iter()
+            .any(|p| p.is_selectable(policy) && p.role == TransportRole::Normal);
+        let best = self
+            .send
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| {
+                *i != active
+                    && p.is_selectable(policy)
+                    && (p.role == TransportRole::Normal || !any_normal_selectable)
+            })
+            .filter_map(|(i, p)| p.score().map(|s| (i, s)))
+            .min_by(|(_, a), (_, b)| a.total_cmp(b));
+        let Some((next, best_score)) = best else {
+            self.send.discretionary_since_ms = None;
+            return None;
+        };
+        // A `Backup` active path yields to a selectable `Normal` one outright:
+        // its role says it should not be carrying traffic at all.
+        let active_is_backup_yielding = self.send.paths[active].role == TransportRole::Backup
+            && self.send.paths[next].role == TransportRole::Normal;
+        if !active_is_backup_yielding && active_score <= best_score * policy.margin {
+            self.send.discretionary_since_ms = None;
+            return None;
+        }
+        let since = *self.send.discretionary_since_ms.get_or_insert(now_ms);
+        if !active_is_backup_yielding && now_ms.saturating_sub(since) < policy.dwell_ms {
+            return None;
+        }
+        Some(self.switch_to(active, next, SwitchReason::Discretionary))
+    }
+
+    fn switch_to(&mut self, from: usize, to: usize, reason: SwitchReason) -> PathSwitch {
+        self.send.discretionary_since_ms = None;
+        let from_path = &self.send.paths[from];
+        let from_key = (from_path.transport_id, from_path.addr.clone());
+        self.send.active = Some(to);
+        let to_path = &self.send.paths[to];
+        PathSwitch {
+            from: from_key,
+            to: (to_path.transport_id, to_path.addr.clone()),
+            reason,
+        }
+    }
+
+    /// Pin traffic to the path on `transport_id`. Returns `false` if the
+    /// peer has no path there. Selection honours the pin on its next run.
+    pub fn pin_path(&mut self, transport_id: TransportId) -> bool {
+        let Some(idx) = self
+            .send
+            .paths
+            .iter()
+            .position(|p| p.transport_id == transport_id)
+        else {
+            return false;
+        };
+        for (i, p) in self.send.paths.iter_mut().enumerate() {
+            p.pinned = i == idx;
+        }
+        true
+    }
+
+    /// Clear any pin.
+    pub fn unpin_paths(&mut self) {
+        for p in self.send.paths.iter_mut() {
+            p.pinned = false;
+        }
+    }
+
+    /// Record the transport's role on the path over `transport_id`.
+    pub fn set_path_role(&mut self, transport_id: TransportId, role: TransportRole) {
+        if let Some(path) = self.path_on_mut(transport_id) {
+            path.role = role;
         }
     }
 

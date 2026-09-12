@@ -726,3 +726,188 @@ async fn garbage_on_a_standby_path_counts_against_the_peer() {
         "a path in the set is a transport the peer is on"
     );
 }
+
+// ============================================================================
+// Selection (design §8)
+// ============================================================================
+
+use crate::config::TransportRole;
+use crate::peer::{ActivePeer, PathPolicy, SwitchReason};
+
+const CABLE: u32 = 1;
+const WIFI: u32 = 2;
+
+fn tid(n: u32) -> TransportId {
+    TransportId::new(n)
+}
+
+/// Feed the path on `t` one acknowledged probe with round trip `rtt_ms`,
+/// as the heartbeat exchange would. Returns the clock after the ack.
+fn sample(peer: &mut ActivePeer, t: u32, now_ms: u64, rtt_ms: u64) -> u64 {
+    let (id, _) = peer
+        .take_probe(tid(t), now_ms, 1, 1)
+        .expect("a probe is due: the last one was acked");
+    peer.note_path_ack(tid(t), id, false, now_ms + rtt_ms, u64::MAX)
+        .expect("the ack matches");
+    now_ms + rtt_ms
+}
+
+/// A peer active on the cable with three samples at `cable_rtt`, and a
+/// wifi standby with three samples at `wifi_rtt`.
+fn dual_path_peer(cable_rtt: u64, wifi_rtt: u64) -> ActivePeer {
+    let mut peer = ActivePeer::new(make_peer_identity(), LinkId::new(1), 0);
+    peer.rebind_transport(tid(CABLE), TransportAddr::from_string("10.0.0.1:1"));
+    peer.add_path(tid(WIFI), TransportAddr::from_string("10.0.0.7:1"));
+    let mut now = 1_000;
+    for _ in 0..3 {
+        now = sample(&mut peer, CABLE, now, cable_rtt);
+        now = sample(&mut peer, WIFI, now, wifi_rtt);
+    }
+    assert_eq!(peer.transport_id(), Some(tid(CABLE)));
+    peer
+}
+
+fn policy() -> PathPolicy {
+    PathPolicy {
+        margin: 1.5,
+        dwell_ms: 5_000,
+        min_samples: 3,
+        rtt_window_ms: u64::MAX,
+    }
+}
+
+#[test]
+fn a_cable_under_a_slightly_better_wifi_is_not_left() {
+    // 1.00 vs 1.10 in the design's table: ratio under K, stay.
+    let mut peer = dual_path_peer(10, 1);
+    assert!(peer.select_path(100_000, &policy()).is_none());
+    assert!(peer.select_path(200_000, &policy()).is_none());
+    assert_eq!(peer.transport_id(), Some(tid(CABLE)));
+}
+
+#[test]
+fn a_degraded_active_path_is_left_after_the_dwell() {
+    // cable 200 ms → score 3.0; wifi 5 ms → 1.05. Ratio 2.9 > K.
+    let mut peer = dual_path_peer(200, 5);
+    assert!(
+        peer.select_path(100_000, &policy()).is_none(),
+        "dwell starts"
+    );
+    assert!(
+        peer.select_path(104_999, &policy()).is_none(),
+        "dwell running"
+    );
+    let switch = peer
+        .select_path(105_000, &policy())
+        .expect("margin held for the dwell");
+    assert_eq!(switch.reason, SwitchReason::Discretionary);
+    assert_eq!(switch.to.0, tid(WIFI));
+    assert_eq!(peer.transport_id(), Some(tid(WIFI)));
+}
+
+#[test]
+fn the_dwell_restarts_when_the_margin_stops_holding() {
+    let mut peer = dual_path_peer(200, 5);
+    assert!(peer.select_path(100_000, &policy()).is_none());
+    // The cable recovers for a moment: enough fast samples to pull the
+    // window min down.
+    let mut now = 101_000;
+    for _ in 0..3 {
+        now = sample(&mut peer, CABLE, now, 1);
+    }
+    assert!(peer.select_path(now, &policy()).is_none());
+    // Min RTT is min over the window, so the recovery sticks: the path
+    // never trips the margin again in this test.
+    assert!(peer.select_path(now + 10_000, &policy()).is_none());
+    assert_eq!(peer.transport_id(), Some(tid(CABLE)));
+}
+
+#[test]
+fn a_standby_with_too_few_samples_is_not_selectable() {
+    let mut peer = ActivePeer::new(make_peer_identity(), LinkId::new(1), 0);
+    peer.rebind_transport(tid(CABLE), TransportAddr::from_string("10.0.0.1:1"));
+    peer.add_path(tid(WIFI), TransportAddr::from_string("10.0.0.7:1"));
+    let mut now = 1_000;
+    for _ in 0..3 {
+        now = sample(&mut peer, CABLE, now, 200);
+    }
+    now = sample(&mut peer, WIFI, now, 5);
+    now = sample(&mut peer, WIFI, now, 5);
+    assert!(peer.select_path(now, &policy()).is_none());
+    assert!(peer.select_path(now + 60_000, &policy()).is_none());
+}
+
+#[test]
+fn a_backup_path_is_not_selected_while_a_normal_one_is_selectable() {
+    let mut peer = dual_path_peer(200, 5);
+    peer.set_path_role(tid(WIFI), TransportRole::Backup);
+    assert!(peer.select_path(100_000, &policy()).is_none());
+    assert!(peer.select_path(200_000, &policy()).is_none());
+    assert_eq!(peer.transport_id(), Some(tid(CABLE)));
+}
+
+#[test]
+fn a_backup_active_path_yields_to_a_normal_one_at_once() {
+    // Traffic landed on the backup (say, the cable was gone); the cable is
+    // back and selectable, and it is slower. Role wins: leave the backup.
+    let mut peer = dual_path_peer(20, 1);
+    peer.set_path_role(tid(WIFI), TransportRole::Backup);
+    peer.pin_path(tid(WIFI));
+    let pinned = peer.select_path(100_000, &policy()).expect("pin honoured");
+    assert_eq!(pinned.reason, SwitchReason::Pinned);
+    peer.unpin_paths();
+    let back = peer
+        .select_path(100_001, &policy())
+        .expect("a backup yields without margin or dwell");
+    assert_eq!(back.reason, SwitchReason::Discretionary);
+    assert_eq!(peer.transport_id(), Some(tid(CABLE)));
+}
+
+#[test]
+fn a_pinned_path_wins_and_holds() {
+    let mut peer = dual_path_peer(1, 200);
+    assert!(peer.pin_path(tid(WIFI)));
+    let switch = peer.select_path(100_000, &policy()).expect("pinned");
+    assert_eq!(switch.reason, SwitchReason::Pinned);
+    assert_eq!(peer.transport_id(), Some(tid(WIFI)));
+    // The cable is far better now, and it does not matter.
+    assert!(peer.select_path(200_000, &policy()).is_none());
+    assert!(!peer.pin_path(tid(9)), "no path there");
+}
+
+#[test]
+fn a_tie_keeps_the_current_path() {
+    let mut peer = dual_path_peer(5, 5);
+    assert!(peer.select_path(100_000, &policy()).is_none());
+    assert!(peer.select_path(200_000, &policy()).is_none());
+    assert_eq!(peer.transport_id(), Some(tid(CABLE)));
+}
+
+#[test]
+fn withdrawal_prefers_a_selectable_standby_over_a_barely_live_one() {
+    let mut peer = dual_path_peer(1, 5);
+    let ble = 3;
+    peer.add_path(tid(ble), TransportAddr::from_string("ble:1"));
+    let now = sample(&mut peer, ble, 500_000, 1); // Live, one sample only
+    let outcome = peer.withdraw_path(tid(CABLE), now, &policy());
+    match outcome {
+        crate::peer::PathWithdrawal::Switched { to, .. } => {
+            assert_eq!(to.0, tid(WIFI), "three samples beat one, whatever the RTT");
+        }
+        other => panic!("expected a switch, got {other:?}"),
+    }
+}
+
+#[test]
+fn transport_role_and_path_config_parse() {
+    let cfg: crate::config::UdpConfig = serde_yaml::from_str("role: backup\n").unwrap();
+    assert_eq!(cfg.role(), TransportRole::Backup);
+    let cfg: crate::config::UdpConfig = serde_yaml::from_str("bind_addr: 0.0.0.0:1\n").unwrap();
+    assert_eq!(cfg.role(), TransportRole::Normal);
+    let node: crate::config::PathConfig =
+        serde_yaml::from_str("switch_margin: 2.0\nmin_samples: 5\n").unwrap();
+    assert_eq!(node.switch_margin, 2.0);
+    assert_eq!(node.min_samples, 5);
+    assert_eq!(node.switch_dwell_secs, 5);
+    assert_eq!(node.active_heartbeat_ms, 250);
+}

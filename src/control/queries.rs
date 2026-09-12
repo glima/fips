@@ -2745,6 +2745,7 @@ mod tests {
         // An interface no host has, so presence is deterministically absent
         // and carrier deterministically false on every machine this runs on.
         let config = EthernetConfig {
+            role: None,
             interface: "fips-absent-x0".to_string(),
             ethertype: None,
             mtu: None,

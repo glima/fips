@@ -756,6 +756,12 @@ pub trait Transport {
         true
     }
 
+    /// The transport's path-selection role. Default: normal. Concrete
+    /// transports read from their own config.
+    fn role(&self) -> crate::config::TransportRole {
+        crate::config::TransportRole::Normal
+    }
+
     /// Close a specific connection (connection-oriented transports only).
     ///
     /// For connectionless transports (UDP, Ethernet), this is a no-op.
@@ -1112,6 +1118,22 @@ impl TransportHandle {
             TransportHandle::Ble(t) => t.discover(),
             #[cfg(test)]
             TransportHandle::Loopback(t) => t.discover(),
+        }
+    }
+
+    /// The transport's path-selection role.
+    pub fn role(&self) -> crate::config::TransportRole {
+        match self {
+            TransportHandle::Udp(t) => t.role(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TransportHandle::Ethernet(t) => t.role(),
+            TransportHandle::Tcp(t) => t.role(),
+            TransportHandle::Tor(t) => t.role(),
+            TransportHandle::Nym(t) => t.role(),
+            #[cfg(ble_available)]
+            TransportHandle::Ble(t) => t.role(),
+            #[cfg(test)]
+            TransportHandle::Loopback(t) => t.role(),
         }
     }
 

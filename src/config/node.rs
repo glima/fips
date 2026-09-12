@@ -1192,6 +1192,71 @@ impl BuffersConfig {
 // ECN Congestion Signaling
 // ============================================================================
 
+// ============================================================================
+// Path Selection
+// ============================================================================
+
+/// Multi-path switchover (`node.path.*`).
+///
+/// A peer reachable over more than one transport keeps one Noise session and
+/// moves its traffic between paths on failure or degradation. Selection is
+/// measured, not configured: a path's score is `etx × (1 + min_rtt_ms / 100)`
+/// from its own probes. These knobs bound *when* a measured difference is
+/// acted on. Their defaults are placeholders to calibrate against
+/// `testing/chaos`, not values to reason about
+/// (`reference/fips-multi-path-switchover.md`, "Calibration").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathConfig {
+    /// Discretionary switch margin `K` (`node.path.switch_margin`): the
+    /// active path's score must exceed the best standby's by this factor.
+    /// This is what encodes the fail-back policy: a cable returning under
+    /// wifi is 1.00 against 1.10, under the margin, so traffic stays.
+    #[serde(default = "PathConfig::default_switch_margin")]
+    pub switch_margin: f64,
+
+    /// Discretionary switch dwell `D` in seconds
+    /// (`node.path.switch_dwell_secs`): the margin must hold this long.
+    #[serde(default = "PathConfig::default_switch_dwell_secs")]
+    pub switch_dwell_secs: u64,
+
+    /// RTT samples `N` a standby needs before it is eligible
+    /// (`node.path.min_samples`).
+    #[serde(default = "PathConfig::default_min_samples")]
+    pub min_samples: u32,
+
+    /// Heartbeat interval on a path that either side sends on, in ms
+    /// (`node.path.active_heartbeat_ms`). Standby paths use
+    /// `node.heartbeat_interval_secs`.
+    #[serde(default = "PathConfig::default_active_heartbeat_ms")]
+    pub active_heartbeat_ms: u64,
+}
+
+impl Default for PathConfig {
+    fn default() -> Self {
+        Self {
+            switch_margin: Self::default_switch_margin(),
+            switch_dwell_secs: Self::default_switch_dwell_secs(),
+            min_samples: Self::default_min_samples(),
+            active_heartbeat_ms: Self::default_active_heartbeat_ms(),
+        }
+    }
+}
+
+impl PathConfig {
+    fn default_switch_margin() -> f64 {
+        1.5
+    }
+    fn default_switch_dwell_secs() -> u64 {
+        5
+    }
+    fn default_min_samples() -> u32 {
+        3
+    }
+    fn default_active_heartbeat_ms() -> u64 {
+        250
+    }
+}
+
 /// Rekey / session rekeying configuration (`node.rekey.*`).
 ///
 /// Controls periodic full rekey for both FMP (link layer) and FSP
@@ -1359,6 +1424,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub tree: TreeConfig,
 
+    /// Multi-path switchover (`node.path.*`).
+    #[serde(default)]
+    pub path: PathConfig,
+
     /// Bloom filter (`node.bloom.*`).
     #[serde(default)]
     pub bloom: BloomConfig,
@@ -1429,6 +1498,7 @@ impl Default for NodeConfig {
             rendezvous: RendezvousConfig::default(),
             discovery: None,
             tree: TreeConfig::default(),
+            path: PathConfig::default(),
             bloom: BloomConfig::default(),
             session: SessionConfig::default(),
             buffers: BuffersConfig::default(),

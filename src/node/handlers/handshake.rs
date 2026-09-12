@@ -1780,6 +1780,13 @@ impl Node {
                     self.config().node.tree.announce_min_interval_ms,
                 );
 
+                new_peer.set_path_role(
+                    transport_id,
+                    self.transports
+                        .get(&transport_id)
+                        .map(|t| t.role())
+                        .unwrap_or_default(),
+                );
                 self.peers.insert(peer_node_addr, new_peer);
                 self.peers_by_index
                     .insert(our_index.as_u32(), peer_node_addr);
@@ -1890,6 +1897,13 @@ impl Node {
                 new_peer.set_last_tree_announce_sent_ms(ts);
             }
 
+            new_peer.set_path_role(
+                transport_id,
+                self.transports
+                    .get(&transport_id)
+                    .map(|t| t.role())
+                    .unwrap_or_default(),
+            );
             self.peers.insert(peer_node_addr, new_peer);
             self.peers_by_index
                 .insert(our_index.as_u32(), peer_node_addr);
