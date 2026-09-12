@@ -53,6 +53,10 @@ def generate_peers_block(
     for peer_id in sorted(outbound_peers):
         peer = topology.nodes[peer_id]
         transport = topology.transport_for_edge(node_id, peer_id)
+        if topology.is_dual_udp_edge(node_id, peer_id):
+            # The Ethernet half of a dual edge is found by beacon; the UDP
+            # half is dialled from here.
+            transport = "udp"
         port = _TRANSPORT_PORTS.get(transport, 2121)
         lines.append(f'  - npub: "{peer.npub}"')
         lines.append(f'    alias: "{peer_id}"')
@@ -178,6 +182,8 @@ def _has_transport_peers(topology: SimTopology, node_id: str, transport: str) ->
     for peer_id in topology.nodes[node_id].peers:
         edge = (min(node_id, peer_id), max(node_id, peer_id))
         if topology.edge_transport.get(edge, "udp") == transport:
+            return True
+        if transport == "udp" and edge in topology.dual_udp_edges:
             return True
     return False
 

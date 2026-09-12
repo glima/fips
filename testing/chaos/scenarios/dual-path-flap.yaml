@@ -1,0 +1,99 @@
+# One peer, two paths: switchover without a second handshake
+#
+# The calibration scenario for `node.path.*`
+# (reference/fips-multi-path-switchover.md, "Calibration"). Two nodes joined
+# twice: a raw-Ethernet veth (the cable) and the Docker bridge over UDP (the
+# wifi). The UDP half is dialled from static config, the Ethernet half is
+# found by beacon and added as a second path under the same session by the
+# probe exchange. iperf runs across the pair throughout while the cable is
+# taken down and brought back.
+#
+# What "down" means here: `link_flaps` sets 100% loss on the veth, so the
+# interface stays IFF_UP and keeps carrier. That is deliberate. Presence and
+# carrier are covered by unit tests; the thing only a network can exercise
+# is the heartbeat echo timeout — the detector every medium falls back to —
+# and the discretionary fail-back when the cable returns.
+#
+# What to read from a run (sim-results/<run>/analysis.txt and node logs):
+#   - "Path switched" / "traffic moved to the standby": one per node per
+#     flap edge, so two flaps give at least four; the ceiling below allows
+#     one extra per flap for a discretionary fail-back and nothing more.
+#   - the timestamps between "Link DOWN" in runner.log and the first switch
+#     on each node: the switch latency. The target is under one second.
+#   - "Peer promoted to active" after the first minute: a re-peering, which
+#     is the failure this scenario exists to catch. The baseline
+#     `min_sessions` floor together with zero errors is the current proxy;
+#     a dedicated ceiling is a follow-up.
+#
+#   n01 ===eth=== n02      (flapped)
+#   n01 ---udp--- n02      (never touched)
+
+scenario:
+  name: "dual-path-flap"
+  seed: 42
+  duration_secs: 180
+
+topology:
+  algorithm: explicit
+  num_nodes: 2
+  default_transport: udp
+  params:
+    adjacency:
+      - [n01, n02, ethernet+udp]
+
+# Mild and equal on both paths: the variable under test is one path going
+# away, not one path being worse. With equal scores the pair should never
+# switch on its own; only the flaps move traffic.
+netem:
+  enabled: true
+  default_policy:
+    delay_ms: [1, 3]
+    jitter_ms: [0, 1]
+    loss_pct: [0, 0.2]
+
+# The mechanism. Only the cable flaps; the UDP path is the standby that
+# has to be warm when it does. `protect_connectivity` is off because the
+# harness counts the dual edge once and would refuse to flap the "only"
+# link; the UDP half keeps the pair connected throughout.
+link_flaps:
+  enabled: true
+  only_transport: ethernet
+  interval_secs: {min: 35, max: 45}
+  max_down_links: 1
+  down_duration_secs: {min: 12, max: 18}
+  protect_connectivity: false
+
+traffic:
+  enabled: true
+  max_concurrent: 1
+  interval_secs: {min: 5, max: 10}
+  duration_secs: {min: 20, max: 30}
+  parallel_streams: 2
+
+node_churn:
+  enabled: false
+
+assertions:
+  baseline:
+    min_nodes_reporting: 2
+    max_roots: 1
+    min_nodes_parented: 1
+
+  # Traffic crossed the pair while the cable was being taken away.
+  min_traffic:
+    min_sessions_ok: 2
+
+  # Two to three flaps in 180 s at the interval above. Each flap moves both
+  # nodes off the cable (2), and the return may move them back (2 more) or
+  # not, per the margin. Floor: the first flap moved something. Ceiling:
+  # three flaps, both directions, both nodes, and nothing else.
+  path_switches:
+    min_total: 2
+    max_total: 12
+
+  max_errors:
+    max_total: 0
+
+logging:
+  rust_log: "info"
+  output_dir: "./sim-results"

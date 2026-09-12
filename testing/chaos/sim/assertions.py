@@ -501,3 +501,45 @@ def evaluate_min_traffic(
             f"means the data path did not survive what the scenario did to it."
         ),
     )
+
+
+def evaluate_path_switches(cfg, count: int) -> AssertionOutcome:
+    """Band on path switches (traffic moving between transports under one
+    session) over the run.
+
+    ``min_total`` catches a harness that flapped a link nothing was
+    switching over: a dual-path scenario in which no switch happened
+    tested nothing. ``max_total`` is the stability ceiling: a healthy
+    dual-path pair should switch only when a link goes and comes back,
+    never on its own.
+    """
+    if cfg.min_total is not None and count < cfg.min_total:
+        return AssertionOutcome(
+            name="path_switches",
+            passed=False,
+            detail=(
+                f"FAIL path_switches: {count} switches < floor {cfg.min_total} "
+                f"— the flaps did not move traffic between paths. Check that "
+                f"both paths came up (fipsctl path show) before the first flap."
+            ),
+        )
+    if cfg.max_total is not None and count > cfg.max_total:
+        return AssertionOutcome(
+            name="path_switches",
+            passed=False,
+            detail=(
+                f"FAIL path_switches: {count} switches > ceiling {cfg.max_total} "
+                f"— traffic is moving between paths more than the flaps "
+                f"account for. Look for discretionary switches on a healthy "
+                f"pair: the margin or the dwell is too small."
+            ),
+        )
+    return AssertionOutcome(
+        name="path_switches",
+        passed=True,
+        detail=(
+            f"PASS path_switches: {count} switches within "
+            f"[{cfg.min_total if cfg.min_total is not None else 0}, "
+            f"{cfg.max_total if cfg.max_total is not None else 'inf'}]"
+        ),
+    )

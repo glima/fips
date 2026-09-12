@@ -639,6 +639,9 @@ jobs:
           - suite: ethernet-churn
             type: chaos
             scenario: ethernet-churn
+          - suite: dual-path-flap
+            type: chaos
+            scenario: dual-path-flap
           - suite: tcp-mesh
             type: chaos
             scenario: tcp-mesh

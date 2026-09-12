@@ -29,6 +29,11 @@ class SimTopology:
     edges: set[tuple[str, str]] = field(default_factory=set)
     # Per-edge transport type; edges not in this dict default to "udp"
     edge_transport: dict[tuple[str, str], str] = field(default_factory=dict)
+    # Edges declared ``ethernet+udp``: an Ethernet veth (found by beacon)
+    # *and* a UDP static-peer entry over the bridge, so the pair holds two
+    # paths under one session. ``edge_transport`` says ``ethernet`` for
+    # these, which is what netem and link flaps act on.
+    dual_udp_edges: set[tuple[str, str]] = field(default_factory=set)
     # Suffix scoping globally-visible names to this run and scenario; empty
     # outside the CI harness, which keeps a bare run's names unchanged.
     name_suffix: str = ""
@@ -41,6 +46,10 @@ class SimTopology:
         host names are scoped differently from its container names.
         """
         return veth_token(self.name_suffix)
+
+    def is_dual_udp_edge(self, a: str, b: str) -> bool:
+        """Whether the edge also carries a UDP static-peer link."""
+        return _make_edge(a, b) in self.dual_udp_edges
 
     def transport_for_edge(self, a: str, b: str) -> str:
         """Get the transport type for an edge (defaults to 'udp')."""
@@ -161,6 +170,7 @@ class SimTopology:
         static_edges = {
             e for e in self.edges
             if self.edge_transport.get(e, "udp") != "ethernet"
+            or e in self.dual_udp_edges
         }
 
         outbound: dict[str, list[str]] = {nid: [] for nid in self.nodes}
@@ -249,7 +259,7 @@ def generate_topology(
         adjacency = config.params.get("adjacency")
         if not adjacency:
             raise ValueError("explicit topology requires params.adjacency")
-        edges, edge_transport = _generate_explicit(
+        edges, edge_transport, dual_udp_edges = _generate_explicit(
             adjacency, config.default_transport
         )
         # Validate all referenced nodes exist
@@ -264,6 +274,7 @@ def generate_topology(
     # Assign transport types to edges
     if config.algorithm != "explicit":
         edge_transport = _assign_edge_transports(edges, config, rng)
+        dual_udp_edges = set()
 
     # Build peer lists from edges
     for a, b in edges:
@@ -276,6 +287,7 @@ def generate_topology(
         nodes=nodes,
         edges=edges,
         edge_transport=edge_transport,
+        dual_udp_edges=dual_udp_edges,
         name_suffix=name_suffix(),
     )
 
@@ -354,17 +366,22 @@ def _generate_erdos_renyi(
 
 def _generate_explicit(
     adjacency: list, default_transport: str = "udp"
-) -> tuple[set[tuple[str, str]], dict[tuple[str, str], str]]:
+) -> tuple[set[tuple[str, str]], dict[tuple[str, str], str], set[tuple[str, str]]]:
     """Build edges from an explicit adjacency list.
 
     Each entry is a 2-element list ``[nodeA, nodeB]`` (uses default
-    transport) or a 3-element list ``[nodeA, nodeB, transport]``.
+    transport) or a 3-element list ``[nodeA, nodeB, transport]``. The
+    transport ``ethernet+udp`` declares a dual edge: an Ethernet veth and
+    a UDP static-peer link between the same two nodes, so the pair holds
+    two paths under one session.
 
-    Returns ``(edges, edge_transport)`` where ``edge_transport`` maps
-    each edge to its transport type.
+    Returns ``(edges, edge_transport, dual_udp_edges)`` where
+    ``edge_transport`` maps each edge to its transport type (``ethernet``
+    for a dual edge) and ``dual_udp_edges`` is the set of dual edges.
     """
     edges = set()
     edge_transport: dict[tuple[str, str], str] = {}
+    dual_udp_edges: set[tuple[str, str]] = set()
     for i, entry in enumerate(adjacency):
         if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
             raise ValueError(
@@ -374,8 +391,11 @@ def _generate_explicit(
         edge = _make_edge(str(entry[0]), str(entry[1]))
         edges.add(edge)
         transport = str(entry[2]) if len(entry) == 3 else default_transport
+        if transport == "ethernet+udp":
+            transport = "ethernet"
+            dual_udp_edges.add(edge)
         edge_transport[edge] = transport
-    return edges, edge_transport
+    return edges, edge_transport, dual_udp_edges
 
 
 def _assign_edge_transports(

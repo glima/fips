@@ -101,11 +101,17 @@ Explicit topologies exercising non-UDP transports.
 | ethernet-only | 4     | Ethernet       | Ring  | 30s      | yes   | --         | AF_PACKET transport with beacon discovery  |
 | ethernet-mesh | 6     | UDP + Ethernet | Mesh  | 120s     | yes   | yes        | Mixed UDP/Ethernet, netem mutation + flaps |
 | tcp-mesh      | 6     | UDP + TCP      | Mesh  | 120s     | yes   | yes        | Mixed UDP/TCP, netem mutation + flaps      |
+| dual-path-flap | 2    | Ethernet + UDP | Pair  | 180s     | yes   | yes        | One session, two paths; cable flaps, traffic moves without re-peering |
 
 - **ethernet-only**: 4-node ring on raw Ethernet (AF_PACKET). Peers discovered
   via beacons, not static config. Minimal netem (1-5ms delay).
 - **ethernet-mesh**: Mirrors `tcp-mesh` topology but with Ethernet instead of
   TCP. UDP edges use static config; Ethernet edges use beacon discovery.
+- **dual-path-flap**: two nodes joined twice, by a raw-Ethernet veth and by
+  UDP over the bridge (`[n01, n02, ethernet+udp]`). The cable flaps
+  (`link_flaps.only_transport: ethernet`); traffic must move to the UDP path
+  under the same session and never re-peer. The calibration scenario for
+  `node.path.*`; see the file header for what to read from a run.
 - **tcp-mesh**: 6-node mesh with 4 UDP and 3 TCP edges. Both transports use
   static peer config. Netem mutation (30% fraction, every 20-40s) and link
   flaps (1 link max, 10-20s down).

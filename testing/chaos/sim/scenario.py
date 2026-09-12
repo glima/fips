@@ -109,6 +109,9 @@ class LinkFlapsConfig:
     max_down_links: int = 2
     down_duration_secs: Range = field(default_factory=lambda: Range(10, 30))
     protect_connectivity: bool = True
+    # Only flap edges of this transport type (``ethernet``, ``udp``, ...).
+    # ``None`` flaps any edge.
+    only_transport: str | None = None
 
 
 @dataclass
@@ -224,6 +227,18 @@ class MinParentSwitchesAssertion:
     """
 
     min_total: int = 1
+
+
+@dataclass
+class PathSwitchesAssertion:
+    """Band on path switches: a peer's traffic moving to another
+    transport under the same session. ``min_total`` proves the flaps moved
+    something; ``max_total`` is the stability ceiling on a pair that should
+    switch only when a link goes and comes back.
+    """
+
+    min_total: int | None = None
+    max_total: int | None = None
 
 
 @dataclass
@@ -351,6 +366,7 @@ class AssertionsConfig:
     bloom_send_rate: BloomSendRateAssertion | None = None
     min_parent_switches: MinParentSwitchesAssertion | None = None
     max_parent_switches: MaxParentSwitchesAssertion | None = None
+    path_switches: PathSwitchesAssertion | None = None
     max_errors: MaxErrorsAssertion | None = None
     congestion_signals: CongestionSignalsAssertion | None = None
     tree_parents: TreeParentsAssertion | None = None
@@ -418,7 +434,7 @@ _SECTION_KEYS = {
     "netem.mutation": {"interval_secs", "fraction", "policies", "exclude_edges"},
     "link_flaps": {
         "enabled", "interval_secs", "max_down_links", "down_duration_secs",
-        "protect_connectivity",
+        "protect_connectivity", "only_transport",
     },
     "traffic": {
         "enabled", "max_concurrent", "interval_secs", "duration_secs",
@@ -435,8 +451,8 @@ _SECTION_KEYS = {
     "link_swap.edges[]": {"edge", "policy"},
     "assertions": {
         "bloom_send_rate", "min_parent_switches", "max_parent_switches",
-        "max_errors", "congestion_signals", "tree_parents", "baseline",
-        "min_traffic",
+        "path_switches", "max_errors", "congestion_signals", "tree_parents",
+        "baseline", "min_traffic",
     },
     "logging": {"rust_log", "output_dir"},
 }
@@ -444,6 +460,7 @@ _ASSERTION_KEYS = {
     "bloom_send_rate": {"window_secs", "max_per_node"},
     "min_parent_switches": {"min_total"},
     "max_parent_switches": {"max_total", "node"},
+    "path_switches": {"min_total", "max_total"},
     "max_errors": {"max_total"},
     "min_traffic": {"min_sessions_ok", "min_bytes_total"},
     "congestion_signals": {
@@ -597,6 +614,8 @@ def load_scenario(path: str) -> Scenario:
             lf["down_duration_secs"], "link_flaps.down_duration_secs"
         )
     s.link_flaps.protect_connectivity = lf.get("protect_connectivity", True)
+    only = lf.get("only_transport")
+    s.link_flaps.only_transport = str(only) if only is not None else None
 
     # Traffic section
     tf = raw.get("traffic", {})
@@ -695,6 +714,24 @@ def load_scenario(path: str) -> Scenario:
         )
         s.assertions.min_parent_switches = MinParentSwitchesAssertion(
             min_total=int(mps.get("min_total", 1)),
+        )
+    if "path_switches" in asrt:
+        ps = asrt["path_switches"]
+        _reject_unknown(ps, _ASSERTION_KEYS["path_switches"], "assertions.path_switches")
+        if "min_total" not in ps and "max_total" not in ps:
+            raise ValueError(
+                "assertions.path_switches: give min_total, max_total or both "
+                "(an empty band asserts nothing)"
+            )
+        for key in ("min_total", "max_total"):
+            if key in ps and (isinstance(ps[key], bool) or not isinstance(ps[key], int) or ps[key] < 0):
+                raise ValueError(
+                    f"assertions.path_switches: {key} must be a non-negative "
+                    f"integer, got {ps[key]!r}"
+                )
+        s.assertions.path_switches = PathSwitchesAssertion(
+            min_total=ps.get("min_total"),
+            max_total=ps.get("max_total"),
         )
     if "max_parent_switches" in asrt:
         xps = asrt["max_parent_switches"]
@@ -1012,10 +1049,12 @@ def _validate(s: Scenario):
             node_ids.update(str(p) for p in entry[:2])
             if len(entry) == 3:
                 transport = str(entry[2])
-                if transport not in VALID_TRANSPORTS:
+                # ``ethernet+udp`` is a dual edge: a veth and a UDP static
+                # peer between the same two nodes (see topology.py).
+                if transport not in VALID_TRANSPORTS and transport != "ethernet+udp":
                     raise ValueError(
                         f"explicit adjacency[{i}]: transport '{transport}' "
-                        f"not in {VALID_TRANSPORTS}"
+                        f"not in {VALID_TRANSPORTS} (or 'ethernet+udp')"
                     )
         if len(node_ids) != s.topology.num_nodes:
             raise ValueError(

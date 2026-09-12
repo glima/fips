@@ -20,6 +20,7 @@ from .assertions import (
     evaluate_max_errors,
     evaluate_max_parent_switches,
     evaluate_min_parent_switches,
+    evaluate_path_switches,
     evaluate_min_traffic,
     evaluate_tree_parents,
 )
@@ -763,6 +764,15 @@ class SimRunner:
                 outcome = self._evaluate_max_parent_switches(
                     xps_cfg, result.parent_switches
                 )
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            ps_cfg = self.scenario.assertions.path_switches
+            if ps_cfg is not None:
+                outcome = evaluate_path_switches(ps_cfg, len(result.path_switches))
                 self.assertion_outcomes.append(outcome)
                 if outcome.passed:
                     log.info("%s", outcome.detail)

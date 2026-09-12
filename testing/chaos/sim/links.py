@@ -66,6 +66,10 @@ class LinkManager:
         up_links = [
             e for e, ls in self.link_states.items()
             if not ls.is_down and e[0] not in down and e[1] not in down
+            and (
+                self.config.only_transport is None
+                or self.topology.transport_for_edge(*e) == self.config.only_transport
+            )
         ]
         if not up_links:
             return
