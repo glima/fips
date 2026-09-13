@@ -28,7 +28,10 @@ class Range:
             raise ValueError(f"{name}: min ({self.min}) must be >= 0")
 
 
-VALID_TRANSPORTS = ("udp", "ethernet", "tcp")
+VALID_TRANSPORTS = ("udp", "ethernet", "tcp", "udp-veth")
+# Dual edges: a veth half and a UDP-over-the-bridge half between the same
+# two nodes (see topology.py).
+DUAL_TRANSPORTS = ("ethernet+udp", "udp-veth+udp")
 
 
 @dataclass
@@ -1057,12 +1060,10 @@ def _validate(s: Scenario):
             node_ids.update(str(p) for p in entry[:2])
             if len(entry) == 3:
                 transport = str(entry[2])
-                # ``ethernet+udp`` is a dual edge: a veth and a UDP static
-                # peer between the same two nodes (see topology.py).
-                if transport not in VALID_TRANSPORTS and transport != "ethernet+udp":
+                if transport not in VALID_TRANSPORTS and transport not in DUAL_TRANSPORTS:
                     raise ValueError(
                         f"explicit adjacency[{i}]: transport '{transport}' "
-                        f"not in {VALID_TRANSPORTS} (or 'ethernet+udp')"
+                        f"not in {VALID_TRANSPORTS} or {DUAL_TRANSPORTS}"
                     )
         if len(node_ids) != s.topology.num_nodes:
             raise ValueError(

@@ -168,8 +168,8 @@ class LinkManager:
 
         transport = self.topology.transport_for_edge(src_node, dst_node)
 
-        if transport == "ethernet":
-            # Ethernet: simple netem on veth
+        if self.topology.is_veth_transport(transport):
+            # Ethernet or udp-veth: simple netem on the veth
             iface = veth_interface_name(src_node, dst_node)
             veth_states = self.netem_mgr.veth_states.get(container, {})
             veth_state = veth_states.get(iface)

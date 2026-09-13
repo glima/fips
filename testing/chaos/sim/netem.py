@@ -196,7 +196,7 @@ class NetemManager:
             eth_peers = []
             for peer_id in sorted(node.peers):
                 transport = self.topology.transport_for_edge(node_id, peer_id)
-                if transport == "ethernet":
+                if self.topology.is_veth_transport(transport):
                     eth_peers.append(peer_id)
                     # A dual edge also has a UDP half over the bridge, which
                     # gets its own HTB class like any IP peer.
@@ -394,7 +394,9 @@ class NetemManager:
         for peer_id in sorted(self.topology.nodes[node_id].peers):
             if peer_id in self.down_nodes:
                 continue
-            if self.topology.transport_for_edge(node_id, peer_id) != "ethernet":
+            if not self.topology.is_veth_transport(
+                self.topology.transport_for_edge(node_id, peer_id)
+            ):
                 continue
             peer_container = self.topology.container_name(peer_id)
             state = self.veth_states.get(peer_container, {}).get(
