@@ -2557,6 +2557,93 @@ impl Node {
             .collect()
     }
 
+    /// The transport and address a configured peer address dials to, or
+    /// `None` (logged at debug) if no operational transport can carry it.
+    ///
+    /// The transport field may name a specific instance (`"udp/aware"`):
+    /// the type half picks the resolver, the instance half is handed to
+    /// whichever resolver can honour it, and only the UDP one can. The
+    /// `"nat"` pseudo-address is not resolved here.
+    fn resolve_peer_address(&self, addr: &PeerAddress) -> Option<(TransportId, TransportAddr)> {
+        let spec = addr.spec();
+        if addr.transport == "ethernet" {
+            return match self.resolve_ethernet_addr(&addr.addr) {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    debug!(
+                        transport = %addr.transport,
+                        addr = %addr.addr,
+                        error = %e,
+                        "Failed to resolve Ethernet address"
+                    );
+                    None
+                }
+            };
+        }
+        if addr.transport == "ble" {
+            #[cfg(ble_available)]
+            {
+                return match self.resolve_ble_addr(&addr.addr) {
+                    Ok(result) => Some(result),
+                    Err(e) => {
+                        debug!(
+                            transport = %addr.transport,
+                            addr = %addr.addr,
+                            error = %e,
+                            "Failed to resolve BLE address"
+                        );
+                        None
+                    }
+                };
+            }
+            #[cfg(not(ble_available))]
+            {
+                debug!(transport = %addr.transport, "BLE transport not available on this build");
+                return None;
+            }
+        }
+        let tid = if spec.kind == "udp"
+            && let Ok(remote_socket_addr) = addr.addr.parse::<SocketAddr>()
+        {
+            match self.find_udp_transport_for_remote_addr(remote_socket_addr, spec.instance) {
+                Some((id, _)) => id,
+                None => {
+                    debug!(
+                        transport = %addr.transport,
+                        addr = %addr.addr,
+                        "No compatible operational UDP transport for address"
+                    );
+                    return None;
+                }
+            }
+        } else if spec.instance.is_some() {
+            // Only the UDP resolver above can honour an instance name.
+            // Matching any instance of the type here would be the silent
+            // wrong-lane substitution this whole mechanism exists to
+            // prevent, so refuse instead.
+            debug!(
+                transport = %addr.transport,
+                addr = %addr.addr,
+                "Instance-qualified address for a transport type that \
+                 does not support instance selection"
+            );
+            return None;
+        } else {
+            match self.find_transport_for_type(spec.kind) {
+                Some(id) => id,
+                None => {
+                    debug!(
+                        transport = %addr.transport,
+                        addr = %addr.addr,
+                        "No operational transport for address type"
+                    );
+                    return None;
+                }
+            }
+        };
+        Some((tid, TransportAddr::from_string(&addr.addr)))
+    }
+
     async fn attempt_peer_address_list(
         &mut self,
         peer_config: &PeerConfig,
@@ -2578,9 +2665,6 @@ impl Node {
             if attempted >= max_attempts {
                 break;
             }
-            // The transport field may name a specific instance
-            // (`"udp/aware"`); everything below dispatches on the type half
-            // and hands the instance half to whichever resolver can honour it.
             let spec = addr.spec();
 
             if spec.kind == "udp" && addr.addr.eq_ignore_ascii_case("nat") {
@@ -2598,82 +2682,8 @@ impl Node {
                 continue;
             }
 
-            let (transport_id, remote_addr) = if addr.transport == "ethernet" {
-                match self.resolve_ethernet_addr(&addr.addr) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        debug!(
-                            transport = %addr.transport,
-                            addr = %addr.addr,
-                            error = %e,
-                            "Failed to resolve Ethernet address"
-                        );
-                        continue;
-                    }
-                }
-            } else if addr.transport == "ble" {
-                #[cfg(ble_available)]
-                {
-                    match self.resolve_ble_addr(&addr.addr) {
-                        Ok(result) => result,
-                        Err(e) => {
-                            debug!(
-                                transport = %addr.transport,
-                                addr = %addr.addr,
-                                error = %e,
-                                "Failed to resolve BLE address"
-                            );
-                            continue;
-                        }
-                    }
-                }
-                #[cfg(not(ble_available))]
-                {
-                    debug!(transport = %addr.transport, "BLE transport not available on this build");
-                    continue;
-                }
-            } else {
-                let tid = if spec.kind == "udp"
-                    && let Ok(remote_socket_addr) = addr.addr.parse::<SocketAddr>()
-                {
-                    match self.find_udp_transport_for_remote_addr(remote_socket_addr, spec.instance)
-                    {
-                        Some((id, _)) => id,
-                        None => {
-                            debug!(
-                                transport = %addr.transport,
-                                addr = %addr.addr,
-                                "No compatible operational UDP transport for address"
-                            );
-                            continue;
-                        }
-                    }
-                } else if spec.instance.is_some() {
-                    // Only the UDP resolver above can honour an instance name.
-                    // Matching any instance of the type here would be the
-                    // silent wrong-lane substitution this whole mechanism
-                    // exists to prevent, so refuse instead.
-                    debug!(
-                        transport = %addr.transport,
-                        addr = %addr.addr,
-                        "Instance-qualified address for a transport type that \
-                         does not support instance selection"
-                    );
-                    continue;
-                } else {
-                    match self.find_transport_for_type(spec.kind) {
-                        Some(id) => id,
-                        None => {
-                            debug!(
-                                transport = %addr.transport,
-                                addr = %addr.addr,
-                                "No operational transport for address type"
-                            );
-                            continue;
-                        }
-                    }
-                };
-                (tid, TransportAddr::from_string(&addr.addr))
+            let Some((transport_id, remote_addr)) = self.resolve_peer_address(addr) else {
+                continue;
             };
 
             if self.is_connecting_to_peer_on_path(&peer_node_addr, transport_id, &remote_addr) {
@@ -3243,7 +3253,7 @@ impl Node {
         let has_alternative = concrete
             .iter()
             .any(|addr| !self.active_peer_matches_candidate(&peer_node_addr, addr));
-        let attempt_candidates: Vec<_> = if has_alternative {
+        let mut attempt_candidates: Vec<_> = if has_alternative {
             concrete
                 .into_iter()
                 .filter(|addr| !self.active_peer_matches_candidate(&peer_node_addr, addr))
@@ -3254,8 +3264,47 @@ impl Node {
             Vec::new()
         };
 
+        // A live peer reachable at an address on a transport we hold no
+        // path to it over gets a *path* there, under the session it has,
+        // not a second handshake: the probe exchange proves the path and
+        // selection moves traffic if it measures better. A handshake to a
+        // peer that already has one is read by the far side as a rekey, so
+        // dialling here would confuse both ends. An address the peer is
+        // already reachable at is nothing to do. What remains (an address
+        // on a transport that already has a path, or a peer that has gone
+        // quiet) is dialled as before.
+        let mut paths_added = false;
+        if self.active_peer_link_is_live(&peer_node_addr) {
+            let mut to_dial = Vec::with_capacity(attempt_candidates.len());
+            for addr in attempt_candidates {
+                let Some((transport_id, remote_addr)) = self.resolve_peer_address(&addr) else {
+                    continue;
+                };
+                let Some(peer) = self.peers.get(&peer_node_addr) else {
+                    to_dial.push(addr);
+                    continue;
+                };
+                if peer.is_reachable_at(transport_id, &remote_addr) {
+                    continue;
+                }
+                if peer.path_on(transport_id).is_some() {
+                    to_dial.push(addr);
+                    continue;
+                }
+                info!(
+                    peer = %self.peer_display_name(&peer_node_addr),
+                    %transport_id,
+                    addr = %remote_addr,
+                    "Configured address on a new transport: added as a path, not dialled"
+                );
+                self.add_path_candidate(peer_node_addr, transport_id, remote_addr);
+                paths_added = true;
+            }
+            attempt_candidates = to_dial;
+        }
+
         if attempt_candidates.is_empty() {
-            return Ok(false);
+            return Ok(paths_added);
         }
 
         self.attempt_peer_address_list(peer_config, peer_identity, false, &attempt_candidates)
