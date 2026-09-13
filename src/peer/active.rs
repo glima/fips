@@ -109,6 +109,12 @@ struct ProbeState {
     next_id: u32,
     /// `(probe_id, sent_at_ms)` of the probe awaiting its ack.
     outstanding: Option<(u32, u64)>,
+    /// `(probe_id, sent_at_ms)` of the last probe whose echo timed out.
+    /// Its ack is still an ack: on a medium whose round trip exceeds the
+    /// timeout floor (Tor, Nym, satellite) the first echo is always late,
+    /// and discarding it would leave the path unmeasured, so the timeout
+    /// never stretches and the path never proves itself.
+    timed_out: Option<(u32, u64)>,
     /// Probes sent since the last ack, for the backoff.
     unanswered: u32,
     /// Earliest monotonic ms at which another probe may be sent.
@@ -149,6 +155,21 @@ pub enum SwitchReason {
     Discretionary,
     /// The operator pinned another path.
     Pinned,
+}
+
+/// The intervals [`ActivePeer::plan_heartbeats`] runs on, all in ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatTiming {
+    /// Interval on a path either side sends on.
+    pub fast_ms: u64,
+    /// Interval on a standby.
+    pub slow_ms: u64,
+    /// Echo timeout floor; stretched per path by its round trip.
+    pub timeout_ms: u64,
+    /// Ceiling on the discovery backoff of a path the peer has never
+    /// acknowledged: an old node, or a medium the peer cannot hear us on.
+    /// Every such probe is full-size, so this bounds a permanent cost.
+    pub discovery_cap_ms: u64,
 }
 
 /// One heartbeat probe to put on the wire, from
@@ -1109,6 +1130,11 @@ impl ActivePeer {
     /// advances the backoff; `None` if the peer has no path there or the
     /// backoff has not expired. `backoff_cap_ms` bounds the retry interval,
     /// which doubles from `base_ms` per unanswered probe.
+    ///
+    /// Tests only. In production [`plan_heartbeats`](Self::plan_heartbeats)
+    /// is the one issuer of probes, so no two writers race for
+    /// `probe.outstanding`.
+    #[cfg(test)]
     pub fn take_probe(
         &mut self,
         transport_id: TransportId,
@@ -1166,9 +1192,10 @@ impl ActivePeer {
     }
 
     /// A `PathAck` arrived on `transport_id`. If it answers the outstanding
-    /// probe, the path is `tx_live` and `Live`, the backoff is cleared and
-    /// the round trip is sampled. Returns the RTT sample in ms, or `None`
-    /// if the ack matched nothing (a stale or duplicate ack is ignored).
+    /// probe, or the one whose echo last timed out, the path is `tx_live`
+    /// and `Live`, the backoff is cleared and the round trip is sampled.
+    /// Returns the RTT sample in ms, or `None` if the ack matched nothing
+    /// (a stale or duplicate ack is ignored).
     pub fn note_path_ack(
         &mut self,
         transport_id: TransportId,
@@ -1180,11 +1207,17 @@ impl ActivePeer {
     ) -> Option<u64> {
         let path = self.path_on_mut(transport_id)?;
         path.remote_id = Some(remote_id);
-        let (outstanding_id, sent_at_ms) = path.probe.outstanding?;
-        if outstanding_id != probe_id {
-            return None;
-        }
-        path.probe.outstanding = None;
+        let sent_at_ms = match (path.probe.outstanding, path.probe.timed_out) {
+            (Some((id, at)), _) if id == probe_id => {
+                path.probe.outstanding = None;
+                at
+            }
+            (_, Some((id, at))) if id == probe_id => {
+                path.probe.timed_out = None;
+                at
+            }
+            _ => return None,
+        };
         path.probe.unanswered = 0;
         let rtt_ms = now_ms.saturating_sub(sent_at_ms);
         path.last_rtt_ms = Some(rtt_ms);
@@ -1214,9 +1247,10 @@ impl ActivePeer {
     /// history expires with [`prune_dead_paths`](Self::prune_dead_paths).
     /// If the withdrawn path was the active one, the best eligible path takes
     /// over: `Live` and `tx_live`, lowest last RTT first. With no eligible
-    /// path the active index is left where it was and the caller reaps the
-    /// peer; a `Probing` path is never promoted, because nothing has proven
-    /// it carries anything.
+    /// path the active index is left where it was, the path is `Suspect`
+    /// rather than `Dead` so it keeps being probed, and the caller decides;
+    /// a `Probing` path is never promoted, because nothing has proven it
+    /// carries anything.
     pub fn withdraw_path(
         &mut self,
         transport_id: TransportId,
@@ -1256,46 +1290,65 @@ impl ActivePeer {
                     to: (path.transport_id, path.addr.clone()),
                 }
             }
-            None => PathWithdrawal::NoAlternative,
+            None => {
+                // Nothing to move to. The caller either reaps the peer
+                // (transport gone) or keeps it (advisory close): in the
+                // latter case the path must stay probed, and only a
+                // non-`Dead` path is, so it is `Suspect`, not `Dead`.
+                let path = &mut self.send.paths[idx];
+                path.state = PathState::Suspect;
+                path.dead_since_ms = None;
+                PathWithdrawal::NoAlternative
+            }
         }
     }
 
-    /// The best path other than `exclude` to move traffic to, if any.
-    ///
-    /// Selectable paths first (eligible with `N` samples), lowest score,
-    /// `Normal` before `Backup`; failing that, any eligible path by last
-    /// RTT: a `Live` path with fewer than `N` samples beats no path. A
-    /// `Probing` path is never returned.
-    fn best_alternative(&self, exclude: usize, policy: &PathPolicy) -> Option<usize> {
-        let candidates = || {
-            self.send
-                .paths
-                .iter()
-                .enumerate()
-                .filter(move |(i, _)| *i != exclude)
-        };
-        let any_normal_selectable =
-            candidates().any(|(_, p)| p.is_selectable(policy) && p.role == TransportRole::Normal);
-        let selectable = candidates()
-            .filter(|(_, p)| {
-                p.is_selectable(policy)
-                    && (p.role == TransportRole::Normal || !any_normal_selectable)
-            })
+    /// The best selectable path other than `exclude`, with its score:
+    /// `Normal` before `Backup`, then lowest score; a selectable path with
+    /// no score yet ranks last. The one rule both selection and withdrawal
+    /// pick by. A `Backup` is offered only while no selectable `Normal`
+    /// path exists at all, `exclude` included: a `Normal` active path is
+    /// never left for a `Backup`, however it scores.
+    fn best_selectable(&self, exclude: usize, policy: &PathPolicy) -> Option<(usize, Option<f64>)> {
+        let any_normal = self
+            .send
+            .paths
+            .iter()
+            .any(|p| p.is_selectable(policy) && p.role == TransportRole::Normal);
+        self.send
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| *i != exclude && p.is_selectable(policy))
+            .filter(|(_, p)| p.role == TransportRole::Normal || !any_normal)
             .min_by(|(_, a), (_, b)| {
                 a.score()
                     .unwrap_or(f64::MAX)
                     .total_cmp(&b.score().unwrap_or(f64::MAX))
             })
-            .map(|(i, _)| i);
-        if selectable.is_some() {
-            return selectable;
+            .map(|(i, p)| (i, p.score()))
+    }
+
+    /// The best path other than `exclude` to move traffic to, if any.
+    ///
+    /// Selectable paths first ([`best_selectable`](Self::best_selectable));
+    /// failing that, any eligible path by last RTT: a `Live` path with
+    /// fewer than `N` samples beats no path. A `Probing` path is never
+    /// returned.
+    fn best_alternative(&self, exclude: usize, policy: &PathPolicy) -> Option<usize> {
+        if let Some((i, _)) = self.best_selectable(exclude, policy) {
+            return Some(i);
         }
-        let any_normal_eligible =
-            candidates().any(|(_, p)| p.is_eligible() && p.role == TransportRole::Normal);
+        let candidates = || {
+            self.send
+                .paths
+                .iter()
+                .enumerate()
+                .filter(move |(i, p)| *i != exclude && p.is_eligible())
+        };
+        let any_normal = candidates().any(|(_, p)| p.role == TransportRole::Normal);
         candidates()
-            .filter(|(_, p)| {
-                p.is_eligible() && (p.role == TransportRole::Normal || !any_normal_eligible)
-            })
+            .filter(|(_, p)| p.role == TransportRole::Normal || !any_normal)
             .min_by_key(|(_, p)| p.last_rtt_ms.unwrap_or(u64::MAX))
             .map(|(i, _)| i)
     }
@@ -1334,24 +1387,7 @@ impl ActivePeer {
             self.send.discretionary_since_ms = None;
             return None;
         };
-        let any_normal_selectable = self
-            .send
-            .paths
-            .iter()
-            .any(|p| p.is_selectable(policy) && p.role == TransportRole::Normal);
-        let best = self
-            .send
-            .paths
-            .iter()
-            .enumerate()
-            .filter(|(i, p)| {
-                *i != active
-                    && p.is_selectable(policy)
-                    && (p.role == TransportRole::Normal || !any_normal_selectable)
-            })
-            .filter_map(|(i, p)| p.score().map(|s| (i, s)))
-            .min_by(|(_, a), (_, b)| a.total_cmp(b));
-        let Some((next, best_score)) = best else {
+        let Some((next, Some(best_score))) = self.best_selectable(active, policy) else {
             self.send.discretionary_since_ms = None;
             return None;
         };
@@ -1441,7 +1477,10 @@ impl ActivePeer {
     /// in flight per path. A probe unanswered for `timeout_ms` is a failed
     /// echo: on a path the peer has acknowledged before, that is a hard
     /// signal and the path goes `Suspect` (a never-acknowledged path is an
-    /// old node, not a dead path; it keeps the discovery backoff instead).
+    /// old node, not a dead path; it keeps the discovery backoff instead,
+    /// capped at `discovery_cap_ms`). The timed-out probe is remembered so
+    /// its late ack still samples the round trip: until a path has one,
+    /// its timeout cannot stretch.
     /// Each timeout is one lost sample for the path's ETX, and a verdict
     /// only if the peer has also been silent on the path for the timeout:
     /// a late echo on a path still carrying the peer's frames is load, not
@@ -1454,13 +1493,13 @@ impl ActivePeer {
     /// The silence hint: our active path silent for two of the peer's
     /// intervals on it while a standby hears the peer triggers a probe now,
     /// never `Suspect` (see §7 for the loop that would otherwise follow).
-    pub fn plan_heartbeats(
-        &mut self,
-        now_ms: u64,
-        fast_ms: u64,
-        slow_ms: u64,
-        timeout_ms: u64,
-    ) -> HeartbeatPlan {
+    pub fn plan_heartbeats(&mut self, now_ms: u64, timing: &HeartbeatTiming) -> HeartbeatPlan {
+        let HeartbeatTiming {
+            fast_ms,
+            slow_ms,
+            timeout_ms,
+            discovery_cap_ms,
+        } = *timing;
         let mut plan = HeartbeatPlan::default();
         let active = self.send.active;
         let newest_rx = self.send.paths.iter().filter_map(|p| p.rx_live_at_ms).max();
@@ -1476,10 +1515,11 @@ impl ActivePeer {
             };
             let timeout_ms = timeout_ms.max(path.last_rtt_ms.unwrap_or(0).saturating_mul(3));
 
-            if let Some((_, sent_at)) = path.probe.outstanding
+            if let Some((id, sent_at)) = path.probe.outstanding
                 && now_ms.saturating_sub(sent_at) >= timeout_ms
             {
                 path.probe.outstanding = None;
+                path.probe.timed_out = Some((id, sent_at));
                 if path.acked_once {
                     // Loss is sampled while the path is Live. Once it is
                     // Suspect the state already says it is down, and every
@@ -1529,9 +1569,13 @@ impl ActivePeer {
                 interval
             } else {
                 // Discovery backoff: doubles per unanswered probe, capped at
-                // the standby interval.
+                // `discovery_cap_ms`. Every one of these is full-size, and
+                // an old node never answers, so the cap is a permanent
+                // per-path cost.
                 let shift = path.probe.unanswered.min(16);
-                interval.saturating_mul(1u64 << shift).min(slow_ms)
+                interval
+                    .saturating_mul(1u64 << shift)
+                    .min(discovery_cap_ms.max(interval))
             };
             path.probe.next_at_ms = now_ms.saturating_add(delay.max(1));
             let full_size = !path.acked_once

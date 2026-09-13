@@ -33,12 +33,16 @@ use super::super::macos as sys;
 /// sizes, applied best-effort: on Linux with `SO_*BUFFORCE` first,
 /// falling back to the normal `SO_*BUF` if the process can't bypass the
 /// kernel ceiling; on macOS with `SO_*BUF` alone, which has no force
-/// variant.
+/// variant. `interface`, if named, binds the socket to that interface the
+/// way the listen socket is (`udp.interface`): without it the connected
+/// socket would route by the kernel's table and an interface-bound
+/// transport's data could leave by another NIC, making the path a lie.
 pub(crate) fn open_connected_fd(
     local_addr: SocketAddr,
     peer_addr: SocketAddr,
     recv_buf: usize,
     send_buf: usize,
+    interface: Option<&str>,
 ) -> io::Result<OwnedFd> {
     // Family must match between local and peer.
     if local_addr.is_ipv4() != peer_addr.is_ipv4() {
@@ -77,6 +81,10 @@ pub(crate) fn open_connected_fd(
     // Buffer sizes — best effort; see the per-platform implementation.
     sys::set_buf_sizes(raw, recv_buf, send_buf);
 
+    if let Some(name) = interface {
+        bind_to_interface(raw, name, local_addr.is_ipv4())?;
+    }
+
     // Bind to the wildcard local address (same port as listen socket).
     let local_sa: socket2::SockAddr = local_addr.into();
     let bind_r = unsafe {
@@ -104,6 +112,51 @@ pub(crate) fn open_connected_fd(
     }
 
     Ok(owned)
+}
+
+/// Bind `fd` to the named interface: `SO_BINDTODEVICE`, both directions.
+#[cfg(target_os = "linux")]
+fn bind_to_interface(fd: RawFd, name: &str, _v4: bool) -> io::Result<()> {
+    let r = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr() as *const libc::c_void,
+            name.len() as libc::socklen_t,
+        )
+    };
+    if r < 0 {
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!("bind to interface {name}: {err}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Bind `fd` to the named interface: `IP_BOUND_IF` / `IPV6_BOUND_IF`,
+/// egress only, as for the listen socket.
+#[cfg(target_os = "macos")]
+fn bind_to_interface(fd: RawFd, name: &str, v4: bool) -> io::Result<()> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
+    // SAFETY: `c_name` is a valid NUL-terminated string for the call's duration.
+    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("interface {name} not found"),
+        ));
+    }
+    let (level, opt) = if v4 {
+        (libc::IPPROTO_IP, libc::IP_BOUND_IF)
+    } else {
+        (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF)
+    };
+    set_sockopt_int(fd, level, opt, index as libc::c_int)
+        .map_err(|err| io::Error::new(err.kind(), format!("bind to interface {name}: {err}")))
 }
 
 fn syscall_err(syscall: &str, addr: SocketAddr) -> io::Error {
@@ -149,7 +202,7 @@ mod tests {
         let holder = UdpSocket::bind("127.0.0.1:0").expect("holder bind");
         let holder_addr = holder.local_addr().expect("holder addr");
 
-        let err = open_connected_fd(holder_addr, "127.0.0.1:9".parse().unwrap(), BUF, BUF)
+        let err = open_connected_fd(holder_addr, "127.0.0.1:9".parse().unwrap(), BUF, BUF, None)
             .expect_err("bind must fail against a non-reuseport holder");
 
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{err}");
@@ -168,6 +221,7 @@ mod tests {
             "255.255.255.255:9999".parse().unwrap(),
             BUF,
             BUF,
+            None,
         )
         .expect_err("connect to broadcast without SO_BROADCAST must fail");
 

@@ -53,6 +53,10 @@ pub struct LoopbackTransport {
     /// Beacons a test has queued for the next `discover()` drain, standing
     /// in for the transport-neighbor beacons a real transport hears.
     discovered: Mutex<Vec<DiscoveredPeer>>,
+    /// Carrier a test has set, standing in for an interface-bound
+    /// transport's `IFF_RUNNING`. `None`: not interface-bound, no presence
+    /// reported, which is the default.
+    carrier: Mutex<Option<bool>>,
 }
 
 impl LoopbackTransport {
@@ -79,7 +83,19 @@ impl LoopbackTransport {
             mtu,
             registry,
             discovered: Mutex::new(Vec::new()),
+            carrier: Mutex::new(None),
         }
+    }
+
+    /// Pretend this transport is bound to an interface with (or without)
+    /// carrier; `None` returns it to reporting no presence at all.
+    pub fn set_carrier(&self, carrier: Option<bool>) {
+        *self.carrier.lock().unwrap() = carrier;
+    }
+
+    /// The carrier a test set, if any.
+    pub fn carrier(&self) -> Option<bool> {
+        *self.carrier.lock().unwrap()
     }
 
     /// Queue a beacon for the next `discover()` drain, as if this transport

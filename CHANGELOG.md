@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivered it. A peer holds a *path* per transport: the first from the
   handshake, further ones added by a `PathProbe`/`PathAck` exchange under the
   existing session (three new inner link-message types, `0x52`/`0x53`/`0x54`;
-  old nodes drop them and the path stays unproven). The first probe on a
+  old nodes drop them and the path stays unproven, probed full-size on a
+  backoff that settles at `node.heartbeat_interval_secs`). The first probe on a
   path and one a minute after are padded to the link MTU, so a medium that
   passes small frames and drops large ones never proves itself. A node
   that loses a path (interface gone, carrier lost) tells the peer with a
@@ -34,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds the tree-visible link cost for the dwell so it does not ripple
   mesh-wide. Operator overrides: `role: backup` on any transport, and
   `fipsctl path show|pin|unpin`. `transports.udp.interface` binds a UDP
-  instance to one interface so two UDP instances can be two paths.
+  instance, and the per-peer connected sockets under it, to one interface
+  so two UDP instances can be two paths.
   Design and calibration plan: `reference/fips-multi-path-switchover.md`.
   Defaults are placeholders; the chaos scenarios that calibrate them are
   still to be written. `show_peers` lists every path under its peer

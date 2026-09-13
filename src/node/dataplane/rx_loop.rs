@@ -580,7 +580,6 @@ impl Node {
                         self.check_session_mmp_reports().await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckLinkHeartbeats,
                         self.check_link_heartbeats().await);
-                        self.run_path_selection();
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckRekey,
                         self.check_rekey().await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckSessionRekey,

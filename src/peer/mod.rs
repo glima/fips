@@ -9,8 +9,8 @@ mod active;
 pub(crate) mod machine;
 
 pub use active::{
-    ActivePeer, ConnectivityState, HeartbeatPlan, HeartbeatSend, PathPolicy, PathState, PathSwitch,
-    PathWithdrawal, PeerPath, SwitchReason,
+    ActivePeer, ConnectivityState, HeartbeatPlan, HeartbeatSend, HeartbeatTiming, PathPolicy,
+    PathState, PathSwitch, PathWithdrawal, PeerPath, SwitchReason,
 };
 
 use crate::NodeAddr;

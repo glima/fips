@@ -424,6 +424,38 @@ pub(super) fn sockaddr_to_socket_addr(
     }
 }
 
+/// Bind `sock` to the named interface, per platform.
+#[cfg(target_os = "linux")]
+fn bind_to_interface(sock: &Socket, name: &str, _v4: bool) -> Result<(), TransportError> {
+    sock.bind_device(Some(name.as_bytes()))
+        .map_err(|e| TransportError::StartFailed(format!("bind to interface {name} failed: {e}")))
+}
+
+/// Bind `sock` to the named interface, per platform.
+#[cfg(target_os = "macos")]
+fn bind_to_interface(sock: &Socket, name: &str, v4: bool) -> Result<(), TransportError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| TransportError::StartFailed(format!("invalid interface name {name:?}")))?;
+    // SAFETY: `c_name` is a valid NUL-terminated string for the call's duration.
+    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    let index = std::num::NonZeroU32::new(index)
+        .ok_or_else(|| TransportError::StartFailed(format!("interface {name} not found")))?;
+    let result = if v4 {
+        sock.bind_device_by_index_v4(Some(index))
+    } else {
+        sock.bind_device_by_index_v6(Some(index))
+    };
+    result.map_err(|e| TransportError::StartFailed(format!("bind to interface {name} failed: {e}")))
+}
+
+/// Bind `sock` to the named interface, per platform.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn bind_to_interface(_sock: &Socket, name: &str, _v4: bool) -> Result<(), TransportError> {
+    Err(TransportError::NotSupported(format!(
+        "udp.interface ({name}) is supported on Linux and macOS only"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::sockaddr_to_socket_addr;
@@ -511,36 +543,4 @@ mod tests {
         storage.ss_family = libc::AF_UNIX as libc::sa_family_t;
         assert!(sockaddr_to_socket_addr(&storage).is_err());
     }
-}
-
-/// Bind `sock` to the named interface, per platform.
-#[cfg(target_os = "linux")]
-fn bind_to_interface(sock: &Socket, name: &str, _v4: bool) -> Result<(), TransportError> {
-    sock.bind_device(Some(name.as_bytes()))
-        .map_err(|e| TransportError::StartFailed(format!("bind to interface {name} failed: {e}")))
-}
-
-/// Bind `sock` to the named interface, per platform.
-#[cfg(target_os = "macos")]
-fn bind_to_interface(sock: &Socket, name: &str, v4: bool) -> Result<(), TransportError> {
-    let c_name = std::ffi::CString::new(name)
-        .map_err(|_| TransportError::StartFailed(format!("invalid interface name {name:?}")))?;
-    // SAFETY: `c_name` is a valid NUL-terminated string for the call's duration.
-    let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
-    let index = std::num::NonZeroU32::new(index)
-        .ok_or_else(|| TransportError::StartFailed(format!("interface {name} not found")))?;
-    let result = if v4 {
-        sock.bind_device_by_index_v4(Some(index))
-    } else {
-        sock.bind_device_by_index_v6(Some(index))
-    };
-    result.map_err(|e| TransportError::StartFailed(format!("bind to interface {name} failed: {e}")))
-}
-
-/// Bind `sock` to the named interface, per platform.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn bind_to_interface(_sock: &Socket, name: &str, _v4: bool) -> Result<(), TransportError> {
-    Err(TransportError::NotSupported(format!(
-        "udp.interface ({name}) is supported on Linux and macOS only"
-    )))
 }

@@ -141,6 +141,13 @@ impl UdpTransport {
         self.socket.as_ref().map(|socket| socket.as_raw_fd())
     }
 
+    /// The interface this instance is bound to (`udp.interface`), if any.
+    /// Per-peer `ConnectedPeerSocket`s bind to it too, or their traffic
+    /// would route by the kernel's table and not by the path.
+    pub fn interface(&self) -> Option<&str> {
+        self.config.interface.as_deref()
+    }
+
     /// Configured recv buffer size — used when opening per-peer
     /// `ConnectedPeerSocket`s so they get the same buffer ceiling as
     /// the wildcard listen socket.

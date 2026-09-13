@@ -1054,6 +1054,15 @@ impl TransportHandle {
                     failed_attempts: state.attempts(),
                 })
             }
+            #[cfg(test)]
+            TransportHandle::Loopback(t) => t.carrier().map(|carrier| InterfacePresence {
+                presence: "present",
+                carrier,
+                policy: "optional",
+                since_secs: 0,
+                binds: 1,
+                failed_attempts: 0,
+            }),
             _ => None,
         }
     }

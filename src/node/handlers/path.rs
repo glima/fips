@@ -10,12 +10,15 @@
 //! `Live`, `tx_live`, and takes an RTT sample. No handshake, no new key
 //! material, no index allocation.
 //!
-//! Nothing here changes which path a peer sends on. That is selection, a
-//! later step; today `active` never moves after promotion.
+//! This is also where the active path moves: selection on the fast tick
+//! (`run_path_selection`), withdrawal when a transport goes
+//! (`withdraw_transport`), a peer's `PathClose`, and the switch side
+//! effects (`apply_path_switch`). The carrier edge and the per-path
+//! heartbeats that feed selection live here too.
 
 use crate::NodeAddr;
 use crate::node::Node;
-use crate::peer::{PathPolicy, PathSwitch, PathWithdrawal};
+use crate::peer::{HeartbeatTiming, PathPolicy, PathSwitch, PathWithdrawal};
 use crate::proto::link::{PathClose, PathCloseReason, PathMessage};
 use crate::transport::{TransportAddr, TransportId};
 use tracing::{debug, info, trace};
@@ -92,7 +95,8 @@ impl Node {
         }
     }
 
-    fn resolve_peer_npub(&self, npub: &str) -> Result<NodeAddr, String> {
+    /// The peer named by `npub`, if it is an active peer.
+    pub(in crate::node) fn resolve_peer_npub(&self, npub: &str) -> Result<NodeAddr, String> {
         let identity = crate::PeerIdentity::from_npub(npub)
             .map_err(|e| format!("invalid npub '{npub}': {e}"))?;
         let node_addr = *identity.node_addr();
@@ -181,83 +185,80 @@ impl Node {
         Ok(serde_json::json!({ "pinned": serde_json::Value::Null }))
     }
 
-    /// Probe `transport_id`/`remote_addr` as a path to a live peer, if the
-    /// per-path backoff allows it.
+    /// A live peer beaconed on `transport_id` at `remote_addr`, a transport
+    /// we hold no path to it over: add the path as `Probing`.
     ///
-    /// Adds the path as `Probing` on first use, so a transport that never
-    /// answers (an old node that drops `0x52` at debug) is probed at the
-    /// backoff cadence and never becomes eligible. The backoff doubles per
-    /// unanswered probe from the tick interval, capped at the heartbeat
-    /// interval, and is reset when the transport's presence cycles.
+    /// Nothing is sent here. The heartbeat tick is the one issuer of
+    /// probes: it picks the new path up within one fast interval, probes
+    /// it full-size, and applies the discovery backoff if the peer never
+    /// answers (an old node that drops `0x52` at debug), so the path is
+    /// probed at the capped cadence and never becomes eligible. The backoff
+    /// is reset when the transport's presence cycles.
+    pub(in crate::node) fn add_path_candidate(
+        &mut self,
+        node_addr: NodeAddr,
+        transport_id: TransportId,
+        remote_addr: TransportAddr,
+    ) {
+        let role = self.transport_role(transport_id);
+        let Some(peer) = self.peers.get_mut(&node_addr) else {
+            return;
+        };
+        if peer.transport_id() == Some(transport_id) {
+            // The active path: the handshake proved it.
+            return;
+        }
+        let was_new = peer.path_on(transport_id).is_none();
+        peer.add_path(transport_id, remote_addr.clone())
+            .set_role(role);
+        if was_new {
+            debug!(
+                peer = %self.peer_display_name(&node_addr),
+                transport_id = %transport_id,
+                remote_addr = %remote_addr,
+                "Peer beaconed on a new transport; path added, probing"
+            );
+        }
+    }
+
+    /// Tests: add the path and probe it at once, as one heartbeat tick
+    /// would, without the tick's other sends. Uses the test-only
+    /// `take_probe`, which honours the per-path backoff.
+    #[cfg(test)]
     pub(in crate::node) async fn maybe_probe_path(
         &mut self,
         node_addr: NodeAddr,
         transport_id: TransportId,
         remote_addr: TransportAddr,
     ) {
+        self.add_path_candidate(node_addr, transport_id, remote_addr.clone());
         let now_ms = crate::time::mono_ms();
-        let base_ms = self
-            .config()
-            .node
-            .tick_interval_secs
-            .saturating_mul(1000)
-            .max(100);
-        let cap_ms = self
-            .config()
-            .node
-            .heartbeat_interval_secs
-            .saturating_mul(1000)
-            .max(base_ms);
-
-        let role = self.transport_role(transport_id);
+        let timing = self.heartbeat_timing();
         let Some(peer) = self.peers.get_mut(&node_addr) else {
             return;
         };
         if peer.transport_id() == Some(transport_id) {
-            // The active path: the handshake proved it, and it is kept
-            // alive by heartbeats, not probes.
             return;
         }
-        peer.add_path(transport_id, remote_addr.clone())
-            .set_role(role);
-        let Some((probe_id, remote_active, path_id)) =
-            peer.take_probe(transport_id, now_ms, base_ms, cap_ms)
-        else {
+        let Some((probe_id, remote_active, path_id)) = peer.take_probe(
+            transport_id,
+            now_ms,
+            timing.fast_ms,
+            timing.discovery_cap_ms,
+        ) else {
             return;
         };
-        // The address the beacon carried is the one to reach the peer at
-        // on this transport, and it may have moved since the path was added.
-        // Full-size: a path that cannot carry a data-sized frame must not
-        // prove itself with a small one.
         let probe = PathMessage {
             probe_id,
             remote_active,
             path_id,
         };
         let wire = self.pad_to_link_mtu(probe.encode_probe().to_vec(), transport_id, &remote_addr);
-        match self
-            .send_encrypted_link_message_on_path(
-                &node_addr,
-                &wire,
-                transport_id,
-                remote_addr.clone(),
-            )
+        if let Err(e) = self
+            .send_encrypted_link_message_on_path(&node_addr, &wire, transport_id, remote_addr)
             .await
         {
-            Ok(()) => trace!(
-                peer = %self.peer_display_name(&node_addr),
-                transport_id = %transport_id,
-                remote_addr = %remote_addr,
-                probe_id,
-                "Sent path probe"
-            ),
-            Err(e) => debug!(
-                peer = %self.peer_display_name(&node_addr),
-                transport_id = %transport_id,
-                remote_addr = %remote_addr,
-                error = %e,
-                "Path probe send failed"
-            ),
+            debug!(peer = %self.peer_display_name(&node_addr), error = %e, "Path probe send failed");
         }
     }
 
@@ -415,10 +416,7 @@ impl Node {
             return 0;
         }
 
-        let wall_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let wall_ms = Self::now_ms();
 
         let mut reaped = 0;
         for node_addr in affected {
@@ -527,19 +525,14 @@ impl Node {
     /// `Suspect`; selection acts on `Suspect` at once because the standby is
     /// warm.
     pub(in crate::node) async fn run_path_heartbeats(&mut self) {
-        self.poll_carrier_edges();
-        self.flush_pending_path_closes().await;
+        let carrier_closes = self.poll_carrier_edges();
 
         let now_ms = crate::time::mono_ms();
-        let fast_ms = self.config().node.path.active_heartbeat_ms.max(50);
-        let slow_ms = self.config().node.path.standby_heartbeat_ms.max(fast_ms);
-        // Two fast intervals: one echo lost is loss, two is a path. Stretched
-        // per path by its own round trip inside `plan_heartbeats`.
-        let timeout_ms = fast_ms.saturating_mul(2);
+        let timing = self.heartbeat_timing();
 
         let mut sends = Vec::new();
         for (node_addr, peer) in self.peers.iter_mut() {
-            let plan = peer.plan_heartbeats(now_ms, fast_ms, slow_ms, timeout_ms);
+            let plan = peer.plan_heartbeats(now_ms, &timing);
             for transport_id in plan.suspects {
                 debug!(
                     peer = %node_addr,
@@ -580,12 +573,44 @@ impl Node {
         }
 
         self.run_path_selection();
+
+        // After selection: a close for the path we were sending on can only
+        // go out once traffic has moved off it, and `send_path_close` sends
+        // nothing for the path that is still active.
+        for (node_addr, transport_id) in carrier_closes {
+            self.send_path_close(&node_addr, transport_id, PathCloseReason::CarrierLost)
+                .await;
+        }
+    }
+
+    /// The heartbeat intervals from `node.path.*` and `node.heartbeat_interval_secs`.
+    fn heartbeat_timing(&self) -> HeartbeatTiming {
+        let cfg = &self.config().node;
+        let fast_ms = cfg.path.active_heartbeat_ms.max(50);
+        let slow_ms = cfg.path.standby_heartbeat_ms.max(fast_ms);
+        HeartbeatTiming {
+            fast_ms,
+            slow_ms,
+            // Two fast intervals: one echo lost is loss, two is a path.
+            // Stretched per path by its own round trip inside
+            // `plan_heartbeats`.
+            timeout_ms: fast_ms.saturating_mul(2),
+            // A path the peer never acknowledges is probed full-size at
+            // this cadence for as long as it exists: the link heartbeat
+            // interval, not the standby one.
+            discovery_cap_ms: cfg
+                .heartbeat_interval_secs
+                .saturating_mul(1000)
+                .max(slow_ms),
+        }
     }
 
     /// Read carrier on every interface-bound transport and mark the paths
     /// over one that just lost it `Suspect`. Unplugging a cable drops
     /// carrier on both NICs, so both ends see this inside one fast tick.
-    fn poll_carrier_edges(&mut self) {
+    /// Returns the `(peer, transport)` pairs to send a `PathClose` for.
+    fn poll_carrier_edges(&mut self) -> Vec<(NodeAddr, TransportId)> {
+        let mut closes = Vec::new();
         let readings: Vec<(TransportId, bool)> = self
             .transports
             .iter()
@@ -602,11 +627,11 @@ impl Node {
                 }
                 if !marked.is_empty() {
                     info!(%transport_id, paths = marked.len(), "Carrier lost: paths suspect");
-                    self.pending_path_closes
-                        .extend(marked.into_iter().map(|a| (a, transport_id)));
+                    closes.extend(marked.into_iter().map(|a| (a, transport_id)));
                 }
             }
         }
+        closes
     }
 
     /// Tell `node_addr` that our path over `transport_id` is closing, on
@@ -702,16 +727,6 @@ impl Node {
         }
     }
 
-    /// Flush the path closes the carrier poll queued (it holds the peer
-    /// table mutably and cannot send).
-    async fn flush_pending_path_closes(&mut self) {
-        let pending = std::mem::take(&mut self.pending_path_closes);
-        for (node_addr, transport_id) in pending {
-            self.send_path_close(&node_addr, transport_id, PathCloseReason::CarrierLost)
-                .await;
-        }
-    }
-
     /// Pad a link message to fill the link MTU on `transport_id` to `addr`,
     /// so the frame is data-sized: outer header, inner timestamp and AEAD
     /// tag are accounted for.
@@ -724,9 +739,8 @@ impl Node {
         let Some(transport) = self.transports.get(&transport_id) else {
             return wire;
         };
-        let overhead =
-            crate::proto::fmp::wire::ESTABLISHED_HEADER_SIZE + 4 + crate::noise::TAG_SIZE;
-        let room = usize::from(transport.link_mtu(addr)).saturating_sub(overhead);
+        let room = usize::from(transport.link_mtu(addr))
+            .saturating_sub(super::session::LINK_FRAME_OVERHEAD);
         if wire.len() < room {
             wire.resize(room, 0);
         }
