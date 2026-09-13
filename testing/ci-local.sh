@@ -151,6 +151,8 @@ CHAOS_SUITES=(
     "ethernet-mesh ethernet-mesh"
     "ethernet-only ethernet-only"
     "ethernet-churn ethernet-churn"
+    "dual-path-flap dual-path-flap"
+    "dual-udp-flap dual-udp-flap"
     "tcp-mesh tcp-mesh"
     "congestion-stress congestion-stress"
 )

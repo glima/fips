@@ -1034,13 +1034,14 @@ impl ActivePeer {
             return false;
         }
         path.addr = addr;
-        if self.send.active == Some(idx) {
-            true
-        } else {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let on_active = self.send.active == Some(idx);
+        // A standby's connected socket is its own to drop; the active one
+        // is the caller's, on the `true` return.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if !on_active {
             path.clear_connected_udp();
-            false
         }
+        on_active
     }
 
     /// Bind the peer's send side to `(transport_id, addr)` outright.
