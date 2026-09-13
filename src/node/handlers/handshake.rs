@@ -17,7 +17,7 @@ use crate::proto::fmp::{
     EstablishSnapshot, EstablishView, InboundDecision, InboundReject, OutboundSnapshot,
     PromotionResult, WireOutcome, cross_connection_winner,
 };
-use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
+use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportId};
 use crate::utils::index::SessionIndex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -69,11 +69,18 @@ pub(in crate::node) enum Msg1Waiver {
 }
 
 impl EstablishView for Node {
-    fn establish_snapshot(&self, peer_addr: &NodeAddr) -> EstablishSnapshot {
+    fn establish_snapshot(
+        &self,
+        peer_addr: &NodeAddr,
+        arrival_transport: TransportId,
+    ) -> EstablishSnapshot {
         let existing = self.peers.get(peer_addr);
         let max_peers = self.max_peers();
         EstablishSnapshot {
             has_existing_peer: existing.is_some(),
+            existing_peer_live: existing.is_some() && self.active_peer_link_is_live(peer_addr),
+            existing_peer_has_path_here: existing
+                .is_some_and(|p| p.path_on(arrival_transport).is_some()),
             existing_peer_epoch: existing.and_then(|p| p.remote_epoch()),
             existing_session_age_secs: existing
                 .map(|p| p.session_established_at().elapsed().as_secs())
@@ -97,9 +104,19 @@ impl EstablishView for Node {
         }
     }
 
-    fn outbound_snapshot(&self, peer_addr: &NodeAddr) -> OutboundSnapshot {
+    fn outbound_snapshot(
+        &self,
+        peer_addr: &NodeAddr,
+        dial_transport: Option<TransportId>,
+    ) -> OutboundSnapshot {
         OutboundSnapshot {
             has_existing_peer: self.peers.contains_key(peer_addr),
+            new_transport_path: dial_transport.is_some_and(|tid| {
+                self.peers
+                    .get(peer_addr)
+                    .is_some_and(|p| p.path_on(tid).is_none())
+                    && self.active_peer_link_is_live(peer_addr)
+            }),
             // Tie-break for THIS outbound connection (`is_outbound = true`),
             // pre-evaluated here so the core stays free of the peer helper.
             our_outbound_wins: cross_connection_winner(
@@ -563,7 +580,7 @@ impl Node {
         // session age resolved here, the max-peers cap, our own address for the
         // tie-break). Taken before this connection is inserted into the
         // registry, matching the pre-refactor read points.
-        let est = self.establish_snapshot(&peer_node_addr);
+        let est = self.establish_snapshot(&peer_node_addr, packet.transport_id);
 
         // === PHASE C: structured classification ===
         // Evaluate the inbound decision once on a local establish leg and route
@@ -1390,7 +1407,9 @@ impl Node {
         // `PromoteToActive` arm can feed `PromotionResolved` back via the same
         // lookup; the `pending_outbound` lifecycle stays shell-side — the
         // machine never touches it.
-        let out_snap = self.outbound_snapshot(&peer_node_addr);
+        let dial_transport = self.links.get(&link_id).map(|l| l.transport_id());
+        let out_snap = self.outbound_snapshot(&peer_node_addr, dial_transport);
+        let out_snap_new_transport_path = out_snap.new_transport_path;
         let actions = match self.peer_machines.get_mut(&link_id) {
             Some(machine) => machine.step(
                 PeerEvent::Msg2 {
@@ -1530,6 +1549,22 @@ impl Node {
                 // Free the outbound's session index since we're not using it
                 if let Some(idx) = outbound_our_index {
                     let _ = self.index_allocator.free(idx);
+                }
+
+                // A keep because the dial ran over a transport we had no
+                // path to this peer on: the peer kept its session and took
+                // the transport as a path, so do the same. The heartbeat
+                // tick probes it from here.
+                if out_snap_new_transport_path && let Some(link) = self.links.get(&link_id) {
+                    let tid = link.transport_id();
+                    let addr = link.remote_addr().clone();
+                    info!(
+                        peer = %self.peer_display_name(&peer_node_addr),
+                        transport_id = %tid,
+                        addr = %addr,
+                        "Handshake over a new transport to a live peer: kept as a path, session kept"
+                    );
+                    self.add_path_candidate(peer_node_addr, tid, addr);
                 }
 
                 cross_conn_outcome = Some(CrossConnOutcome::Keep);
@@ -1710,6 +1745,37 @@ impl Node {
             let existing_link_id = existing_peer.link_id();
 
             let remote_epoch_changed = matches!((existing_peer.remote_epoch(), remote_epoch), (Some(old), Some(new)) if old != new);
+
+            // A handshake from a live peer over a transport we hold no path
+            // to it on (the responder side of what `establish_inbound`
+            // admitted as a fresh establish, or a cross-connection that
+            // happened to land on a new transport): keep the session both
+            // ends already share and take the transport as a path. The new
+            // session is dropped; its index is freed by the machine's
+            // `PromotionResolved` follow-up, as for any lost connection.
+            let adopt_as_path = !remote_epoch_changed
+                && existing_peer.path_on(transport_id).is_none()
+                && self.active_peer_link_is_live(&peer_node_addr);
+            if adopt_as_path {
+                let role = self
+                    .transports
+                    .get(&transport_id)
+                    .map(|t| t.role())
+                    .unwrap_or_default();
+                if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
+                    peer.add_path(transport_id, current_addr.clone())
+                        .set_role(role);
+                }
+                info!(
+                    peer = %self.peer_display_name(&peer_node_addr),
+                    transport_id = %transport_id,
+                    addr = %current_addr,
+                    "Handshake from a live peer over a new transport: kept as a path, session kept"
+                );
+                return Ok(PromotionResult::CrossConnectionLost {
+                    winner_link_id: existing_link_id,
+                });
+            }
 
             // Determine which connection wins. A peer restart (different
             // startup epoch) is not a normal cross-connection: the old link

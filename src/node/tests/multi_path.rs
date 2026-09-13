@@ -443,6 +443,68 @@ async fn a_beacon_from_a_live_peer_on_a_new_transport_probes_instead_of_dialling
 }
 
 #[tokio::test]
+async fn a_second_handshake_over_a_new_transport_becomes_a_path_at_both_ends() {
+    let (mut nodes, wifi_0, _wifi_1) = dual_homed_pair().await;
+    let addr_0 = *nodes[0].node.node_addr();
+    let addr_1 = *nodes[1].node.node_addr();
+    let cable = nodes[0].transport_id;
+    let session_before = (
+        nodes[0].node.get_peer(&addr_1).unwrap().our_index(),
+        nodes[1].node.get_peer(&addr_0).unwrap().our_index(),
+    );
+
+    // Node 1 dials node 0 over the wifi, as a static config listing both
+    // addresses does at startup, while the cable session is live.
+    let identity_0 = PeerIdentity::from_pubkey_full(nodes[0].node.identity().pubkey_full());
+    nodes[1]
+        .node
+        .initiate_connection(wifi(), wifi_0.clone(), identity_0)
+        .await
+        .expect("dial starts");
+    for _ in 0..8 {
+        if process_available_packets(&mut nodes).await == 0 {
+            break;
+        }
+    }
+
+    // Neither end re-peered: one peer each, the session untouched.
+    assert_eq!(nodes[0].node.peer_count(), 1);
+    assert_eq!(nodes[1].node.peer_count(), 1);
+    assert_eq!(
+        (
+            nodes[0].node.get_peer(&addr_1).unwrap().our_index(),
+            nodes[1].node.get_peer(&addr_0).unwrap().our_index(),
+        ),
+        session_before,
+        "the handshake did not replace the session"
+    );
+    // Both ends took the wifi as a path, traffic still on the cable.
+    for (node, peer) in [(&nodes[0], addr_1), (&nodes[1], addr_0)] {
+        let p = node.node.get_peer(&peer).unwrap();
+        assert!(p.path_on(wifi()).is_some(), "wifi is a path");
+        assert_eq!(p.transport_id(), Some(cable), "traffic stays on the cable");
+    }
+
+    // The heartbeat tick proves it.
+    nodes[1].node.run_path_heartbeats().await;
+    for _ in 0..8 {
+        if process_available_packets(&mut nodes).await == 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        nodes[1]
+            .node
+            .get_peer(&addr_0)
+            .unwrap()
+            .path_on(wifi())
+            .unwrap()
+            .state(),
+        PathState::Live
+    );
+}
+
+#[tokio::test]
 async fn a_beaconed_path_is_probed_by_the_next_heartbeat_tick_and_once_only() {
     let (mut nodes, wifi_0, _wifi_1) = dual_homed_pair().await;
     let addr_0 = *nodes[0].node.node_addr();

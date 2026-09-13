@@ -77,6 +77,8 @@ pub(super) fn resend_snapshot(link: LinkId, resend_count: u32, msg1: Vec<u8>) ->
 pub(super) fn establish_snapshot() -> EstablishSnapshot {
     EstablishSnapshot {
         has_existing_peer: false,
+        existing_peer_live: false,
+        existing_peer_has_path_here: false,
         existing_peer_epoch: None,
         existing_session_age_secs: 0,
         has_session: false,

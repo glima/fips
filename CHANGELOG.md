@@ -41,8 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport it has no path to that peer over (from `update_peers`,
   `fipsctl connect`, or a runtime peer lane), is added as a path under that
   session rather than dialled: a second handshake to a live peer is read by
-  the far side as a rekey. `testing/chaos/scenarios/dual-udp-flap` is the
-  all-IP calibration twin: two interface-bound UDP instances as two paths.
+  the far side as a rekey. And a handshake that does complete to a live
+  peer over a transport with no path (a peer entry listing two addresses
+  dials both at startup) is kept as a path at both ends, under the session
+  the first one made, instead of replacing it or being read as a rekey;
+  once a tick, a configured address whose transport came up later becomes
+  a path too. `testing/chaos/scenarios/dual-udp-flap` is the all-IP
+  calibration twin: two interface-bound UDP instances as two paths.
   Design and calibration plan: `reference/fips-multi-path-switchover.md`.
   Defaults are placeholders; the chaos scenarios that calibrate them are
   still to be written. `show_peers` lists every path under its peer

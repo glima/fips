@@ -1060,6 +1060,15 @@ Static peer list. Each entry defines a peer to connect to.
 | `peers[].auto_reconnect` | bool | `true` | Automatically reconnect after MMP link-dead removal (exponential backoff, unlimited retries) |
 | `peers[].via_nostr` | bool | `false` | Append Nostr advert-derived endpoints after static addresses for this peer |
 
+**Several addresses, one session.** A peer entry may list addresses on
+several transports (`udp/main` and `udp/eth0`, or `udp` and `tor`). All
+are dialled; the first handshake to complete makes the session, and a
+later one to the same live peer over a transport that has no path yet is
+kept as a *path* under that session at both ends, not as a second
+session. A configured address whose transport was down at dial time is
+added as a path once the transport is up and the peer is live. Paths are
+listed by `fipsctl path show <peer>`.
+
 **Named UDP instances.** Where several UDP transports are configured
 under named sub-keys, a peer address can name the one it belongs to by
 writing the transport field as `udp/<instance>`, for example

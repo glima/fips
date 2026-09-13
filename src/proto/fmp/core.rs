@@ -18,7 +18,7 @@
 //! shell-side.
 
 use super::state::Fmp;
-use crate::transport::LinkId;
+use crate::transport::{LinkId, TransportId};
 use crate::utils::index::SessionIndex;
 use crate::{NodeAddr, PeerIdentity};
 
@@ -217,6 +217,15 @@ pub(crate) struct WireOutcome {
 pub(crate) struct EstablishSnapshot {
     /// The peer is already an active peer in the registry.
     pub has_existing_peer: bool,
+    /// The existing peer's link is answering (heard within the heartbeat
+    /// interval). Only meaningful when `has_existing_peer`.
+    pub existing_peer_live: bool,
+    /// The existing peer already holds a path on the transport this msg1
+    /// arrived on. Only meaningful when `has_existing_peer`. A live peer's
+    /// msg1 on a transport it has no path on is not a rekey (a rekey rides
+    /// a path) but a fresh handshake over a new transport, which the
+    /// promotion keeps as a path rather than as a session.
+    pub existing_peer_has_path_here: bool,
     /// The existing active peer's captured remote startup epoch, if any.
     pub existing_peer_epoch: Option<[u8; 8]>,
     /// Monotonic age in seconds of the existing peer's session
@@ -260,6 +269,12 @@ pub(crate) struct OutboundSnapshot {
     /// The peer identity is already a promoted active peer — i.e. this outbound
     /// completion is a cross-connection (we also processed their msg1).
     pub has_existing_peer: bool,
+    /// The existing peer is live and holds no path on the transport this
+    /// outbound handshake ran over: the completion is a new transport to a
+    /// peer we already have, not a race for one session. Resolved as a
+    /// keep, and the shell adds the path. Only meaningful when
+    /// `has_existing_peer`.
+    pub new_transport_path: bool,
     /// Pre-evaluated cross-connection tie-break: our *outbound* connection wins
     /// (we are the smaller NodeAddr). Only meaningful when `has_existing_peer`.
     pub our_outbound_wins: bool,
@@ -439,14 +454,24 @@ const REKEY_MIN_SESSION_AGE_SECS: u64 = 30;
 pub(crate) trait EstablishView {
     /// Snapshot the registry state relevant to classifying an inbound msg1 from
     /// `peer_addr`: the existing peer's epoch/session/rekey state (with the
-    /// session age resolved shell-side), the max-peers cap, and this node's own
+    /// session age resolved shell-side), whether it is live and already has a
+    /// path on `arrival_transport`, the max-peers cap, and this node's own
     /// address for the tie-break.
-    fn establish_snapshot(&self, peer_addr: &NodeAddr) -> EstablishSnapshot;
+    fn establish_snapshot(
+        &self,
+        peer_addr: &NodeAddr,
+        arrival_transport: TransportId,
+    ) -> EstablishSnapshot;
 
     /// Snapshot the registry state relevant to classifying an outbound msg2
     /// completion for `peer_addr`: whether the identity is already an active
-    /// peer, and the pre-evaluated cross-connection tie-break.
-    fn outbound_snapshot(&self, peer_addr: &NodeAddr) -> OutboundSnapshot;
+    /// peer, whether `dial_transport` is a new transport to a live one, and
+    /// the pre-evaluated cross-connection tie-break.
+    fn outbound_snapshot(
+        &self,
+        peer_addr: &NodeAddr,
+        dial_transport: Option<TransportId>,
+    ) -> OutboundSnapshot;
 }
 
 impl Fmp {
@@ -610,6 +635,18 @@ impl Fmp {
 
         if snap.has_existing_peer {
             let peer_addr = *wire.peer_identity.node_addr();
+            let restarted = matches!(
+                (snap.existing_peer_epoch, wire.remote_epoch),
+                (Some(existing), Some(new)) if existing != new
+            );
+            if !restarted && snap.existing_peer_live && !snap.existing_peer_has_path_here {
+                // A live peer dialling us over a transport we hold no path
+                // to it on. Not a rekey: those ride an existing path. Run
+                // it as a fresh establish so the initiator's handshake
+                // completes; the promotion keeps the new transport as a
+                // path under the session both ends already share.
+                return InboundDecision::Promote;
+            }
             match (snap.existing_peer_epoch, wire.remote_epoch) {
                 (Some(existing), Some(new)) if existing != new => {
                     // Epoch mismatch → peer restart.
@@ -669,6 +706,11 @@ impl Fmp {
     pub(crate) fn establish_outbound(&self, snap: &OutboundSnapshot) -> OutboundDecision {
         if !snap.has_existing_peer {
             return OutboundDecision::Promote;
+        }
+        if snap.new_transport_path {
+            // Same handshake seen from the initiator: the peer kept its
+            // session and took our transport as a path, so do the same.
+            return OutboundDecision::CrossConnectionKeep;
         }
         if snap.our_outbound_wins {
             OutboundDecision::CrossConnectionSwap

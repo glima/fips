@@ -878,6 +878,7 @@ impl Node {
         for (node_addr, transport_id, remote_addr) in path_candidates {
             self.add_path_candidate(node_addr, transport_id, remote_addr);
         }
+        self.add_configured_path_candidates();
 
         if transport_neighbors.is_empty() {
             return;
@@ -2555,6 +2556,39 @@ impl Node {
             .into_iter()
             .cloned()
             .collect()
+    }
+
+    /// Configured addresses of live peers on transports they have no path
+    /// over become paths. Runs every discovery tick, idempotent and cheap:
+    /// a configured address whose transport was down at dial time (wifi
+    /// joined later, Tor came up) is otherwise never looked at again, since
+    /// a peer that is already active is not re-dialled.
+    fn add_configured_path_candidates(&mut self) {
+        let configs: Vec<PeerConfig> = self.config().auto_connect_peers().cloned().collect();
+        for peer_config in configs {
+            let Ok(identity) = PeerIdentity::from_npub(&peer_config.npub) else {
+                continue;
+            };
+            let node_addr = *identity.node_addr();
+            if !self.peers.contains_key(&node_addr) || !self.active_peer_link_is_live(&node_addr) {
+                continue;
+            }
+            for addr in peer_config.addresses_by_priority() {
+                if addr.transport == "udp" && addr.addr.eq_ignore_ascii_case("nat") {
+                    continue;
+                }
+                let Some((transport_id, remote_addr)) = self.resolve_peer_address(addr) else {
+                    continue;
+                };
+                let has_path = self
+                    .peers
+                    .get(&node_addr)
+                    .is_some_and(|p| p.path_on(transport_id).is_some());
+                if !has_path {
+                    self.add_path_candidate(node_addr, transport_id, remote_addr);
+                }
+            }
+        }
     }
 
     /// The transport and address a configured peer address dials to, or

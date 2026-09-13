@@ -3,11 +3,10 @@
 # The all-IP twin of dual-path-flap. Two nodes joined twice, both by UDP: a
 # dedicated veth carrying IP (`10.222.0.0/24`), on which each node runs a
 # UDP instance bound to that interface (`transports.udp.<veth>.interface`),
-# and the Docker bridge on the ordinary wildcard instance. The bridge half is
-# dialled from static config; the veth half has no beacon, so the runner
-# hands the dial owner the veth address once the pair has peered
-# (`fipsctl connect ... udp/<veth>`), and the daemon adds it as a path under
-# the existing session rather than dialling a second handshake.
+# and the Docker bridge on the ordinary wildcard instance. Both are static
+# peer addresses on the dial owner (`udp/main` first, `udp/<veth>` second),
+# so both handshakes run at startup; whichever completes second is kept as a
+# path under the first's session, at both ends, rather than replacing it.
 #
 # What this exercises that dual-path-flap cannot: two UDP instances as two
 # paths, `udp.interface` binding on the listen socket *and* on the per-peer
@@ -16,9 +15,10 @@
 # same: `link_flaps` sets 100% loss on the veth, the interface stays up, and
 # the heartbeat echo timeout is the detector.
 #
-# What to read from a run: as dual-path-flap. "udp-veth path n01 -> n02" in
-# runner.log is the moment the second path was handed over; `fipsctl path
-# show` on either node should list both instances live before the first flap.
+# What to read from a run: as dual-path-flap. "kept as a path, session kept"
+# in both node logs is the second handshake being taken as a path; `fipsctl
+# path show` on either node should list both instances live before the first
+# flap, and "Peer promoted to active" must appear once per node.
 #
 #   n01 ===udp/veth=== n02      (flapped)
 #   n01 ----udp/main--- n02      (never touched)

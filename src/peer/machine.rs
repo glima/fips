@@ -1895,6 +1895,8 @@ mod tests {
     fn est_new_peer(our: NodeAddr) -> EstablishSnapshot {
         EstablishSnapshot {
             has_existing_peer: false,
+            existing_peer_live: false,
+            existing_peer_has_path_here: false,
             existing_peer_epoch: None,
             existing_session_age_secs: 0,
             has_session: false,
@@ -2560,6 +2562,7 @@ mod tests {
         };
         m.conn.set_our_index(SessionIndex::new(0xABCD));
         let out = OutboundSnapshot {
+            new_transport_path: false,
             has_existing_peer: false,
             our_outbound_wins: false,
         };
@@ -2610,6 +2613,7 @@ mod tests {
         };
         m2.conn.set_our_index(SessionIndex::new(0x2222)); // outbound index
         let out_swap = OutboundSnapshot {
+            new_transport_path: false,
             has_existing_peer: true,
             our_outbound_wins: true,
         };
@@ -2649,6 +2653,7 @@ mod tests {
         };
         m3.conn.set_our_index(SessionIndex::new(0x3333));
         let out_keep = OutboundSnapshot {
+            new_transport_path: false,
             has_existing_peer: true,
             our_outbound_wins: false,
         };
@@ -2703,6 +2708,7 @@ mod tests {
 
         // Promote via msg2 from Discovered.
         let out = OutboundSnapshot {
+            new_transport_path: false,
             has_existing_peer: false,
             our_outbound_wins: false,
         };
@@ -2820,6 +2826,7 @@ mod tests {
 
         // Step Msg2 from Handshaking — identical promote to the Discovered path.
         let out = OutboundSnapshot {
+            new_transport_path: false,
             has_existing_peer: false,
             our_outbound_wins: false,
         };

@@ -550,6 +550,7 @@ fn establish_outbound_no_existing_peer_promotes() {
     let fmp = Fmp::new();
     // our_outbound_wins is irrelevant when there is no existing peer.
     let snap = OutboundSnapshot {
+        new_transport_path: false,
         has_existing_peer: false,
         our_outbound_wins: true,
     };
@@ -560,6 +561,7 @@ fn establish_outbound_no_existing_peer_promotes() {
 fn establish_outbound_cross_connection_win_swaps() {
     let fmp = Fmp::new();
     let snap = OutboundSnapshot {
+        new_transport_path: false,
         has_existing_peer: true,
         our_outbound_wins: true,
     };
@@ -573,6 +575,7 @@ fn establish_outbound_cross_connection_win_swaps() {
 fn establish_outbound_cross_connection_loss_keeps() {
     let fmp = Fmp::new();
     let snap = OutboundSnapshot {
+        new_transport_path: false,
         has_existing_peer: true,
         our_outbound_wins: false,
     };
@@ -613,4 +616,60 @@ fn test_cross_connection_symmetric() {
 
     // Exactly one survives
     assert!(a_outbound_wins != a_inbound_wins);
+}
+
+#[test]
+fn a_live_peer_s_msg1_on_a_transport_without_a_path_is_a_fresh_establish() {
+    // Same epoch, session old enough to rekey: everything that would make
+    // this a rekey, except that it arrived on a transport we hold no path
+    // to the peer on. That is a new transport, not a rekey.
+    let mut snap = establish_snapshot();
+    snap.has_existing_peer = true;
+    snap.existing_peer_epoch = Some([1u8; 8]);
+    snap.has_session = true;
+    snap.is_healthy = true;
+    snap.existing_session_age_secs = 31;
+    snap.existing_peer_live = true;
+    snap.existing_peer_has_path_here = false;
+    let wire = wire_outcome(Some([1u8; 8]));
+    assert!(matches!(
+        Fmp::new().establish_inbound(&snap, &wire),
+        InboundDecision::Promote
+    ));
+
+    // On a transport that already carries a path it is the rekey it looks like.
+    snap.existing_peer_has_path_here = true;
+    assert!(matches!(
+        Fmp::new().establish_inbound(&snap, &wire),
+        InboundDecision::RekeyRespond { .. }
+    ));
+
+    // A peer that has gone quiet gets the ordinary existing-peer treatment.
+    snap.existing_peer_has_path_here = false;
+    snap.existing_peer_live = false;
+    assert!(matches!(
+        Fmp::new().establish_inbound(&snap, &wire),
+        InboundDecision::RekeyRespond { .. }
+    ));
+
+    // A restart is a restart, whatever transport it arrives on.
+    snap.existing_peer_live = true;
+    let restarted = wire_outcome(Some([2u8; 8]));
+    assert!(matches!(
+        Fmp::new().establish_inbound(&snap, &restarted),
+        InboundDecision::RestartThenPromote { .. }
+    ));
+}
+
+#[test]
+fn an_outbound_completion_over_a_new_transport_keeps_the_session_even_when_it_would_win() {
+    let snap = OutboundSnapshot {
+        new_transport_path: true,
+        has_existing_peer: true,
+        our_outbound_wins: true,
+    };
+    assert!(matches!(
+        Fmp::new().establish_outbound(&snap),
+        OutboundDecision::CrossConnectionKeep
+    ));
 }

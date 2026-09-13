@@ -340,13 +340,12 @@ impl Node {
                                     );
                                 }
                                 PromotionResult::CrossConnectionLost { winner_link_id } => {
-                                    debug_assert!(
-                                        false,
-                                        "executor CrossConnectionLost is unreachable on \
-                                         driven net-new establish paths"
-                                    );
-                                    // Close this (losing) connection, drop its link,
-                                    // and restore `addr_to_link` to the winner.
+                                    // Reached when the promotion kept a handshake from
+                                    // a live peer over a new transport as a path: the
+                                    // session stays the existing peer's, this leg is
+                                    // done. Close this connection, drop its link, and
+                                    // point `addr_to_link` for the new address at the
+                                    // winner, so a msg1 from it is recognised.
                                     if let Some(transport) =
                                         self.transports.get(&ambient.transport_id)
                                     {
