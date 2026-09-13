@@ -311,3 +311,113 @@ async fn test_api_disconnect_unknown_peer_changes_nothing() {
     assert_eq!(node.peer_machines.len(), machines_before);
     assert_eq!(node.links.len(), links_before);
 }
+
+/// The `show_links` row whose `link_id` is `link_id`.
+fn link_row(links: &serde_json::Value, link_id: LinkId) -> &serde_json::Value {
+    links["links"]
+        .as_array()
+        .expect("show_links returns a links array")
+        .iter()
+        .find(|row| row["link_id"] == link_id.as_u64())
+        .expect("show_links lists the link bound to the peer")
+}
+
+/// Check one node's `show_links` row for the link it shares with `peer_idx`
+/// against the counters the data plane kept on that peer, and return the row.
+fn assert_link_row_matches_peer(
+    nodes: &[TestNode],
+    node_idx: usize,
+    peer_idx: usize,
+) -> serde_json::Value {
+    let peer_addr = *nodes[peer_idx].node.node_addr();
+    let peer = nodes[node_idx]
+        .node
+        .get_peer(&peer_addr)
+        .expect("the tree test establishes the peer");
+    let link_id = peer.link_id();
+    let expected = peer.link_stats().clone();
+
+    // Without traffic every counter is zero on both copies and the comparison
+    // below would pass whether or not show_links reads the right one.
+    assert!(expected.packets_sent > 0, "node {node_idx} sent no frames");
+    assert!(
+        expected.packets_recv > 0,
+        "node {node_idx} received no frames"
+    );
+    assert!(expected.bytes_sent > 0, "node {node_idx} sent no bytes");
+    assert!(expected.bytes_recv > 0, "node {node_idx} received no bytes");
+    assert!(
+        expected.last_recv_ms > 0,
+        "node {node_idx} stamped no receive time"
+    );
+
+    let links = crate::control::queries::show_links(&nodes[node_idx].node);
+    let row = link_row(&links, link_id).clone();
+    let stats = &row["stats"];
+    assert_eq!(
+        stats["packets_sent"], expected.packets_sent,
+        "node {node_idx}"
+    );
+    assert_eq!(
+        stats["packets_recv"], expected.packets_recv,
+        "node {node_idx}"
+    );
+    assert_eq!(stats["bytes_sent"], expected.bytes_sent, "node {node_idx}");
+    assert_eq!(stats["bytes_recv"], expected.bytes_recv, "node {node_idx}");
+    assert_eq!(
+        stats["last_recv_ms"], expected.last_recv_ms,
+        "node {node_idx}"
+    );
+    row
+}
+
+/// `show_links` reports the traffic a link has carried, not zero: for a link
+/// bound to an authenticated peer its counters are the ones the data plane
+/// keeps on that peer, on both ends of the link, and the tick-published
+/// snapshot render agrees with the on-loop render.
+#[tokio::test]
+async fn show_links_reports_the_traffic_counters_of_the_peer_bound_to_each_link() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+
+    let row0 = assert_link_row_matches_peer(&nodes, 0, 1);
+
+    // The off-loop render comes from the snapshot published on the tick.
+    nodes[0].node.record_stats_history();
+    let handle = nodes[0].node.control_read_handle();
+    let on_loop = crate::control::queries::show_links(&nodes[0].node);
+    let off_loop = crate::control::queries::show_links_from_handle(&handle);
+    assert_eq!(
+        off_loop, on_loop,
+        "the snapshot render of show_links must match the on-loop render"
+    );
+    let link_id = nodes[0]
+        .node
+        .get_peer(nodes[1].node.node_addr())
+        .expect("node 0 still has node 1")
+        .link_id();
+    let off_row = link_row(&off_loop, link_id);
+    assert!(
+        off_row["stats"]["packets_recv"].as_u64().unwrap_or(0) > 0,
+        "the snapshot render must carry the link's receive count, got {off_row}"
+    );
+
+    let row1 = assert_link_row_matches_peer(&nodes, 1, 0);
+
+    // A check that does not come from the same node's peer copy: every frame
+    // node 1 counted as received from node 0 was counted as sent by node 0.
+    // Loopback is lossless, but a frame sent before node 1 promoted node 0 is
+    // counted by the sender only, so the bound is not an equality.
+    let sent0 = row0["stats"]["packets_sent"]
+        .as_u64()
+        .expect("packets_sent is a number");
+    let recv1 = row1["stats"]["packets_recv"]
+        .as_u64()
+        .expect("packets_recv is a number");
+    assert!(recv1 > 0, "node 1's link row shows no frames received");
+    assert!(
+        recv1 <= sent0,
+        "node 1's link row counts {recv1} frames received, more than the {sent0} node 0 sent"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}

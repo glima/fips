@@ -712,6 +712,21 @@ with v0.5.x or earlier peers.
   platforms with the connected-socket fast path); elsewhere the heartbeat alone
   carries the new address.
 
+#### Control socket
+
+- `show_links` (`fipsctl show links`) now reports the traffic a link has
+  carried. Its `packets_sent`, `packets_recv`, `bytes_sent`, `bytes_recv` and
+  `last_recv_ms` were read from counters on the link record that nothing on
+  the data plane ever wrote, so every link reported zero however much traffic
+  it carried, while `show_peers` counted the same traffic on the peer. A link
+  bound to an authenticated peer now reports that peer's counters, so the two
+  queries agree for the same `link_id`; a link still in handshake has no peer
+  yet and still reports zero. The counters follow the peer across address
+  changes, while the row's `transport_id` and `remote_addr` stay those the
+  link was created with. The counters cover authenticated link frames only, so
+  they are not expected to match the transport totals in `show_transports`.
+  The response shape is unchanged.
+
 #### Packaging
 
 - The Linux `.deb` and the systemd tarball now install and run on Debian 12 and

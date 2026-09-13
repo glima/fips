@@ -567,10 +567,14 @@ pub(crate) fn show_peers_from_handle(handle: &super::read_handle::ControlReadHan
 
 /// `show_links` — Active links.
 pub fn show_links(node: &Node) -> Value {
+    let counters = node.link_counters();
     let links: Vec<Value> = node
         .links()
         .map(|link| {
-            let stats = link.stats();
+            let stats = counters
+                .get(&link.link_id())
+                .copied()
+                .unwrap_or_else(|| link.stats());
             json!({
                 "link_id": link.link_id().as_u64(),
                 "transport_id": link.transport_id().as_u32(),
@@ -3517,6 +3521,48 @@ mod tests {
             render(show_mmp(&node)),
             render(show_mmp_from_handle(&handle)),
             "off-loop show_mmp must match on-loop output"
+        );
+    }
+
+    /// A link with no authenticated peer yet (one still in handshake) keeps its
+    /// row in `show_links`, with zero traffic counters, on both the on-loop and
+    /// the snapshot render. Guards against dropping unbound rows.
+    #[test]
+    fn show_links_keeps_a_link_with_no_bound_peer_and_reports_zero_counters() {
+        use crate::transport::{Link, LinkDirection, LinkId, TransportAddr, TransportId};
+
+        let mut node = build_test_node();
+        let link_id = LinkId::new(7);
+        node.add_link(Link::connectionless(
+            link_id,
+            TransportId::new(1),
+            TransportAddr::from_string("127.0.0.1:2121"),
+            LinkDirection::Outbound,
+            Duration::from_millis(50),
+        ))
+        .expect("an empty node has room for a link");
+
+        let links = show_links(&node);
+        let rows = links["links"].as_array().expect("links array");
+        assert_eq!(rows.len(), 1, "the unbound link must be listed");
+        let row = &rows[0];
+        assert_eq!(row["link_id"], link_id.as_u64());
+        for key in [
+            "packets_sent",
+            "packets_recv",
+            "bytes_sent",
+            "bytes_recv",
+            "last_recv_ms",
+        ] {
+            assert_eq!(row["stats"][key], 0, "{key} for a link with no peer");
+        }
+
+        node.record_stats_history();
+        let handle = node.control_read_handle();
+        assert_eq!(
+            render(show_links(&node)),
+            render(show_links_from_handle(&handle)),
+            "off-loop show_links must match on-loop output for an unbound link"
         );
     }
 

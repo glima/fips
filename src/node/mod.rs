@@ -2463,10 +2463,14 @@ impl Node {
             .collect();
 
         // --- links (show_links) ---
+        let counters = self.link_counters();
         let link_rows: Vec<snap::LinkRow> = self
             .links()
             .map(|link| {
-                let stats = link.stats();
+                let stats = counters
+                    .get(&link.link_id())
+                    .copied()
+                    .unwrap_or_else(|| link.stats());
                 snap::LinkRow {
                     link_id: link.link_id().as_u64(),
                     transport_id: link.transport_id().as_u32(),
@@ -2986,6 +2990,18 @@ impl Node {
     /// Iterate over all links.
     pub fn links(&self) -> impl Iterator<Item = &Link> {
         self.links.values()
+    }
+
+    /// Traffic counters for each link bound to an active peer, keyed by link.
+    ///
+    /// The data plane counts a link's authenticated traffic on the peer that
+    /// owns it (`ActivePeer::link_stats_mut`), not on the `Link` record, so a
+    /// link still in handshake has no entry here.
+    pub(crate) fn link_counters(&self) -> HashMap<LinkId, &crate::transport::LinkStats> {
+        self.peers
+            .values()
+            .map(|p| (p.link_id(), p.link_stats()))
+            .collect()
     }
 
     // === Connection Management (Handshake Phase) ===
