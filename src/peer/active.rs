@@ -409,11 +409,12 @@ impl PeerPath {
         self.etx
     }
 
-    /// The path's quality index, `etx × (1 + min_rtt_ms / 100)`, lower is
-    /// better. `None` until an RTT has been measured.
+    /// The path's quality index, [`quality_index`](crate::proto::mmp::quality_index)
+    /// of its ETX and min RTT, lower is better. `None` until an RTT has been
+    /// measured.
     pub fn score(&self) -> Option<f64> {
         self.min_rtt_ms()
-            .map(|rtt| self.etx * (1.0 + rtt as f64 / 100.0))
+            .map(|rtt| crate::proto::mmp::quality_index(self.etx, rtt as f64))
     }
 
     /// Whether selection may pick this path: eligible, with enough samples,
@@ -1807,7 +1808,8 @@ impl ActivePeer {
     /// Link cost for routing decisions.
     ///
     /// Returns a scalar cost where lower is better (1.0 = ideal).
-    /// Computed as RTT-weighted ETX: `etx * (1.0 + srtt_ms / 100.0)`.
+    /// The [`quality_index`](crate::proto::mmp::quality_index) of the link's
+    /// ETX and smoothed RTT.
     ///
     /// Returns 1.0 (optimistic default) when MMP metrics are not yet
     /// available, matching depth-only parent selection behavior.
@@ -1830,7 +1832,7 @@ impl ActivePeer {
             Some(mmp) => {
                 let etx = mmp.metrics.smoothed_etx().unwrap_or(mmp.metrics.etx);
                 match mmp.metrics.srtt_ms() {
-                    Some(srtt_ms) => etx * (1.0 + srtt_ms / 100.0),
+                    Some(srtt_ms) => crate::proto::mmp::quality_index(etx, srtt_ms),
                     None => 1.0,
                 }
             }
