@@ -1,7 +1,7 @@
 # One peer, two paths: switchover without a second handshake
 #
 # The calibration scenario for `node.path.*`
-# (reference/fips-multi-path-switchover.md, "Calibration"). Two nodes joined
+# (docs/design/fips-multi-path-switchover.md, "Calibration"). Two nodes joined
 # twice: a raw-Ethernet veth (the cable) and the Docker bridge over UDP (the
 # wifi). The UDP half is dialled from static config, the Ethernet half is
 # found by beacon and added as a second path under the same session by the

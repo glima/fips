@@ -85,7 +85,7 @@ impl fmt::Display for ConnectivityState {
     }
 }
 
-/// Where a path is in its life. See `reference/fips-multi-path-switchover.md` §4, §7.
+/// Where a path is in its life. See `docs/design/fips-multi-path-switchover.md` §4, §7.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathState {
     /// Added, probe outstanding or never answered. Never eligible to carry
@@ -229,7 +229,7 @@ pub enum PathWithdrawal {
 /// path to a given peer, and an address roams *inside* a path. Everything
 /// that is per session (Noise slots, K-bit, indices, rekey state) stays on
 /// the peer; a path carries only what is bound to the medium it runs over.
-/// See `reference/fips-multi-path-switchover.md` §1–2.
+/// See `docs/design/fips-multi-path-switchover.md` §1–2.
 ///
 /// The first path is added at promotion, proven by the handshake. Further
 /// ones are added by the probe exchange under the existing session (§4).

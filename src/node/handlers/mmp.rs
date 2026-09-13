@@ -40,7 +40,7 @@ const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 /// Presence flaps on a cable (dock sleep, autoneg bounce) are what the
 /// binder's churn guard exists for; a path that came back inside this window
 /// is re-probed with its RTT intact rather than measured from nothing. See
-/// `reference/fips-multi-path-switchover.md` §6.
+/// `docs/design/fips-multi-path-switchover.md` §6.
 const DEAD_PATH_GRACE_MS: u64 = 5 * 60 * 1000;
 
 /// Decide whether a peer is due a heartbeat, from the two timestamps it keeps.

@@ -44,7 +44,7 @@ const DEFAULT_UDP_SEND_BUF: usize = 2 * 1024 * 1024;
 /// What a transport is *for*, as far as path selection is concerned.
 ///
 /// Not a rank. Selection between paths is measured, never configured
-/// (`reference/fips-multi-path-switchover.md` §8); this is the one
+/// (`docs/design/fips-multi-path-switchover.md` §8); this is the one
 /// statement an operator can make about a transport's purpose: a `backup`
 /// transport never carries a peer's traffic while any non-backup path to
 /// that peer is eligible. "Drop BLE when something better is stable."

@@ -1204,7 +1204,7 @@ impl BuffersConfig {
 /// from its own probes. These knobs bound *when* a measured difference is
 /// acted on. Their defaults are placeholders to calibrate against
 /// `testing/chaos`, not values to reason about
-/// (`reference/fips-multi-path-switchover.md`, "Calibration").
+/// (`docs/design/fips-multi-path-switchover.md`, "Calibration").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathConfig {
     /// Discretionary switch margin `K` (`node.path.switch_margin`): the

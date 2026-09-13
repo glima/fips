@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once a tick, a configured address whose transport came up later becomes
   a path too. `testing/chaos/scenarios/dual-udp-flap` is the all-IP
   calibration twin: two interface-bound UDP instances as two paths.
-  Design and calibration plan: `reference/fips-multi-path-switchover.md`.
+  Design and calibration plan: `docs/design/fips-multi-path-switchover.md`.
   Defaults are placeholders; the chaos scenarios that calibrate them are
   still to be written. `show_peers` lists every path under its peer
   (`paths[]`, the `path_show` fields minus the now-relative ages), and

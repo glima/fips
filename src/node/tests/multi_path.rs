@@ -1,5 +1,5 @@
 //! Index-only demux: the first step of the multi-path switchover design
-//! (`reference/fips-multi-path-switchover.md`, §3).
+//! (`docs/design/fips-multi-path-switchover.md`, §3).
 //!
 //! A session index is unique across transports, so a frame carrying a known
 //! `receiver_idx` decrypts no matter which transport delivered it. That opens

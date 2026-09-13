@@ -1,7 +1,7 @@
 //! Path probe / path ack: adding a second path to a peer under the session
 //! it already has.
 //!
-//! `reference/fips-multi-path-switchover.md` §4. A probe is an ordinary
+//! `docs/design/fips-multi-path-switchover.md` §4. A probe is an ordinary
 //! encrypted frame sent on a candidate transport. The receiver, having
 //! decrypted it against the session found by index, has proof the peer is
 //! reachable on that `(transport, addr)`: it adds the path as `Probing`,
@@ -461,7 +461,7 @@ impl Node {
     ///
     /// A switch is also an MTU change, and three things size traffic from
     /// the peer's transport without re-running on their own
-    /// (`reference/fips-multi-path-switchover.md` §5):
+    /// (`docs/design/fips-multi-path-switchover.md` §5):
     ///
     /// - the peer's `path_mtu_lookup` seed, which only ever tightens within
     ///   a link and would leave one cable→BLE excursion clamping every new
