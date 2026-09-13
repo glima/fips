@@ -37,7 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instance to one interface so two UDP instances can be two paths.
   Design and calibration plan: `reference/fips-multi-path-switchover.md`.
   Defaults are placeholders; the chaos scenarios that calibrate them are
-  still to be written.
+  still to be written. `show_peers` lists every path under its peer
+  (`paths[]`, the `path_show` fields minus the now-relative ages), and
+  `fipstop`'s Peers tab draws a peer with more than one path as a tree —
+  the peer row keeps the peer-level columns, one child row per path carries
+  transport, address, `active`/`live`/`probing`/`suspect`/`dead` with
+  `pinned` / `backup` markers, RTT and score, the active path in green — and
+  a Paths section in the detail pane. A single-path peer stays one line.
 
 - An authentic frame arriving on a transport the peer has no path on no
   longer re-pins the peer's send side to that transport, and a decrypt
