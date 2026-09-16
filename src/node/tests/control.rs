@@ -6,6 +6,7 @@
 //! socket framing.
 
 use super::*;
+use heartbeat::set_heartbeat_interval;
 use spanning_tree::{
     TestNode, add_loopback_alias, cleanup_nodes, drain_all_packets, make_test_node,
     process_available_packets, run_tree_test,
@@ -420,4 +421,111 @@ async fn show_links_reports_the_traffic_counters_of_the_peer_bound_to_each_link(
     );
 
     cleanup_nodes(&mut nodes).await;
+}
+
+/// Insert an authenticated peer last heard from at `last_seen_ms` and return
+/// its address.
+fn insert_peer_last_seen_at(node: &mut Node, link: u64, last_seen_ms: u64) -> NodeAddr {
+    let identity = PeerIdentity::from_pubkey_full(Identity::generate().pubkey_full());
+    let addr = *identity.node_addr();
+    node.peers.insert(
+        addr,
+        ActivePeer::new(identity, LinkId::new(link), last_seen_ms),
+    );
+    addr
+}
+
+/// The `connectivity` string a `show_peers` response gives the peer at `addr`.
+fn connectivity_of(peers: &serde_json::Value, addr: &NodeAddr) -> String {
+    let addr_hex = hex::encode(addr.as_bytes());
+    peers["peers"]
+        .as_array()
+        .expect("show_peers returns a peers array")
+        .iter()
+        .find(|row| row["node_addr"] == addr_hex.as_str())
+        .and_then(|row| row["connectivity"].as_str())
+        .expect("show_peers lists the peer with a connectivity string")
+        .to_string()
+}
+
+/// Render `show_peers` on the loop, then publish a tick and render it again
+/// from the snapshot the control socket serves.
+fn show_peers_both_renders(node: &mut Node) -> [(&'static str, serde_json::Value); 2] {
+    let on_loop = crate::control::queries::show_peers(node);
+    node.record_stats_history();
+    let off_loop = crate::control::queries::show_peers_from_handle(&node.control_read_handle());
+    [("on-loop", on_loop), ("snapshot", off_loop)]
+}
+
+/// `show_peers` reports a peer silent for longer than the heartbeat interval
+/// as `stale`, and a peer heard from just now as `connected`, on both the
+/// on-loop render and the tick-published snapshot render.
+#[test]
+fn show_peers_reports_a_peer_idle_past_the_heartbeat_interval_as_stale() {
+    let mut node = make_node();
+    let interval_ms = node.config().node.heartbeat_interval_secs * 1000;
+    assert_eq!(interval_ms, 10_000, "the default heartbeat interval");
+    let now = Node::now_ms();
+    let fresh = insert_peer_last_seen_at(&mut node, 1, now);
+    let idle = insert_peer_last_seen_at(&mut node, 2, now - interval_ms - 5_000);
+
+    for (render, peers) in show_peers_both_renders(&mut node) {
+        assert_eq!(
+            connectivity_of(&peers, &idle),
+            "stale",
+            "{render} render, peer silent for 15 s"
+        );
+        assert_eq!(
+            connectivity_of(&peers, &fresh),
+            "connected",
+            "{render} render, peer heard from just now"
+        );
+    }
+}
+
+/// The `stale` threshold is the configured heartbeat interval rather than a
+/// fixed ten seconds: with a 30 s interval a peer silent for 15 s still reads
+/// `connected`, and one silent for 35 s reads `stale`.
+#[test]
+fn show_peers_stale_threshold_follows_the_configured_heartbeat_interval() {
+    let mut node = make_node();
+    set_heartbeat_interval(&mut node, 30);
+    let now = Node::now_ms();
+    let quiet = insert_peer_last_seen_at(&mut node, 1, now - 15_000);
+    let idle = insert_peer_last_seen_at(&mut node, 2, now - 35_000);
+
+    for (render, peers) in show_peers_both_renders(&mut node) {
+        assert_eq!(
+            connectivity_of(&peers, &idle),
+            "stale",
+            "{render} render, peer silent for 35 s"
+        );
+        assert_eq!(
+            connectivity_of(&peers, &quiet),
+            "connected",
+            "{render} render, peer silent for 15 s"
+        );
+    }
+}
+
+/// The derived connectivity changes at the heartbeat interval exactly: a peer
+/// silent for the whole interval still reads `connected`, and one millisecond
+/// more reads `stale`. A zero interval is floored at one second, the floor the
+/// discovery re-dial gate applies.
+#[test]
+fn peer_connectivity_turns_stale_one_millisecond_past_the_heartbeat_interval() {
+    let mut node = make_node();
+    let seen = 1_000_000;
+    let addr = insert_peer_last_seen_at(&mut node, 1, seen);
+    let at = |node: &Node, now_ms: u64| {
+        let peer = node.get_peer(&addr).expect("the peer was inserted");
+        node.peer_connectivity(peer, now_ms)
+    };
+
+    assert_eq!(at(&node, seen + 10_000), ConnectivityState::Connected);
+    assert_eq!(at(&node, seen + 10_001), ConnectivityState::Stale);
+
+    set_heartbeat_interval(&mut node, 0);
+    assert_eq!(at(&node, seen + 1_000), ConnectivityState::Connected);
+    assert_eq!(at(&node, seen + 1_001), ConnectivityState::Stale);
 }

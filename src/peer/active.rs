@@ -35,38 +35,24 @@ fn draw_rekey_jitter() -> i64 {
     rand::rng().random_range(-REKEY_JITTER_SECS..=REKEY_JITTER_SECS)
 }
 
-/// Connectivity state for an active peer.
+/// Connectivity of an active peer, as the control socket reports it.
 ///
-/// This is simpler than the full PeerState since authentication is complete.
+/// Not stored on the peer: the node derives it from how long the peer has
+/// been silent, compared with the configured heartbeat interval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectivityState {
-    /// Peer is fully connected and responsive.
+    /// Heard from within the heartbeat interval.
     Connected,
-    /// Peer hasn't been heard from recently (potential timeout).
+    /// Silent for longer than the heartbeat interval.
     Stale,
-    /// Connection lost, attempting to reconnect.
-    Reconnecting,
-    /// Peer has been explicitly disconnected.
-    Disconnected,
 }
 
 impl ConnectivityState {
-    /// Check if the peer is usable for sending traffic.
-    pub fn can_send(&self) -> bool {
-        matches!(
-            self,
-            ConnectivityState::Connected | ConnectivityState::Stale
-        )
-    }
-
     /// Check if this is a terminal state requiring cleanup.
+    ///
+    /// Always false: neither derived state is terminal.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ConnectivityState::Disconnected)
-    }
-
-    /// Check if peer is fully healthy.
-    pub fn is_healthy(&self) -> bool {
-        matches!(self, ConnectivityState::Connected)
+        false
     }
 }
 
@@ -75,8 +61,6 @@ impl fmt::Display for ConnectivityState {
         let s = match self {
             ConnectivityState::Connected => "connected",
             ConnectivityState::Stale => "stale",
-            ConnectivityState::Reconnecting => "reconnecting",
-            ConnectivityState::Disconnected => "disconnected",
         };
         write!(f, "{}", s)
     }
@@ -225,10 +209,6 @@ pub struct ActivePeer {
     /// Immutable for the same reason as [`ActivePeer::npub`].
     short_npub: String,
 
-    // === Connection ===
-    /// Current connectivity state.
-    connectivity: ConnectivityState,
-
     // === Spanning Tree ===
     /// Their latest parent declaration.
     declaration: Option<ParentDeclaration>,
@@ -346,7 +326,6 @@ impl ActivePeer {
             npub: identity.npub(),
             short_npub: identity.short_npub(),
             identity,
-            connectivity: ConnectivityState::Connected,
             declaration: None,
             ancestry: None,
             tree_announce_min_interval_ms: 500,
@@ -441,7 +420,6 @@ impl ActivePeer {
             npub: identity.npub(),
             short_npub: identity.short_npub(),
             identity,
-            connectivity: ConnectivityState::Connected,
             declaration: None,
             ancestry: None,
             tree_announce_min_interval_ms: 500,
@@ -564,24 +542,12 @@ impl ActivePeer {
         self.send.link_id
     }
 
-    /// Get the connectivity state.
-    pub fn connectivity(&self) -> ConnectivityState {
-        self.connectivity
-    }
-
-    /// Check if peer can receive traffic.
-    pub fn can_send(&self) -> bool {
-        self.connectivity.can_send()
-    }
-
-    /// Check if peer is fully healthy.
-    pub fn is_healthy(&self) -> bool {
-        self.connectivity.is_healthy()
-    }
-
     /// Check if peer is disconnected.
+    ///
+    /// Always false: the peer stores no connectivity state, and a peer that
+    /// goes away is removed from the node rather than marked.
     pub fn is_disconnected(&self) -> bool {
-        self.connectivity.is_terminal()
+        false
     }
 
     // === Session Accessors ===
@@ -919,33 +885,6 @@ impl ActivePeer {
 
     /// Update last seen timestamp.
     pub fn touch(&mut self, current_time_ms: u64) {
-        self.send.last_seen = current_time_ms;
-        // If we were stale, receiving traffic makes us connected again
-        if self.connectivity == ConnectivityState::Stale {
-            self.connectivity = ConnectivityState::Connected;
-        }
-    }
-
-    /// Mark peer as stale (no recent traffic).
-    pub fn mark_stale(&mut self) {
-        if self.connectivity == ConnectivityState::Connected {
-            self.connectivity = ConnectivityState::Stale;
-        }
-    }
-
-    /// Mark peer as reconnecting.
-    pub fn mark_reconnecting(&mut self) {
-        self.connectivity = ConnectivityState::Reconnecting;
-    }
-
-    /// Mark peer as disconnected.
-    pub fn mark_disconnected(&mut self) {
-        self.connectivity = ConnectivityState::Disconnected;
-    }
-
-    /// Mark peer as connected (e.g., after successful reconnect).
-    pub fn mark_connected(&mut self, current_time_ms: u64) {
-        self.connectivity = ConnectivityState::Connected;
         self.send.last_seen = current_time_ms;
     }
 
@@ -1633,16 +1572,8 @@ mod tests {
 
     #[test]
     fn test_connectivity_state_properties() {
-        assert!(ConnectivityState::Connected.can_send());
-        assert!(ConnectivityState::Stale.can_send());
-        assert!(!ConnectivityState::Reconnecting.can_send());
-        assert!(!ConnectivityState::Disconnected.can_send());
-
-        assert!(ConnectivityState::Connected.is_healthy());
-        assert!(!ConnectivityState::Stale.is_healthy());
-
-        assert!(ConnectivityState::Disconnected.is_terminal());
         assert!(!ConnectivityState::Connected.is_terminal());
+        assert!(!ConnectivityState::Stale.is_terminal());
     }
 
     #[test]
@@ -1652,8 +1583,7 @@ mod tests {
 
         assert_eq!(peer.identity().node_addr(), identity.node_addr());
         assert_eq!(peer.link_id(), LinkId::new(1));
-        assert!(peer.is_healthy());
-        assert!(peer.can_send());
+        assert!(!peer.is_disconnected());
         assert_eq!(peer.authenticated_at(), 1000);
         assert!(peer.needs_filter_update()); // New peers need filter
     }
@@ -1712,32 +1642,6 @@ mod tests {
         let short_first = peer.short_npub().as_ptr();
         let short_second = peer.short_npub().as_ptr();
         assert_eq!(short_first, short_second);
-    }
-
-    #[test]
-    fn test_connectivity_transitions() {
-        let identity = make_peer_identity();
-        let mut peer = ActivePeer::new(identity, LinkId::new(1), 1000);
-
-        assert!(peer.is_healthy());
-
-        peer.mark_stale();
-        assert_eq!(peer.connectivity(), ConnectivityState::Stale);
-        assert!(peer.can_send()); // Stale can still send
-
-        // Traffic received brings back to connected
-        peer.touch(2000);
-        assert!(peer.is_healthy());
-
-        peer.mark_reconnecting();
-        assert!(!peer.can_send());
-
-        peer.mark_connected(3000);
-        assert!(peer.is_healthy());
-
-        peer.mark_disconnected();
-        assert!(peer.is_disconnected());
-        assert!(!peer.can_send());
     }
 
     #[test]

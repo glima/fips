@@ -48,8 +48,6 @@ pub(crate) trait RoutingView {
     /// Does `peer`'s bloom filter indicate it may reach `dest`? The raw
     /// per-peer predicate the core filters candidates on.
     fn peer_may_reach<'a>(&'a self, peer: Self::Peer<'a>, dest: &NodeAddr) -> bool;
-    /// Can `peer`'s session currently carry a forward?
-    fn peer_can_send<'a>(&'a self, peer: Self::Peer<'a>) -> bool;
     /// `peer`'s outgoing link cost (lower is preferred).
     fn peer_link_cost<'a>(&'a self, peer: Self::Peer<'a>) -> f64;
     /// `peer`'s tree coordinates, if known.
@@ -333,15 +331,15 @@ impl RouteClass {
 
 /// Select the best next hop from the active peers that may reach `dest`.
 ///
-/// Enumerates borrowed peers through [`RoutingView`], applies the bloom and
-/// send-eligibility filters, and tracks the best hop inline without allocating
-/// candidate vectors or cloning coordinates. Only peers strictly closer to the
-/// destination than we are (`my_coords`) are eligible — the self-distance check
-/// that prevents routing loops.
+/// Enumerates borrowed peers through [`RoutingView`], applies the bloom filter,
+/// and tracks the best hop inline without allocating candidate vectors or
+/// cloning coordinates. Only peers strictly closer to the destination than we
+/// are (`my_coords`) are eligible — the self-distance check that prevents
+/// routing loops.
 ///
 /// Ordering: `(link_cost, distance_to_dest, node_addr)`. Returns the winning
-/// peer's address, or `None` when no candidate is send-ready and strictly
-/// closer to the destination than us.
+/// peer's address, or `None` when no candidate is strictly closer to the
+/// destination than us.
 pub(crate) fn select_best_candidate(
     rv: &impl RoutingView,
     dest: &NodeAddr,
@@ -353,7 +351,7 @@ pub(crate) fn select_best_candidate(
     let mut best: Option<(NodeAddr, f64, usize)> = None;
 
     rv.for_each_peer(|peer| {
-        if !rv.peer_may_reach(peer, dest) || !rv.peer_is_full(peer) || !rv.peer_can_send(peer) {
+        if !rv.peer_may_reach(peer, dest) || !rv.peer_is_full(peer) {
             return;
         }
 

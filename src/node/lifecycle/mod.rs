@@ -2725,7 +2725,7 @@ impl Node {
         let peer_addrs: Vec<NodeAddr> = self
             .peers
             .iter()
-            .filter(|(_, peer)| peer.can_send() && peer.has_session())
+            .filter(|(_, peer)| peer.has_session())
             .map(|(addr, _)| *addr)
             .collect();
 
@@ -3541,13 +3541,7 @@ impl Node {
         let Some(peer) = self.peers.get(peer_node_addr) else {
             return false;
         };
-        let stale_after_ms = self
-            .config()
-            .node
-            .heartbeat_interval_secs
-            .saturating_mul(1000)
-            .max(1000);
-        peer.idle_time(Self::now_ms()) > stale_after_ms
+        self.peer_link_is_stale(peer, Self::now_ms())
     }
 
     pub(in crate::node) fn active_peer_matches_candidate(

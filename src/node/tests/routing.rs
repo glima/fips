@@ -1698,42 +1698,6 @@ fn test_seam_bloom_hit_overrides_tree_tiebreak() {
     );
 }
 
-/// `NodeRoutingView::peer_can_send` keeps a down link out of the candidate set.
-///
-/// Both peers hold a bloom hit, so the address tie-break would hand the route
-/// to the low-address peer; that peer is the one marked reconnecting. Widening
-/// `peer_can_send` to `true` lets it back in and hands a down link to the
-/// forwarder.
-#[test]
-fn test_seam_unsendable_bloom_candidate_is_skipped() {
-    let mut node = make_node();
-    let (near, far, dest) = seam_two_equidistant_peers(&mut node);
-    let low = near.min(far);
-    let high = near.max(far);
-
-    seam_set_filter(&mut node, &low, &dest);
-    seam_set_filter(&mut node, &high, &dest);
-    node.get_peer_mut(&low).unwrap().mark_reconnecting();
-
-    assert_eq!(node.peers.len(), 2, "fixture: two peers");
-    assert!(
-        !node.get_peer(&low).unwrap().can_send(),
-        "fixture: low is down"
-    );
-    assert!(
-        node.get_peer(&high).unwrap().can_send(),
-        "fixture: high is up"
-    );
-
-    let hop = node.find_next_hop(&dest).expect("route exists");
-    assert!(hop.can_send(), "a down link must never be returned");
-    assert_eq!(
-        hop.node_addr(),
-        &high,
-        "the sendable peer must win despite losing the address tie-break"
-    );
-}
-
 /// `NodeRoutingView::peer_link_cost` must carry the ETX factor.
 ///
 /// SRTT is equal on both peers, so ETX is the only thing that can order them,
@@ -1847,12 +1811,11 @@ fn test_seam_peer_without_tree_coords_is_never_selected() {
     let (near, far, dest) = seam_two_equidistant_peers(&mut node);
     let tree_pick = near.min(far);
 
-    // A third peer: in the peer map, sendable, holding a bloom hit for dest,
+    // A third peer: in the peer map, holding a bloom hit for dest,
     // and absent from tree state.
     let ghost = seam_add_peer(&mut node, 3, TransportId::new(1));
     seam_set_filter(&mut node, &ghost, &dest);
 
-    assert!(node.get_peer(&ghost).unwrap().can_send());
     assert!(node.get_peer(&ghost).unwrap().may_reach(&dest));
     assert!(
         node.tree_state().peer_coords(&ghost).is_none(),
@@ -1897,7 +1860,6 @@ fn test_seam_routing_view_reads_match_live_peer_state() {
     // Make the two peers differ on every predicate, in opposite directions, so
     // no constant in either direction can satisfy the assertions below.
     seam_set_filter(&mut node, &near, &dest);
-    node.get_peer_mut(&far).unwrap().mark_reconnecting();
     // Both cost factors off the multiplicative identity: with etx pinned at 1.0
     // a cost that reads only the latency half is indistinguishable from the
     // real one, and this assertion would be blind to it.
@@ -1949,10 +1911,6 @@ fn test_seam_routing_view_reads_match_live_peer_state() {
         "the filter is per-destination"
     );
 
-    // peer_can_send: far was marked reconnecting.
-    assert!(view.peer_can_send(near_h));
-    assert!(!view.peer_can_send(far_h));
-
     // peer_link_cost: etx 2.0 * (1.0 + 50ms/100) for near; far has no RTT
     // sample, so it takes the optimistic 1.0 default. Neither factor is at the
     // identity, so a cost reading only one half of the product is caught.
@@ -1993,7 +1951,6 @@ fn test_seam_routing_view_reads_match_live_peer_state() {
         let addr = view.peer_addr(*peer);
         let live = node.peers.get(&addr).unwrap();
         assert_eq!(view.peer_may_reach(*peer, &dest), live.may_reach(&dest));
-        assert_eq!(view.peer_can_send(*peer), live.can_send());
         assert_eq!(view.peer_link_cost(*peer), live.link_cost());
         assert_eq!(
             view.peer_coords(*peer),

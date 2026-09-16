@@ -418,3 +418,132 @@ async fn test_adopted_udp_inherits_mtu_from_named_primary_config() {
         transport.stop().await.ok();
     }
 }
+
+/// A peer reached through an adopted traversal socket gets a per-peer
+/// connected UDP socket on that socket's own port, as a peer on a configured
+/// listener does. The traversal socket comes from a plain bind with no reuse
+/// flags, and the kernel refuses the connected socket's bind to a port whose
+/// holder did not opt in to sharing it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_connected_udp_activates_on_an_adopted_traversal_transport_and_on_a_configured_one() {
+    let mut node_a = make_node();
+    let mut node_b = make_node();
+
+    let transport_id_b = TransportId::new(1);
+    let udp_config = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        mtu: Some(1280),
+        ..Default::default()
+    };
+
+    let (packet_tx_a, packet_rx_a) = packet_channel(64);
+    let (packet_tx_b, packet_rx_b) = packet_channel(64);
+
+    node_a.supervisor.packet_tx = Some(packet_tx_a.clone());
+    node_a.packet_rx = Some(packet_rx_a);
+    node_a.supervisor.state = NodeState::Running;
+
+    let mut transport_b = UdpTransport::new(transport_id_b, None, udp_config, packet_tx_b.clone());
+    transport_b.start_async().await.unwrap();
+
+    let addr_b = transport_b.local_addr().unwrap();
+    node_b.supervisor.packet_tx = Some(packet_tx_b.clone());
+    node_b.packet_rx = Some(packet_rx_b);
+    node_b.supervisor.state = NodeState::Running;
+    node_b
+        .transports
+        .insert(transport_id_b, TransportHandle::Udp(transport_b));
+
+    let adopted_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let handoff =
+        EstablishedTraversal::new("sess-connected", node_b.npub(), addr_b, adopted_socket)
+            .with_transport_name("nostr-punched");
+
+    let result = node_a.adopt_established_traversal(handoff).await.unwrap();
+
+    // XX three-way handshake, driven directly: node_a sent msg1 on adoption,
+    // node_b answers with msg2, node_a sends msg3, and node_b promotes node_a
+    // only once it has processed msg3.
+    let mut rx_a = node_a.packet_rx.take().expect("node_a packet_rx");
+    let mut rx_b = node_b.packet_rx.take().expect("node_b packet_rx");
+
+    let pkt_at_b = timeout(Duration::from_secs(1), rx_b.recv())
+        .await
+        .expect("timeout waiting for node_a -> node_b msg1")
+        .expect("node_b channel closed");
+    assert_eq!(pkt_at_b.data[0] & 0x0f, PHASE_MSG1);
+    node_b.handle_msg1(pkt_at_b).await;
+
+    let pkt_at_a = timeout(Duration::from_secs(1), rx_a.recv())
+        .await
+        .expect("timeout waiting for node_b -> node_a msg2")
+        .expect("node_a channel closed");
+    assert_eq!(pkt_at_a.data[0] & 0x0f, PHASE_MSG2);
+    node_a.handle_msg2(pkt_at_a).await;
+
+    let pkt_at_b = timeout(Duration::from_secs(1), rx_b.recv())
+        .await
+        .expect("timeout waiting for node_a -> node_b msg3")
+        .expect("node_b channel closed");
+    assert_eq!(pkt_at_b.data[0] & 0x0f, PHASE_MSG3);
+    node_b.handle_msg3(pkt_at_b).await;
+
+    let peer_a_node_addr =
+        *PeerIdentity::from_pubkey_full(node_a.identity().pubkey_full()).node_addr();
+    let peer_b_node_addr =
+        *PeerIdentity::from_pubkey_full(node_b.identity().pubkey_full()).node_addr();
+
+    // Preconditions: both sides are peered, and node_a reaches node_b over
+    // the adopted transport rather than some other one.
+    assert_eq!(node_a.peer_count(), 1, "node_a should promote node_b");
+    assert_eq!(node_b.peer_count(), 1, "node_b should promote node_a");
+    assert!(node_b.get_peer(&peer_a_node_addr).unwrap().has_session());
+    let peer_on_a = node_a.get_peer(&peer_b_node_addr).unwrap();
+    assert!(peer_on_a.has_session());
+    assert_eq!(
+        peer_on_a.transport_id(),
+        Some(result.transport_id),
+        "node_a's peer must be on the adopted transport",
+    );
+    assert!(peer_on_a.current_addr().is_some());
+
+    node_b.activate_connected_udp_sessions().await;
+    node_a.activate_connected_udp_sessions().await;
+
+    assert!(
+        node_b
+            .get_peer(&peer_a_node_addr)
+            .unwrap()
+            .connected_udp()
+            .is_some(),
+        "node_b's peer on its configured listener must get a connected UDP socket; \
+         if it does not, check whether FIPS_CONNECTED_UDP turns the fast path off here",
+    );
+
+    let Some(connected) = node_a.get_peer(&peer_b_node_addr).unwrap().connected_udp() else {
+        let direct =
+            match crate::transport::udp::open_connected_fd(result.local_addr, addr_b, 65536, 65536)
+            {
+                Ok(_) => "succeeds".to_string(),
+                Err(e) => format!("fails with {e}"),
+            };
+        panic!(
+            "node_a's peer on the adopted transport must get a connected UDP socket; \
+             opening one on the adopted socket's address directly {direct}"
+        );
+    };
+    assert_eq!(
+        connected.local_addr(),
+        result.local_addr,
+        "the connected socket must join the adopted socket's port, not another transport's",
+    );
+    drop(connected);
+
+    for (_, transport) in node_a.transports.iter_mut() {
+        transport.stop().await.ok();
+    }
+    for (_, transport) in node_b.transports.iter_mut() {
+        transport.stop().await.ok();
+    }
+}

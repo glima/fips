@@ -250,6 +250,7 @@ pub fn show_peers(node: &Node) -> Value {
     // start (no peer has SRTT) every peer uses the default link cost of 1.0.
     let any_peer_has_srtt = node.peers().any(|p| p.has_srtt());
 
+    let now = now_ms();
     let peers: Vec<Value> = node
         .peers()
         .map(|peer| {
@@ -267,7 +268,7 @@ pub fn show_peers(node: &Node) -> Value {
                 "npub": peer.npub(),
                 "display_name": node.peer_display_name(&node_addr),
                 "ipv6_addr": format!("{}", peer.address()),
-                "connectivity": format!("{}", peer.connectivity()),
+                "connectivity": format!("{}", node.peer_connectivity(peer, now)),
                 "link_id": peer.link_id().as_u64(),
                 "authenticated_at_ms": peer.authenticated_at(),
                 "last_seen_ms": peer.last_seen(),

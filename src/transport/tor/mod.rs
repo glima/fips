@@ -34,6 +34,7 @@ use crate::transport::socks5::{
     Socks5Auth, Socks5Dialer, SocksTarget, poll_connecting, proxied_receive_loop,
     proxied_send_loop,
 };
+use crate::transport::stream::{ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id};
 use crate::transport::tcp::INBOUND_FIRST_FRAME_TIMEOUT;
 use control::{ControlAuth, TorControlClient, TorMonitoringInfo};
 use stats::TorStats;
@@ -756,12 +757,14 @@ impl TorTransport {
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
         let mtu = self.config.mtu();
+        let id = next_conn_id();
 
         let recv_task = tokio::spawn(async move {
             tor_receive_loop(
                 read_half,
                 transport_id,
                 remote_addr.clone(),
+                id,
                 packet_tx,
                 pool,
                 mtu,
@@ -781,6 +784,7 @@ impl TorTransport {
             send_rx,
             transport_id,
             addr.clone(),
+            id,
             self.pool.clone(),
             self.stats.clone(),
             "Tor",
@@ -797,6 +801,7 @@ impl TorTransport {
             mtu,
             established_at: Instant::now(),
             meta: Direction::Outbound,
+            id,
         };
 
         let mut pool = self.pool.lock().await;
@@ -940,12 +945,14 @@ impl TorTransport {
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
+        let id = next_conn_id();
 
         let recv_task = tokio::spawn(async move {
             tor_receive_loop(
                 read_half,
                 transport_id,
                 remote_addr.clone(),
+                id,
                 packet_tx,
                 pool,
                 mtu,
@@ -965,6 +972,7 @@ impl TorTransport {
             send_rx,
             transport_id,
             addr.clone(),
+            id,
             self.pool.clone(),
             self.stats.clone(),
             "Tor",
@@ -981,6 +989,7 @@ impl TorTransport {
             mtu,
             established_at: Instant::now(),
             meta: Direction::Outbound,
+            id,
         };
 
         // Use try_lock since we're in a sync context and the pool
@@ -1007,12 +1016,24 @@ impl TorTransport {
     }
 
     /// Close a specific connection asynchronously.
+    ///
+    /// Aborts the receive task and lets the writer finish the frames already
+    /// queued, within [`WRITER_DRAIN_TIMEOUT`], without waiting for it. This
+    /// mirrors `TcpTransport::close_connection_async`.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            conn.recv_task.abort();
-            conn.send_task.abort();
-            match conn.meta {
+            let ProxiedConnection {
+                send_tx,
+                send_task,
+                recv_task,
+                meta,
+                ..
+            } = conn;
+            drop(send_tx);
+            recv_task.abort();
+            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
+            match meta {
                 Direction::Inbound => self.stats.record_pool_inbound_removed(),
                 Direction::Outbound => self.stats.record_pool_outbound_removed(),
             }
@@ -1096,6 +1117,7 @@ async fn tor_receive_loop(
     reader: tokio::net::tcp::OwnedReadHalf,
     transport_id: TransportId,
     remote_addr: TransportAddr,
+    id: ConnId,
     packet_tx: PacketTx,
     pool: ProxiedPool<Direction>,
     mtu: u16,
@@ -1108,6 +1130,7 @@ async fn tor_receive_loop(
         reader,
         transport_id,
         remote_addr.clone(),
+        id,
         packet_tx,
         pool,
         mtu,
@@ -1236,12 +1259,14 @@ async fn tor_accept_loop(
         // nothing and leave an orphaned entry with a permanently incremented
         // inbound counter.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let id = next_conn_id();
 
         let recv_task = tokio::spawn(async move {
             tor_receive_loop(
                 read_half,
                 transport_id,
                 recv_addr,
+                id,
                 recv_tx,
                 recv_pool,
                 mtu,
@@ -1259,6 +1284,7 @@ async fn tor_accept_loop(
             send_rx,
             transport_id,
             remote_addr.clone(),
+            id,
             pool.clone(),
             stats.clone(),
             "Tor",
@@ -1275,6 +1301,7 @@ async fn tor_accept_loop(
             mtu,
             established_at: Instant::now(),
             meta: Direction::Inbound,
+            id,
         };
 
         let evicted = {
@@ -1289,6 +1316,7 @@ async fn tor_accept_loop(
             // just inserted and decrement for it, leaking one slot and
             // orphaning a live connection.
             old.recv_task.abort();
+            old.send_task.abort();
             match old.meta {
                 Direction::Inbound => stats.record_pool_inbound_removed(),
                 Direction::Outbound => stats.record_pool_outbound_removed(),
@@ -2153,6 +2181,7 @@ mod tests {
 
         let pool: ProxiedPool<Direction> = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(TorStats::new());
+        let id = next_conn_id();
         pool.lock().await.insert(
             remote.clone(),
             ProxiedConnection {
@@ -2162,6 +2191,7 @@ mod tests {
                 mtu: 1400,
                 established_at: Instant::now(),
                 meta: Direction::Inbound,
+                id,
             },
         );
         stats.record_pool_inbound_added();
@@ -2174,6 +2204,7 @@ mod tests {
             read_half,
             TransportId::new(1),
             remote.clone(),
+            id,
             tx,
             pool.clone(),
             1400,
@@ -2223,11 +2254,13 @@ mod tests {
         let recv_pool = pool.clone();
         let recv_stats = stats.clone();
         let recv_addr = remote.clone();
+        let id = next_conn_id();
         let mut handle = tokio::spawn(async move {
             tor_receive_loop(
                 read_half,
                 TransportId::new(1),
                 recv_addr,
+                id,
                 tx,
                 recv_pool,
                 1400,
@@ -2256,6 +2289,7 @@ mod tests {
                 mtu: 1400,
                 established_at: Instant::now(),
                 meta: Direction::Inbound,
+                id,
             },
         );
         stats.record_pool_inbound_added();
@@ -2313,6 +2347,7 @@ mod tests {
                 mtu: 1400,
                 established_at: Instant::now(),
                 meta: Direction::Inbound,
+                id: next_conn_id(),
             },
         );
         stats.record_pool_inbound_added();
@@ -2348,5 +2383,249 @@ mod tests {
 
         accept.abort();
         drop(sock);
+    }
+
+    // ========================================================================
+    // Connection identity and failure teardown
+    // ========================================================================
+
+    /// A connection displaced from the pool by a newer one at the same address
+    /// must not remove the newer one when its own receive loop ends.
+    ///
+    /// Both are built by `promote_connection`, and the MTU marks which entry
+    /// is pooled. The last step checks the newer connection still removes its
+    /// own entry.
+    #[tokio::test]
+    async fn tor_displaced_connection_cannot_remove_its_successor() {
+        let (tx, _rx) = packet_channel(32);
+        let tor = TorTransport::new(TransportId::new(1), None, make_config(), tx);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let remote = TransportAddr::from_string(&listen.to_string());
+
+        let a = TcpStream::connect(listen).await.unwrap();
+        let (sa, _) = listener.accept().await.unwrap();
+        let b = TcpStream::connect(listen).await.unwrap();
+        let (sb, _) = listener.accept().await.unwrap();
+
+        tor.promote_connection(&remote, a, 1400);
+        tor.promote_connection(&remote, b, 1300);
+        {
+            let pool = tor.pool.lock().await;
+            assert_eq!(pool.len(), 1);
+            assert_eq!(pool.get(&remote).map(|c| c.mtu), Some(1300));
+        }
+
+        drop(sa);
+        assert!(
+            wait_until(
+                || tor.stats().snapshot().recv_errors == 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the displaced connection's receive loop should have read EOF"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            tor.pool.lock().await.get(&remote).map(|c| c.mtu),
+            Some(1300),
+            "the displaced connection's teardown removed its successor"
+        );
+
+        drop(sb);
+        assert!(
+            wait_until(
+                || tor.stats().snapshot().recv_errors == 2,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the newer connection's receive loop should have read EOF"
+        );
+        assert!(
+            wait_until(
+                || tor.pool.try_lock().map(|p| p.is_empty()).unwrap_or(false),
+                Duration::from_secs(2)
+            )
+            .await,
+            "the newer connection's teardown should remove its own entry"
+        );
+    }
+
+    /// A connection admitted by the onion accept loop removes its own entry and
+    /// releases its inbound slot when its receive loop ends.
+    #[tokio::test]
+    async fn onion_accept_teardown_removes_its_own_entry() {
+        use socket2::{Domain, Socket, Type};
+
+        let (tx, mut rx) = packet_channel(10);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let client_addr = sock.local_addr().unwrap().as_socket().unwrap();
+        let remote = TransportAddr::from_string(&client_addr.to_string());
+
+        let (pool, stats, accept) = spawn_onion_accept_loop(listener, tx, Duration::from_secs(5));
+
+        sock.connect(&listen.into()).unwrap();
+        let std_stream: std::net::TcpStream = sock.into();
+        std_stream.set_nonblocking(true).unwrap();
+        let mut client = TcpStream::from_std(std_stream).unwrap();
+        client.write_all(&build_msg1_frame()).await.unwrap();
+
+        let packet = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the frame")
+            .expect("packet channel closed");
+        assert_eq!(packet.remote_addr, remote);
+        assert!(pool.lock().await.contains_key(&remote));
+        assert_eq!(stats.pool_inbound_count(), 1);
+
+        drop(client);
+        assert!(
+            wait_until(|| stats.pool_inbound_count() == 0, Duration::from_secs(2)).await,
+            "the receive loop should release the inbound slot"
+        );
+        assert!(
+            !pool.lock().await.contains_key(&remote),
+            "the receive loop should remove its own entry"
+        );
+
+        accept.abort();
+    }
+
+    /// When the onion accept loop evicts an entry at a colliding address, it
+    /// must stop that entry's writer as well as its receive task.
+    ///
+    /// The stale writer holds a oneshot sender and never finishes, so the
+    /// sender is dropped only if the task is aborted: dropping its handle
+    /// alone leaves it running.
+    #[tokio::test]
+    async fn evicting_a_colliding_onion_entry_stops_its_writer() {
+        use socket2::{Domain, Socket, Type};
+
+        let (tx, _rx) = packet_channel(10);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+
+        let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        sock.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+            .unwrap();
+        let client_addr = sock.local_addr().unwrap().as_socket().unwrap();
+        let remote = TransportAddr::from_string(&client_addr.to_string());
+
+        let pool: ProxiedPool<Direction> = Arc::new(Mutex::new(HashMap::new()));
+        let stats = Arc::new(TorStats::new());
+        let (guard_tx, guard_rx) = tokio::sync::oneshot::channel::<()>();
+        pool.lock().await.insert(
+            remote.clone(),
+            ProxiedConnection {
+                send_tx: tokio::sync::mpsc::channel(1).0,
+                send_task: tokio::spawn(async move {
+                    let _guard = guard_tx;
+                    std::future::pending::<()>().await
+                }),
+                recv_task: tokio::spawn(std::future::pending::<()>()),
+                mtu: 1400,
+                established_at: Instant::now(),
+                meta: Direction::Inbound,
+                id: next_conn_id(),
+            },
+        );
+        stats.record_pool_inbound_added();
+
+        let accept = tokio::spawn(tor_accept_loop(
+            listener,
+            TransportId::new(1),
+            tx,
+            pool.clone(),
+            1400,
+            64,
+            Duration::from_secs(5),
+            stats.clone(),
+        ));
+
+        sock.connect(&listen.into()).unwrap();
+        assert!(
+            wait_until(
+                || stats.snapshot().connections_accepted == 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the colliding connection should have been accepted"
+        );
+
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), guard_rx).await,
+                Ok(Err(_))
+            ),
+            "the evicted entry's writer was left running"
+        );
+
+        accept.abort();
+        drop(sock);
+    }
+
+    // ========================================================================
+    // Deliberate close finishes the frames already queued
+    // ========================================================================
+
+    /// A frame queued immediately before a deliberate close must still reach
+    /// the peer through the proxy, and the close must still end the
+    /// connection at the far side.
+    #[tokio::test]
+    async fn tor_frame_queued_just_before_close_still_reaches_the_peer() {
+        let (dest_tx, mut dest_rx) = packet_channel(32);
+        let dest_config = TcpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        };
+        let mut dest = TcpTransport::new(TransportId::new(100), None, dest_config, dest_tx);
+        dest.start_async().await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+
+        let mock = MockSocks5Server::new(dest_addr).await.unwrap();
+        let proxy_addr = mock.addr();
+        let _proxy_handle = mock.spawn();
+
+        let (tor_tx, _tor_rx) = packet_channel(32);
+        let tor_config = TorConfig {
+            socks5_addr: Some(proxy_addr.to_string()),
+            ..Default::default()
+        };
+        let mut tor = TorTransport::new(TransportId::new(200), None, tor_config, tor_tx);
+        tor.start_async().await.unwrap();
+
+        let target = TransportAddr::from_string(&dest_addr.to_string());
+        let frame = build_msg1_frame();
+        tor.send_async(&target, &frame).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), dest_rx.recv())
+            .await
+            .expect("timeout waiting for the first frame")
+            .expect("channel closed");
+        assert_eq!(first.data, frame);
+
+        tor.send_async(&target, &frame).await.unwrap();
+        tor.close_connection_async(&target).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(2), dest_rx.recv())
+            .await
+            .expect("a frame queued just before close was never written")
+            .expect("channel closed");
+        assert_eq!(second.data, frame);
+        assert!(
+            wait_until(
+                || dest.stats().snapshot().pool_inbound == 0,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the close must still end the connection once the queue is written"
+        );
+
+        tor.stop_async().await.unwrap();
+        dest.stop_async().await.unwrap();
     }
 }

@@ -546,7 +546,7 @@ fn establish_same_link_fresh_is_duplicate() {
     }
 }
 
-/// Aged, healthy, same-epoch session with no dual-init in flight -> rekey
+/// Aged, same-epoch session with no dual-init in flight -> rekey
 /// responder, no prior abandon.
 ///
 /// The snapshot carries no local rekey-trigger config, and deliberately: the
@@ -720,13 +720,28 @@ fn establish_undeclared_during_our_rekey_still_cross_connects() {
     }
 }
 
-/// An unhealthy or session-less aged peer is not a rekey candidate -> duplicate.
+/// A declared rekey naming keys we do not hold, on the link the peer already
+/// uses, is not a rekey -> duplicate.
 #[test]
-fn establish_aged_unhealthy_is_duplicate() {
+fn establish_mismatched_claim_on_the_same_link_is_duplicate() {
+    let fmp = Fmp::new();
+    let mut snap = establish_snapshot(0x05);
+    snap.rekey_claim = RekeyClaim::Mismatch;
+    let wire = wire_outcome(0x02, SAME_EPOCH);
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::ResendMsg2 { .. }
+    ));
+}
+
+/// A declared rekey naming our session, when we hold no session keys for the
+/// peer, is not a rekey -> duplicate.
+#[test]
+fn establish_matching_claim_without_a_session_is_duplicate() {
     let fmp = Fmp::new();
     let mut snap = establish_snapshot(0x05);
     snap.rekey_claim = RekeyClaim::Matches;
-    snap.is_healthy = false;
+    snap.has_session = false;
     let wire = wire_outcome(0x02, SAME_EPOCH);
     assert!(matches!(
         fmp.establish_inbound(&snap, &wire),

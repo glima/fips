@@ -28,14 +28,12 @@ fn mock_peer(
     addr: u8,
     dest: NodeAddr,
     may_reach: bool,
-    can_send: bool,
     link_cost: f64,
     coords: Option<&[u8]>,
 ) -> MockPeer {
     MockPeer {
         addr: make_node_addr(addr),
         reach: may_reach.then_some(dest).into_iter().collect(),
-        can_send,
         link_cost,
         coords: coords.map(make_coords),
         is_full: true,
@@ -48,7 +46,7 @@ fn mock_peer(
 fn mock_non_full_peer(addr: u8, dest: NodeAddr, link_cost: f64, coords: Option<&[u8]>) -> MockPeer {
     MockPeer {
         is_full: false,
-        ..mock_peer(addr, dest, true, true, link_cost, coords)
+        ..mock_peer(addr, dest, true, link_cost, coords)
     }
 }
 
@@ -295,8 +293,8 @@ fn candidate_selection_is_independent_of_peer_enumeration_order() {
     let root = 0x00;
     let my_coords = make_coords(&[0x10, root]);
     let dest_coords = make_coords(&[0x50, root]);
-    let lower_addr = mock_peer(0x20, dest, true, true, 1.0, Some(&[root]));
-    let higher_addr = mock_peer(0x30, dest, true, true, 1.0, Some(&[root]));
+    let lower_addr = mock_peer(0x20, dest, true, 1.0, Some(&[root]));
+    let higher_addr = mock_peer(0x30, dest, true, 1.0, Some(&[root]));
 
     let forward = MockRoutingView {
         peers: vec![lower_addr.clone(), higher_addr.clone()],
@@ -318,7 +316,7 @@ fn candidate_selection_is_independent_of_peer_enumeration_order() {
 }
 
 #[test]
-fn candidate_selection_filters_bloom_unsendable_and_missing_coords() {
+fn candidate_selection_filters_bloom_and_missing_coords() {
     let dest = make_node_addr(0x50);
     let root = 0x00;
     let my_coords = make_coords(&[0x10, root]);
@@ -326,10 +324,9 @@ fn candidate_selection_filters_bloom_unsendable_and_missing_coords() {
     let eligible = make_node_addr(0x60);
     let rv = MockRoutingView {
         peers: vec![
-            mock_peer(0x01, dest, true, false, 0.0, Some(&[0x50, root])),
-            mock_peer(0x02, dest, true, true, 0.0, None),
-            mock_peer(0x03, dest, false, true, 0.0, Some(&[0x50, root])),
-            mock_peer(0x60, dest, true, true, 10.0, Some(&[root])),
+            mock_peer(0x02, dest, true, 0.0, None),
+            mock_peer(0x03, dest, false, 0.0, Some(&[0x50, root])),
+            mock_peer(0x60, dest, true, 10.0, Some(&[root])),
         ],
         ..MockRoutingView::new(false)
     };
@@ -349,9 +346,9 @@ fn candidate_must_be_strictly_closer_than_self() {
     let rv = MockRoutingView {
         peers: vec![
             // A sibling is exactly as far from dest as this node.
-            mock_peer(0x20, dest, true, true, 1.0, Some(&[0x20, root])),
+            mock_peer(0x20, dest, true, 1.0, Some(&[0x20, root])),
             // This descendant of a sibling is farther from dest.
-            mock_peer(0x21, dest, true, true, 0.5, Some(&[0x21, 0x20, root])),
+            mock_peer(0x21, dest, true, 0.5, Some(&[0x21, 0x20, root])),
         ],
         ..MockRoutingView::new(false)
     };
@@ -368,12 +365,12 @@ fn candidate_ordering_is_cost_then_distance_then_address() {
     let rv = MockRoutingView {
         peers: vec![
             // Lowest address loses because distance precedes address.
-            mock_peer(0x01, dest, true, true, 1.0, Some(&[root])),
+            mock_peer(0x01, dest, true, 1.0, Some(&[root])),
             // Closest peer loses because cost is the primary key.
-            mock_peer(0x02, dest, true, true, 1.0, Some(&[0x50, root])),
-            mock_peer(0x04, dest, true, true, 0.5, Some(&[root])),
+            mock_peer(0x02, dest, true, 1.0, Some(&[0x50, root])),
+            mock_peer(0x04, dest, true, 0.5, Some(&[root])),
             // Same cost and distance: lower address wins.
-            mock_peer(0x03, dest, true, true, 0.5, Some(&[root])),
+            mock_peer(0x03, dest, true, 0.5, Some(&[root])),
         ],
         ..MockRoutingView::new(false)
     };
@@ -530,7 +527,7 @@ fn synth_mtu_exceeded_rate_limit_gate_suppresses_second_call() {
 }
 
 /// A non-Full peer is excluded even when its bloom filter may reach the
-/// destination, it can send, it is strictly closer, and its link cost beats
+/// destination, it is strictly closer, and its link cost beats
 /// every Full peer's. Only Full peers carry transit bloom filters, so trusting
 /// a non-Full peer's would route into a node that cannot forward.
 #[test]
@@ -540,7 +537,7 @@ fn candidate_selection_excludes_non_full_peers() {
     let my_coords = make_coords(&[0x10, root]);
     let dest_coords = make_coords(&[0x50, root]);
 
-    let full = mock_peer(0x70, dest, true, true, 10.0, Some(&[root]));
+    let full = mock_peer(0x70, dest, true, 10.0, Some(&[root]));
     let non_full = mock_non_full_peer(0x71, dest, 0.5, Some(&[root]));
 
     let rv = MockRoutingView {

@@ -2303,7 +2303,6 @@ mod tests {
             has_existing_peer: false,
             existing_peer_epoch: None,
             has_session: false,
-            is_healthy: false,
             pending_new_session: false,
             rekey_in_progress: false,
             existing_msg2: None,
@@ -2744,7 +2743,6 @@ mod tests {
             est.has_existing_peer = true;
             est.existing_peer_epoch = Some([1u8; 8]);
             est.has_session = true;
-            est.is_healthy = true;
             est.rekey_claim = RekeyClaim::Matches; // declared rekey of our session
             est.rekey_in_progress = true;
             let wire = wire_outcome(peer_addr, Some([1u8; 8]));
@@ -2791,7 +2789,6 @@ mod tests {
             est.has_existing_peer = true;
             est.existing_peer_epoch = Some([1u8; 8]);
             est.has_session = true;
-            est.is_healthy = true;
             est.rekey_claim = RekeyClaim::Matches;
             est.rekey_in_progress = true;
             let wire = wire_outcome(peer_addr, Some([1u8; 8]));
@@ -3112,7 +3109,6 @@ mod tests {
         est.has_existing_peer = true;
         est.existing_peer_epoch = Some([5u8; 8]);
         est.has_session = true;
-        est.is_healthy = true;
         est.different_link = true;
         est.rekey_claim = RekeyClaim::None; // no rekey declared -> cross-connection
         let wire = wire_outcome(peer_addr, Some([5u8; 8]));
@@ -3159,7 +3155,6 @@ mod tests {
         est.has_existing_peer = true;
         est.existing_peer_epoch = Some([5u8; 8]);
         est.has_session = true;
-        est.is_healthy = true;
         est.different_link = true;
         est.rekey_claim = RekeyClaim::None; // no rekey declared -> cross-connection
         let wire = wire_outcome(peer_addr, Some([5u8; 8]));
@@ -3199,13 +3194,12 @@ mod tests {
         assert_eq!(m.our_index(), None);
         let seed = SessionIndex::new(0xCD);
 
-        // Aged, healthy session, same epoch, same link, no rekey in progress ->
+        // Aged session, same epoch, same link, no rekey in progress ->
         // plain rekey responder (abandon_first: false).
         let mut est = est_new_peer(our);
         est.has_existing_peer = true;
         est.existing_peer_epoch = Some([7u8; 8]);
         est.has_session = true;
-        est.is_healthy = true;
         est.rekey_claim = RekeyClaim::Matches; // declared rekey of our session
         let wire = wire_outcome(peer_addr, Some([7u8; 8]));
 

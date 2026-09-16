@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::transport::stream::{ConnId, PooledConn};
 use crate::transport::{TransportAddr, TransportError};
 
 /// Direction of a pooled connection, used to drive separate
@@ -53,6 +54,17 @@ pub(crate) struct TcpConnection {
     pub(crate) established_at: Instant,
     /// Direction of the connection — drives pool-inbound/outbound accounting.
     pub(crate) direction: Direction,
+    /// Identity of this connection, shared with its writer and receive loop.
+    /// Either loop removes the entry at its address only when the entry
+    /// carries this id, so a loop that outlives its connection cannot remove
+    /// a newer connection at the same address.
+    pub(crate) id: ConnId,
+}
+
+impl PooledConn for TcpConnection {
+    fn conn_id(&self) -> ConnId {
+        self.id
+    }
 }
 
 /// Shared connection pool.

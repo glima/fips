@@ -125,6 +125,8 @@ impl UdpRawSocket {
     /// Adopt an existing bound UDP socket.
     ///
     /// This preserves socket identity/NAT mapping created by bootstrap code.
+    /// The adopted socket is also made joinable by per-peer connected
+    /// sockets, which bind its local address.
     pub fn adopt(
         socket: std::net::UdpSocket,
         recv_buf_size: usize,
@@ -134,6 +136,15 @@ impl UdpRawSocket {
 
         sock.set_nonblocking(true)
             .map_err(|e| TransportError::StartFailed(format!("set nonblocking failed: {}", e)))?;
+
+        // A per-peer connected socket later binds this socket's own address,
+        // and the kernel admits that joiner only when the holder carries a
+        // reuse flag too. The socket arrives already bound, so setting the
+        // flags here cannot change which port it was given, unlike flags set
+        // ahead of a port-zero bind; see the comment in `open`. Best-effort,
+        // as there: without them only the connected fast path is refused.
+        let _ = sock.set_reuse_port(true);
+        let _ = sock.set_reuse_address(true);
 
         sock.set_recv_buffer_size(recv_buf_size)
             .map_err(|e| TransportError::StartFailed(format!("set recv buffer: {}", e)))?;

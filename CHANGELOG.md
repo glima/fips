@@ -480,6 +480,22 @@ with v0.5.x or earlier peers.
   binder tearing down and rebinding every second while teardown silently
   declined to abort anything.
 
+### Removed
+
+- **Source-breaking for consumers of the library crate**: `ActivePeer` no
+  longer stores a connectivity state. `ActivePeer::connectivity`, `can_send`,
+  `is_healthy`, `mark_stale`, `mark_reconnecting`, `mark_disconnected` and
+  `mark_connected` are gone. `ConnectivityState` stays public with only
+  `Connected` and `Stale`, the values `show_peers` reports, and loses
+  `can_send` and `is_healthy`. `ConnectivityState::is_terminal`,
+  `ActivePeer::is_disconnected`, `Node::sendable_peers` and
+  `Node::sendable_peer_count` keep their signatures and the results they
+  always had in the daemon: the first two return `false`, and the last two
+  cover every peer. Nothing in the daemon changed the stored state after a
+  peer was promoted, so every removed check was already true and the shipped
+  binaries behave as before. The peer wire and the control-socket response
+  shape are unchanged.
+
 ### Fixed
 
 - A leaf-profile node no longer self-elects as tree root. A leaf holding the
@@ -676,7 +692,15 @@ with v0.5.x or earlier peers.
   resynchronise from. BLE was the worst of the four: it awaited the L2CAP
   write while holding the connection-pool mutex, so one unresponsive peer
   froze every other BLE operation as well — connects, evictions, and each
-  receive loop's teardown.
+  receive loop's teardown. On TCP, Tor and Nym, a connection's writer and
+  receive loop act only on their own connection: one that outlives its
+  connection can no longer tear down a newer connection that has taken the
+  same address, and a receive loop that ends stops its writer rather than
+  leaving it writing to a peer that has gone. Closing one of their connections
+  on purpose, as a control-API disconnect does, now lets the writer finish the
+  frames already queued, within five seconds, instead of discarding them, so a
+  Disconnect sent just before the close reaches the peer. Stopping the
+  transport, or a connection that has failed, still discards them.
 
 - A per-peer `connect()`-ed UDP socket is no longer left pinned to an interface
   the host has moved off. Established UDP peers get their own socket for the
@@ -712,6 +736,13 @@ with v0.5.x or earlier peers.
   platforms with the connected-socket fast path); elsewhere the heartbeat alone
   carries the new address.
 
+- A peer reached by NAT traversal now gets its per-peer connected UDP socket.
+  The adopted traversal socket carried no address-reuse flags, so the connected
+  socket's bind to the same port was refused with `EADDRINUSE` on every tick and
+  the peer never left the unconnected path. The flags are now set when the
+  socket is adopted, after its bind, so the traversal bind still receives a
+  port no other socket holds.
+
 #### Control socket
 
 - `show_links` (`fipsctl show links`) now reports the traffic a link has
@@ -726,6 +757,16 @@ with v0.5.x or earlier peers.
   link was created with. The counters cover authenticated link frames only, so
   they are not expected to match the transport totals in `show_transports`.
   The response shape is unchanged.
+- `show_peers` (`fipsctl show peers`) now reports a peer that has gone quiet
+  as `stale`. Its `connectivity` was read from a state that nothing outside
+  the tests ever changed, so every peer read `connected` until it was
+  removed, including one that had stopped answering tens of seconds earlier.
+  The value is now derived from how long the peer has been silent: `connected`
+  while its idle time is at or below `heartbeat_interval_secs`, and `stale`
+  above it, the same rule that decides whether discovery re-dials an active
+  peer on the path it already has. The `reconnecting` and `disconnected`
+  values the open-discovery tutorial described never occurred, and the
+  tutorial no longer lists them. The response shape is unchanged.
 
 #### Packaging
 

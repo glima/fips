@@ -350,7 +350,7 @@ impl Node {
             session_established,
             session_is_ours: is_ours,
             session_error: job.session_error.take(),
-            target_is_direct_peer: self.peers.get(&target).is_some_and(|p| p.can_send()),
+            target_is_direct_peer: self.peers.contains_key(&target),
             counters,
             last_rtt_ms: mmp.and_then(|m| m.metrics.last_rtt_ms()),
             srtt_ms: mmp.and_then(|m| m.metrics.srtt_ms()),
@@ -485,9 +485,7 @@ impl Node {
         if dest == self.node_addr() {
             return (None, Some(NoHopReason::Local));
         }
-        if let Some(peer) = self.peers.get(dest)
-            && peer.can_send()
-        {
+        if self.peers.contains_key(dest) {
             return (
                 Some(NextHopFacts {
                     node_addr: *dest,
@@ -519,7 +517,7 @@ impl Node {
         let Some(hop) = selected else {
             return (None, Some(NoHopReason::NoCloserPeer));
         };
-        if !self.peers.get(&hop).is_some_and(|p| p.can_send()) {
+        if !self.peers.contains_key(&hop) {
             return (None, Some(NoHopReason::HopNotSendReady));
         }
         let class = self.classify_forward(dest, &hop);

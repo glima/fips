@@ -252,6 +252,43 @@ async fn a_peer_joining_onto_a_settled_path_is_still_not_a_change() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn local_sources_trading_places_between_peers_is_reported_for_both() {
+    // The reason the fingerprint is a map from peer to source and not a set of
+    // sources. Two peers swap the local addresses they are reached from, so
+    // the host still leaves from exactly the same two addresses, yet each
+    // peer's connected socket is pinned to the source the other peer now
+    // uses. A set of addresses is unchanged across the swap and would report
+    // nothing while both sockets are stale.
+    let a = Some(v4(192, 168, 1, 10));
+    let b = Some(v4(10, 40, 0, 7));
+    let before = NetFingerprint::for_test(&[(peer(1), a), (peer(2), b)]);
+    let swapped = NetFingerprint::for_test(&[(peer(1), b), (peer(2), a)]);
+    let (sampler, _) = scripted(vec![before, swapped]);
+    let (tx, mut rx) = mpsc::channel(1);
+
+    tokio::spawn(run_detector(tx, cfg(1, 0), sampler, timer_wake(1)));
+
+    let change = expect_change(&mut rx).await;
+    assert_eq!(change.summary.moved.len(), 2, "{:?}", change.summary.moved);
+    assert_eq!(
+        change.summary.moved,
+        vec![
+            PeerSourceMove {
+                peer: peer(1),
+                before: a,
+                after: b,
+            },
+            PeerSourceMove {
+                peer: peer(2),
+                before: b,
+                after: a,
+            },
+        ],
+        "each peer must be named with its own source before and after the swap"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn churn_during_a_handover_does_not_mask_the_handover() {
     // Both at once: a peer leaves while the medium moves under the peer that
     // stays. The intersection rule must ignore the departure and still report

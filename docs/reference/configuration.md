@@ -283,10 +283,15 @@ one would put a DNS lookup on the sample path; the address becomes numeric as
 soon as an authenticated packet arrives from the peer). A node holding no peers
 detects nothing, which is correct — it has nothing bound to the old path.
 
-The cost is five non-blocking syscalls per peer per sample, read from the
-probe's own code rather than measured: `socket(2)` and `bind(2)`, a `connect(2)`
-that sends no packet, a `getsockname(2)`, and the `close(2)` the socket takes on
-drop. Nothing goes on the wire and no name is resolved.
+The cost is five non-blocking syscalls per peer per sample, counted with
+`strace` on Linux: `socket(2)` and `bind(2)`, a `connect(2)` that sends no
+packet, a `getsockname(2)`, and the `close(2)` the socket takes on drop. A peer
+with no route costs four, because the lookup fails at `connect(2)`. Nothing goes
+on the wire and no name is resolved. At the default `max_peers` of 128 that is
+640 syscalls per sample. A detected change is resampled until it settles, so
+with the default `debounce_ms` it costs between two samples and nine, which is
+between 1280 and 5760 syscalls at 128 peers; the backstop timer also takes one
+sample every `poll_interval_secs` whether or not anything moved.
 `node.limits.max_peers` bounds the per-sample total only where it is set: at
 `max_peers: 0`, which means unlimited, there is no bound and the cost tracks the
 live peer count instead.

@@ -51,9 +51,9 @@
 //! One local source address per peer: for every peer whose transport address is
 //! a numeric IP endpoint, the address the kernel would pick to reach *that
 //! peer*. A connected-but-never-sending UDP socket makes the kernel run its
-//! route lookup and bind the source address it would use; five syscalls, read
-//! off [`NetFingerprint::sample`] rather than measured, no packets, no name
-//! resolution, and it works identically on every platform std supports.
+//! route lookup and bind the source address it would use; five syscalls per
+//! peer (see [`NetFingerprint::sample`] for the measured cost), no packets, no
+//! name resolution, and it works identically on every platform std supports.
 //!
 //! Keying on peers bounds the *reaction* — only the peers a change names are
 //! acted on — and does not bound the *sampling*. One roaming peer still makes
@@ -222,18 +222,26 @@ struct PeerPath {
 impl NetFingerprint {
     /// Probe every target and record the local address the kernel picks.
     ///
-    /// Five non-blocking syscalls per target: `socket(2)` and `bind(2)` behind
-    /// `UdpSocket::bind`, a `connect(2)` that sends no packet, a
-    /// `getsockname(2)`, and the `close(2)` the socket takes on drop. No I/O
-    /// wait, no name resolution, and no allocation beyond the map.
+    /// Five non-blocking syscalls per target, counted with `strace -f` on
+    /// Linux: `socket(2)` and `bind(2)` behind `UdpSocket::bind`, a
+    /// `connect(2)` that sends no packet, a `getsockname(2)`, and the
+    /// `close(2)` the socket takes on drop. A target with no route costs four,
+    /// because `connect(2)` fails and `getsockname(2)` is never reached. A
+    /// build with debug assertions on adds a sixth to each, the `fcntl(2)` std
+    /// uses to check a descriptor is still open before closing it, so count
+    /// against a release build. No I/O wait, no name resolution, and no
+    /// allocation beyond the map.
     ///
-    /// The count matters because a debounced handover resamples: up to
-    /// `MAX_DEBOUNCE_ROUNDS` rounds plus the settled sample, times the peers
-    /// held. `node.limits.max_peers` bounds that only where it is set —
-    /// the value 0 means unlimited, and there the cost tracks the live peer
-    /// count instead. It runs inline in the detector's own task rather than
-    /// through `spawn_blocking`, which is what keeps it off every other task
-    /// regardless.
+    /// The count matters because a debounced handover resamples: the sample
+    /// that saw the move, then up to `MAX_DEBOUNCE_ROUNDS` more until two
+    /// consecutive samples agree. At 128 peers, the `node.limits.max_peers`
+    /// default, that is 640 syscalls per sample, and a reported change under a
+    /// non-zero debounce costs from 1280 (settled on the first resample) to
+    /// 5760 (still moving after every round). `node.limits.max_peers` bounds
+    /// that only where it is set — the value 0 means unlimited, and there the
+    /// cost tracks the live peer count instead. It runs inline in the
+    /// detector's own task rather than through `spawn_blocking`, which is what
+    /// keeps it off every other task regardless.
     pub(in crate::node) fn sample(targets: &[ProbeTarget]) -> Self {
         Self {
             sources: targets
@@ -541,7 +549,8 @@ struct WakeSource {
     /// either of which would otherwise leave the node noticing nothing at all.
     /// Keeping the period the poller would have used makes an event-driven
     /// backend a strict latency improvement rather than a replacement that can
-    /// regress, for the cost of a few syscalls per period.
+    /// regress, for the cost of one sample per period: five syscalls per probed
+    /// peer, or 640 at the default of 128 peers.
     timer: tokio::time::Interval,
 }
 

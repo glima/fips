@@ -32,6 +32,9 @@ use super::{
 };
 use crate::config::TcpConfig;
 use crate::transport::framing::read_fmp_packet;
+use crate::transport::stream::{
+    ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id, remove_own,
+};
 use pool::{ConnectingEntry, ConnectingPool, ConnectionPool, Direction, TcpConnection};
 use stats::TcpStats;
 
@@ -425,12 +428,14 @@ impl TcpTransport {
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
         let mtu = mss_mtu;
+        let id = next_conn_id();
 
         let recv_task = tokio::spawn(async move {
             tcp_receive_loop(
                 read_half,
                 transport_id,
                 remote_addr.clone(),
+                id,
                 packet_tx,
                 pool,
                 mtu,
@@ -450,6 +455,7 @@ impl TcpTransport {
             send_rx,
             transport_id,
             addr.clone(),
+            id,
             self.pool.clone(),
             self.stats.clone(),
         ));
@@ -461,6 +467,7 @@ impl TcpTransport {
             mtu: mss_mtu,
             established_at: Instant::now(),
             direction: Direction::Outbound,
+            id,
         };
 
         let mut pool = self.pool.lock().await;
@@ -481,21 +488,35 @@ impl TcpTransport {
 
     /// Close a specific connection asynchronously.
     ///
-    /// Removes the connection from the pool, aborts its receive task,
-    /// and drops the write half (sends FIN to remote).
+    /// Removes the connection from the pool and aborts its receive task. The
+    /// writer is not aborted: dropping the queue lets it finish writing the
+    /// frames already queued, such as a Disconnect sent just before this close,
+    /// and then exit, which drops the write half and sends FIN. A detached
+    /// timer aborts it if it is still writing after [`WRITER_DRAIN_TIMEOUT`],
+    /// so this call never waits on the peer. Stopping the transport, and every
+    /// teardown after a connection has failed, abort the writer instead and
+    /// discard what it had queued.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            conn.recv_task.abort();
-            conn.send_task.abort();
-            match conn.direction {
+            let TcpConnection {
+                send_tx,
+                send_task,
+                recv_task,
+                direction,
+                ..
+            } = conn;
+            drop(send_tx);
+            recv_task.abort();
+            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
+            match direction {
                 Direction::Inbound => self.stats.record_pool_inbound_removed(),
                 Direction::Outbound => self.stats.record_pool_outbound_removed(),
             }
             debug!(
                 transport_id = %self.transport_id,
                 remote_addr = %addr,
-                direction = ?conn.direction,
+                direction = ?direction,
                 "TCP connection closed (close_connection)"
             );
         }
@@ -689,12 +710,14 @@ impl TcpTransport {
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
+        let id = next_conn_id();
 
         let recv_task = tokio::spawn(async move {
             tcp_receive_loop(
                 read_half,
                 transport_id,
                 remote_addr.clone(),
+                id,
                 packet_tx,
                 pool,
                 mss_mtu,
@@ -714,6 +737,7 @@ impl TcpTransport {
             send_rx,
             transport_id,
             addr.clone(),
+            id,
             self.pool.clone(),
             self.stats.clone(),
         ));
@@ -725,6 +749,7 @@ impl TcpTransport {
             mtu: mss_mtu,
             established_at: Instant::now(),
             direction: Direction::Outbound,
+            id,
         };
 
         // Use try_lock since we're in a sync context and the pool
@@ -932,12 +957,14 @@ async fn accept_loop(
                 // or it would remove nothing and leave an orphaned entry with
                 // a permanently incremented inbound counter.
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let id = next_conn_id();
 
                 let recv_task = tokio::spawn(async move {
                     tcp_receive_loop(
                         read_half,
                         transport_id,
                         recv_addr,
+                        id,
                         recv_packet_tx,
                         recv_pool,
                         conn_mtu,
@@ -956,6 +983,7 @@ async fn accept_loop(
                     send_rx,
                     transport_id,
                     remote_addr.clone(),
+                    id,
                     pool.clone(),
                     stats.clone(),
                 ));
@@ -967,6 +995,7 @@ async fn accept_loop(
                     mtu: conn_mtu,
                     established_at: Instant::now(),
                     direction: Direction::Inbound,
+                    id,
                 };
 
                 let mut pool_guard = pool.lock().await;
@@ -1018,6 +1047,10 @@ async fn accept_loop(
 /// receive task is aborted here rather than left to notice on its own, because
 /// a half-closed connection is not something either side should keep.
 ///
+/// The entry is removed only when it carries this connection's `id`. A writer
+/// can outlive its entry, and by the time its write fails a newer connection
+/// may hold the address; that one is left alone.
+///
 /// Frames are written whole. A partial write followed by an error takes the
 /// connection down with it, so the peer never sees a frame it cannot
 /// resynchronise from.
@@ -1026,6 +1059,7 @@ async fn tcp_send_loop(
     mut frames: mpsc::Receiver<Vec<u8>>,
     transport_id: TransportId,
     remote_addr: TransportAddr,
+    id: ConnId,
     pool: ConnectionPool,
     stats: Arc<TcpStats>,
 ) {
@@ -1050,11 +1084,12 @@ async fn tcp_send_loop(
                 );
                 let removed = {
                     let mut pool = pool.lock().await;
-                    pool.remove(&remote_addr)
+                    remove_own(&mut pool, &remote_addr, id)
                 };
+                // The removed entry's `send_task` is this task, which returns
+                // below, so only the receive task needs stopping.
                 if let Some(conn) = removed {
                     conn.recv_task.abort();
-                    conn.send_task.abort();
                     match conn.direction {
                         Direction::Inbound => stats.record_pool_inbound_removed(),
                         Direction::Outbound => stats.record_pool_outbound_removed(),
@@ -1087,11 +1122,20 @@ async fn tcp_send_loop(
 /// slot from accept) and `None` for outbound ones. `ready_rx`, when
 /// present, is the accept loop's readiness barrier: the loop must not run
 /// its cleanup before the accept loop has inserted the pool entry.
+///
+/// `id` is the connection's identity. The cleanup removes the entry at
+/// `remote_addr` only when it carries this id, so a loop whose entry has
+/// already been replaced by a newer connection at the same address leaves
+/// that connection alone. When it does remove its own entry it also stops the
+/// entry's writer: the loop ended on EOF, a read error or a missed deadline,
+/// and frames still queued for a connection in that state are not worth
+/// writing.
 #[allow(clippy::too_many_arguments)]
 async fn tcp_receive_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     transport_id: TransportId,
     remote_addr: TransportAddr,
+    id: ConnId,
     packet_tx: PacketTx,
     pool: ConnectionPool,
     mtu: u16,
@@ -1182,9 +1226,10 @@ async fn tcp_receive_loop(
     // entry actually being removed so a double-cleanup never drives
     // the counter below zero.
     let mut pool_guard = pool.lock().await;
-    let removed = pool_guard.remove(&remote_addr).is_some();
+    let removed = remove_own(&mut pool_guard, &remote_addr, id);
     drop(pool_guard);
-    if removed {
+    if let Some(conn) = removed {
+        conn.send_task.abort();
         match direction {
             Direction::Inbound => stats.record_pool_inbound_removed(),
             Direction::Outbound => stats.record_pool_outbound_removed(),
@@ -2227,6 +2272,7 @@ mod tests {
 
         let pool: ConnectionPool = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(TcpStats::new());
+        let id = next_conn_id();
         pool.lock().await.insert(
             remote.clone(),
             TcpConnection {
@@ -2236,6 +2282,7 @@ mod tests {
                 mtu: 1400,
                 established_at: Instant::now(),
                 direction: Direction::Inbound,
+                id,
             },
         );
         stats.record_pool_inbound_added();
@@ -2248,6 +2295,7 @@ mod tests {
             read_half,
             TransportId::new(1),
             remote.clone(),
+            id,
             tx,
             pool.clone(),
             1400,
@@ -2320,5 +2368,567 @@ mod tests {
 
         drop(client);
         transport.stop_async().await.unwrap();
+    }
+
+    // ========================================================================
+    // Connection identity and failure teardown
+    // ========================================================================
+
+    /// Bind a listener whose accepted sockets get a small receive buffer.
+    ///
+    /// Setting `SO_RCVBUF` before `listen` locks the size on every accepted
+    /// socket, so kernel autotuning cannot grow it past what a test's fill
+    /// can overrun.
+    fn capped_deaf_listener() -> TcpListener {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        socket.listen(8).unwrap()
+    }
+
+    /// Fill `remote`'s send queue behind a peer that does not read, until the
+    /// writer is parked in `write_all`, and return how many frames were
+    /// queued.
+    ///
+    /// Every send is attempted whatever the previous one returned, with a
+    /// yield between sends so the writer runs. A queue still full 300 ms
+    /// after the last send means the writer could not drain it, which is the
+    /// state the caller's teardown needs; anything else panics rather than
+    /// letting the caller pass without it.
+    async fn park_tcp_writer(t: &TcpTransport, remote: &TransportAddr, frame: &[u8]) -> usize {
+        let mut queued = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..8000 {
+            match timeout(Duration::from_secs(2), t.send_async(remote, frame)).await {
+                Ok(Ok(_)) => queued += 1,
+                Ok(Err(_)) => refused += 1,
+                Err(_) => panic!("send blocked on a peer that stopped reading"),
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let capacity = t
+            .pool
+            .lock()
+            .await
+            .get(remote)
+            .map(|c| c.send_tx.capacity());
+        assert_eq!(
+            capacity,
+            Some(0),
+            "setup did not park the writer: queued={queued} refused={refused}"
+        );
+        assert!(refused > 0, "setup never filled the queue: queued={queued}");
+        queued
+    }
+
+    /// Read `stream` to EOF within `limit`, returning the byte count, or
+    /// `None` if EOF did not arrive in time.
+    async fn read_to_eof(stream: &mut TcpStream, limit: Duration) -> Option<usize> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        timeout(limit, async {
+            let mut total = 0usize;
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return total,
+                    Ok(n) => total += n,
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// A writer whose write fails must not remove a newer connection that has
+    /// taken its address in the pool.
+    ///
+    /// The successor is marked by its MTU. The peer resets the connection, and
+    /// frames are pushed until the writer's write fails, since the first write
+    /// after a reset can still succeed.
+    #[tokio::test]
+    async fn tcp_writer_error_leaves_a_newer_connection_at_the_same_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let client = TcpStream::connect(listen).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        socket2::SockRef::from(&server)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(server);
+        let (_read_half, write_half) = client.into_split();
+        let remote = TransportAddr::from_string(&listen.to_string());
+
+        let pool: ConnectionPool = Arc::new(Mutex::new(HashMap::new()));
+        let stats = Arc::new(TcpStats::new());
+        pool.lock().await.insert(
+            remote.clone(),
+            TcpConnection {
+                send_tx: mpsc::channel(1).0,
+                send_task: tokio::spawn(async {}),
+                recv_task: tokio::spawn(async {}),
+                mtu: 1234,
+                established_at: Instant::now(),
+                direction: Direction::Outbound,
+                id: next_conn_id(),
+            },
+        );
+
+        let (send_tx, send_rx) = mpsc::channel(pool::SEND_QUEUE_DEPTH);
+        let writer = tokio::spawn(tcp_send_loop(
+            write_half,
+            send_rx,
+            TransportId::new(1),
+            remote.clone(),
+            next_conn_id(),
+            pool.clone(),
+            stats.clone(),
+        ));
+
+        let frame = build_msg1_frame();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !writer.is_finished() && Instant::now() < deadline {
+            let _ = send_tx.try_send(frame.clone());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(writer.is_finished(), "the writer never hit a write error");
+        assert_eq!(
+            stats.snapshot().send_errors,
+            1,
+            "the writer's error path must have run"
+        );
+
+        assert_eq!(
+            pool.lock().await.get(&remote).map(|c| c.mtu),
+            Some(1234),
+            "a failed writer removed the newer connection at its address"
+        );
+    }
+
+    /// A receive loop that ends on EOF must stop its writer rather than leave
+    /// it writing to a peer that has gone.
+    ///
+    /// The writer is parked on a peer that does not read, with a full queue.
+    /// The peer then half-closes, which ends the receive loop, and only
+    /// afterwards reads. A writer left running delivers every frame it had
+    /// queued; a stopped one delivers fewer, since the queue alone holds
+    /// more frames than the kernel buffers leave unread.
+    #[tokio::test]
+    async fn tcp_receive_teardown_stops_the_writer() {
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let listener = capped_deaf_listener();
+        let remote = TransportAddr::from_string(&listener.local_addr().unwrap().to_string());
+        let frame = vec![0xAB; 1400];
+
+        let queued = park_tcp_writer(&t1, &remote, &frame).await;
+        let (mut peer, _) = listener.accept().await.unwrap();
+
+        peer.shutdown().await.unwrap();
+        assert!(
+            wait_until(
+                || t1.stats().snapshot().pool_outbound == 0,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the receive loop should have torn the connection down on EOF"
+        );
+
+        let read = read_to_eof(&mut peer, Duration::from_secs(10))
+            .await
+            .expect("the connection was never closed toward the peer");
+        assert!(read > 0, "the kernel buffers held written frames");
+        assert!(
+            read < queued * frame.len(),
+            "the writer kept writing after its receive loop tore the connection down: \
+             read={read} queued_bytes={}",
+            queued * frame.len()
+        );
+
+        t1.stop_async().await.unwrap();
+    }
+
+    /// A connection displaced from the pool by a newer one at the same address
+    /// must not remove the newer one when its own receive loop ends.
+    ///
+    /// Both are built by `promote_connection`, and the MTU marks which entry
+    /// is pooled. The last step checks the newer connection still removes its
+    /// own entry.
+    #[tokio::test]
+    async fn tcp_displaced_connection_cannot_remove_its_successor() {
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let remote = TransportAddr::from_string(&listen.to_string());
+
+        let a = TcpStream::connect(listen).await.unwrap();
+        let (sa, _) = listener.accept().await.unwrap();
+        let b = TcpStream::connect(listen).await.unwrap();
+        let (sb, _) = listener.accept().await.unwrap();
+
+        t1.promote_connection(&remote, a, 1400);
+        t1.promote_connection(&remote, b, 1300);
+        {
+            let pool = t1.pool.lock().await;
+            assert_eq!(pool.len(), 1);
+            assert_eq!(pool.get(&remote).map(|c| c.mtu), Some(1300));
+        }
+
+        drop(sa);
+        assert!(
+            wait_until(
+                || t1.stats().snapshot().recv_errors == 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the displaced connection's receive loop should have read EOF"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            t1.pool.lock().await.get(&remote).map(|c| c.mtu),
+            Some(1300),
+            "the displaced connection's teardown removed its successor"
+        );
+
+        drop(sb);
+        assert!(
+            wait_until(
+                || t1.stats().snapshot().recv_errors == 2,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the newer connection's receive loop should have read EOF"
+        );
+        assert!(
+            wait_until(
+                || t1.pool.try_lock().map(|p| p.is_empty()).unwrap_or(false),
+                Duration::from_secs(2)
+            )
+            .await,
+            "the newer connection's teardown should remove its own entry"
+        );
+
+        t1.stop_async().await.unwrap();
+    }
+
+    /// A receive loop's teardown must leave alone a newer entry at its address,
+    /// and must not decrement the counter for it.
+    ///
+    /// Calls the loop directly against a hand-built successor, so the check is
+    /// on the teardown alone and not on how a constructor wires it.
+    #[tokio::test]
+    async fn tcp_receive_teardown_leaves_a_newer_connection_at_the_same_address() {
+        let (tx, _rx) = packet_channel(10);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let client = TcpStream::connect(listen).await.unwrap();
+        let (server, peer_addr) = listener.accept().await.unwrap();
+        let remote = TransportAddr::from_string(&peer_addr.to_string());
+        let (read_half, _write_half) = server.into_split();
+
+        let pool: ConnectionPool = Arc::new(Mutex::new(HashMap::new()));
+        let stats = Arc::new(TcpStats::new());
+        pool.lock().await.insert(
+            remote.clone(),
+            TcpConnection {
+                send_tx: mpsc::channel(1).0,
+                send_task: tokio::spawn(async {}),
+                recv_task: tokio::spawn(async {}),
+                mtu: 1234,
+                established_at: Instant::now(),
+                direction: Direction::Outbound,
+                id: next_conn_id(),
+            },
+        );
+        stats.record_pool_outbound_added();
+        assert_eq!(stats.snapshot().pool_outbound, 1);
+
+        drop(client);
+        tcp_receive_loop(
+            read_half,
+            TransportId::new(1),
+            remote.clone(),
+            next_conn_id(),
+            tx,
+            pool.clone(),
+            1400,
+            stats.clone(),
+            Direction::Outbound,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            stats.snapshot().recv_errors,
+            1,
+            "the loop should have ended on EOF"
+        );
+
+        assert_eq!(
+            pool.lock().await.get(&remote).map(|c| c.mtu),
+            Some(1234),
+            "the teardown removed a newer connection at its address"
+        );
+        assert_eq!(
+            stats.snapshot().pool_outbound,
+            1,
+            "the teardown decremented for a connection it did not remove"
+        );
+    }
+
+    /// A connection built by connect-on-send removes its own entry when its
+    /// receive loop ends.
+    #[tokio::test]
+    async fn tcp_connect_teardown_removes_its_own_entry() {
+        use tokio::io::AsyncReadExt;
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = TransportAddr::from_string(&listener.local_addr().unwrap().to_string());
+        let frame = build_msg1_frame();
+
+        t1.send_async(&remote, &frame).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; frame.len()];
+        timeout(Duration::from_secs(2), server.read_exact(&mut buf))
+            .await
+            .expect("timeout waiting for the frame")
+            .unwrap();
+        assert_eq!(buf, frame);
+        assert_eq!(t1.stats().snapshot().pool_outbound, 1);
+
+        drop(server);
+        assert!(
+            wait_until(
+                || t1.stats().snapshot().pool_outbound == 0,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the receive loop should release the outbound slot"
+        );
+        assert!(
+            t1.pool.lock().await.is_empty(),
+            "the receive loop should remove its own entry"
+        );
+
+        t1.stop_async().await.unwrap();
+    }
+
+    /// Two live inbound connections can share one remote address when they
+    /// reach a wildcard listener on different local addresses. Closing the
+    /// older one must not remove the newer one's pool entry.
+    ///
+    /// Known gap, not covered here: two live inbound connections that share a
+    /// remote address still share one pool key. The second accept replaces
+    /// the first entry without stopping its tasks and counts a second inbound
+    /// slot, so the inbound counter ends one above the pool once both
+    /// connections close. This test checks only that the older connection's
+    /// teardown no longer removes the newer connection's entry.
+    ///
+    /// Linux only: it needs `127.0.0.2` on the loopback interface and Linux
+    /// `SO_REUSEADDR` semantics to bind two client sockets to one port.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closing_the_older_of_two_inbound_connections_sharing_a_remote_address_keeps_the_newer_entry()
+     {
+        use socket2::{Domain, Socket, Type};
+        use tokio::io::AsyncReadExt;
+
+        let (tx, mut rx) = packet_channel(100);
+        let config = TcpConfig {
+            bind_addr: Some("0.0.0.0:0".to_string()),
+            mtu: Some(1400),
+            ..Default::default()
+        };
+        let mut transport = TcpTransport::new(TransportId::new(1), None, config, tx);
+        transport.start_async().await.unwrap();
+        let port = transport.local_addr().unwrap().port();
+
+        let client = |local: SocketAddr| {
+            let sock = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            sock.set_reuse_address(true).unwrap();
+            sock.bind(&local.into()).unwrap();
+            sock
+        };
+        let into_tokio = |sock: Socket| {
+            let std_stream: std::net::TcpStream = sock.into();
+            std_stream.set_nonblocking(true).unwrap();
+            TcpStream::from_std(std_stream).unwrap()
+        };
+        let sock_a = client("127.0.0.1:0".parse().unwrap());
+        let source = sock_a.local_addr().unwrap().as_socket().unwrap();
+        let sock_b = client(source);
+        let remote = TransportAddr::from_string(&source.to_string());
+        let frame = build_msg1_frame();
+
+        // Admit A before B dials, so B's entry is the one left in the pool.
+        let target_a: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        sock_a.connect(&target_a.into()).unwrap();
+        let mut a = into_tokio(sock_a);
+        a.write_all(&frame).await.unwrap();
+        let first = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for A's frame")
+            .expect("packet channel closed");
+        assert_eq!(first.remote_addr, remote);
+        assert_eq!(transport.stats().snapshot().connections_accepted, 1);
+
+        let target_b: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
+        sock_b.connect(&target_b.into()).unwrap();
+        let mut b = into_tokio(sock_b);
+        b.write_all(&frame).await.unwrap();
+        let second = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for B's frame")
+            .expect("packet channel closed");
+        assert_eq!(
+            second.remote_addr, remote,
+            "B must arrive with the same remote address as A"
+        );
+        assert_eq!(transport.stats().snapshot().connections_accepted, 2);
+        {
+            let pool = transport.pool.lock().await;
+            assert_eq!(pool.len(), 1);
+            assert!(pool.contains_key(&remote));
+        }
+
+        drop(a);
+        assert!(
+            wait_until(
+                || transport.stats().snapshot().recv_errors == 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "A's receive loop should have read EOF"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let send_tx = transport
+            .pool
+            .lock()
+            .await
+            .get(&remote)
+            .map(|c| c.send_tx.clone())
+            .expect("closing the older connection removed the newer connection's entry");
+        send_tx.try_send(frame.clone()).unwrap();
+        drop(send_tx);
+        let mut buf = vec![0u8; frame.len()];
+        timeout(Duration::from_secs(2), b.read_exact(&mut buf))
+            .await
+            .expect("the surviving entry is not B's live connection")
+            .unwrap();
+        assert_eq!(buf, frame);
+
+        drop(b);
+        assert!(
+            wait_until(
+                || transport.stats().snapshot().recv_errors == 2,
+                Duration::from_secs(2)
+            )
+            .await,
+            "B's receive loop should have read EOF"
+        );
+        assert!(
+            wait_until(
+                || transport
+                    .pool
+                    .try_lock()
+                    .map(|p| p.is_empty())
+                    .unwrap_or(false),
+                Duration::from_secs(2)
+            )
+            .await,
+            "B's teardown should remove its own entry"
+        );
+
+        transport.stop_async().await.unwrap();
+    }
+
+    // ========================================================================
+    // Deliberate close finishes the frames already queued
+    // ========================================================================
+
+    /// A frame queued immediately before a deliberate close must still be
+    /// written.
+    ///
+    /// Sending only queues the frame for the connection's writer task. A close
+    /// that aborts that task before it has run discards the frame, which is
+    /// how a Disconnect sent just before a close, or a handshake message sent
+    /// just before the losing side of a crossed connection is closed, never
+    /// reaches the peer. The second half checks the close still closes: the
+    /// peer sees FIN and releases its inbound slot, so a writer that never
+    /// exits cannot pass.
+    #[tokio::test]
+    async fn a_frame_queued_just_before_close_still_reaches_the_peer() {
+        let (tx1, _rx1) = packet_channel(100);
+        let (tx2, mut rx2) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        let mut t2 = TcpTransport::new(TransportId::new(2), None, make_config(), tx2);
+        t1.start_async().await.unwrap();
+        t2.start_async().await.unwrap();
+        let remote = TransportAddr::from_string(&t2.local_addr().unwrap().to_string());
+        let frame = build_msg1_frame();
+
+        // Pool the connection and let its writer go idle.
+        t1.send_async(&remote, &frame).await.unwrap();
+        let first = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("timeout waiting for the first frame")
+            .expect("packet channel closed");
+        assert_eq!(first.data, frame);
+
+        // Queue, then close with nothing in between.
+        t1.send_async(&remote, &frame).await.unwrap();
+        t1.close_connection_async(&remote).await;
+
+        let second = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("a frame queued just before close was never written")
+            .expect("packet channel closed");
+        assert_eq!(second.data, frame);
+
+        assert!(
+            wait_until(
+                || t2.stats().snapshot().pool_inbound == 0,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the close must still end the connection once the queue is written"
+        );
+
+        t1.stop_async().await.unwrap();
+        t2.stop_async().await.unwrap();
+    }
+
+    /// A deliberate close must return at once even when the writer cannot
+    /// finish, because the peer has stopped reading. Draining happens after
+    /// the close returns, never inside it.
+    #[tokio::test]
+    async fn close_does_not_wait_for_a_writer_parked_on_a_deaf_peer() {
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let listener = capped_deaf_listener();
+        let remote = TransportAddr::from_string(&listener.local_addr().unwrap().to_string());
+        let frame = vec![0xAB; 1400];
+
+        park_tcp_writer(&t1, &remote, &frame).await;
+        let (_peer, _) = listener.accept().await.unwrap();
+
+        assert!(
+            timeout(
+                Duration::from_millis(200),
+                t1.close_connection_async(&remote)
+            )
+            .await
+            .is_ok(),
+            "close waited on a writer that cannot finish"
+        );
+
+        t1.stop_async().await.unwrap();
     }
 }

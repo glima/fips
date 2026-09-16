@@ -59,8 +59,8 @@ use self::reloadable::Reloadable;
 pub(crate) const REKEY_JITTER_SECS: i64 = 15;
 use crate::cache::CoordCache;
 use crate::node::session::SessionEntry;
-use crate::peer::ActivePeer;
 use crate::peer::machine::{PeerMachine, TimerKind};
+use crate::peer::{ActivePeer, ConnectivityState};
 use crate::proto::bloom::{BloomFilter, BloomState};
 use crate::proto::fmp::Fmp;
 use crate::proto::fmp::NodeProfile;
@@ -2310,6 +2310,7 @@ impl Node {
         // SRTT) every peer falls back to the default link cost of 1.0.
         let any_peer_has_srtt = self.peers().any(|p| p.has_srtt());
 
+        let now_ms = Self::now_ms();
         let peer_rows: Vec<snap::PeerRow> = self
             .peers()
             .map(|peer| {
@@ -2362,7 +2363,7 @@ impl Node {
                     npub: peer.npub(),
                     display_name: self.peer_display_name(&node_addr),
                     ipv6_addr: format!("{}", peer.address()),
-                    connectivity: format!("{}", peer.connectivity()),
+                    connectivity: format!("{}", self.peer_connectivity(peer, now_ms)),
                     link_id: peer.link_id().as_u64(),
                     authenticated_at_ms: peer.authenticated_at(),
                     last_seen_ms: peer.last_seen(),
@@ -3109,6 +3110,37 @@ impl Node {
         self.peers.values()
     }
 
+    /// Whether an active peer has been silent at `now_ms` for longer than the
+    /// configured heartbeat interval, floored at one second.
+    ///
+    /// The one idle-time liveness rule: the control socket reports such a peer
+    /// as `stale`, the discovery dial gate
+    /// [`Self::active_peer_link_is_live`] no longer holds its link as live, and
+    /// discovery re-dials it on the path it already has.
+    pub(in crate::node) fn peer_link_is_stale(&self, peer: &ActivePeer, now_ms: u64) -> bool {
+        let stale_after_ms = self
+            .config()
+            .node
+            .heartbeat_interval_secs
+            .saturating_mul(1000)
+            .max(1000);
+        peer.idle_time(now_ms) > stale_after_ms
+    }
+
+    /// Connectivity of an active peer as the control socket reports it:
+    /// `Stale` when [`Self::peer_link_is_stale`] holds at `now_ms`, otherwise
+    /// `Connected`.
+    ///
+    /// Derived from idle time rather than read from the state stored on the
+    /// peer, which nothing in production changes after promotion.
+    pub(crate) fn peer_connectivity(&self, peer: &ActivePeer, now_ms: u64) -> ConnectivityState {
+        if self.peer_link_is_stale(peer, now_ms) {
+            ConnectivityState::Stale
+        } else {
+            ConnectivityState::Connected
+        }
+    }
+
     /// Reference to the Nostr discovery handle if discovery is enabled.
     /// Used by control queries (`show_peers` per-peer Nostr-traversal
     /// state) to read failure-state without taking shared ownership.
@@ -3121,14 +3153,15 @@ impl Node {
         self.peers.keys()
     }
 
-    /// Iterate over peers that can send traffic.
+    /// Iterate over peers that can send traffic: every active peer, the same
+    /// peers as [`Self::peers`].
     pub fn sendable_peers(&self) -> impl Iterator<Item = &ActivePeer> {
-        self.peers.values().filter(|p| p.can_send())
+        self.peers.values()
     }
 
-    /// Number of peers that can send traffic.
+    /// Number of peers that can send traffic, the same as [`Self::peer_count`].
     pub fn sendable_peer_count(&self) -> usize {
-        self.peers.values().filter(|p| p.can_send()).count()
+        self.peers.len()
     }
 
     // === End-to-End Sessions ===
@@ -3482,9 +3515,7 @@ impl Node {
         }
 
         // 2. Direct peer
-        if let Some(peer) = self.peers.get(dest_node_addr)
-            && peer.can_send()
-        {
+        if let Some(peer) = self.peers.get(dest_node_addr) {
             return Some(peer);
         }
 
@@ -3501,7 +3532,7 @@ impl Node {
         // 3. Bloom filter candidates — requires dest_coords for loop-free selection.
         //    If no candidate is strictly closer, fall through to tree routing.
         //    The sans-IO core enumerates borrowed peers over the `RoutingView`
-        //    seam, applies the bloom/send/progress filters, and tracks the
+        //    seam, applies the bloom/progress filters, and tracks the
         //    winner inline; the shell supplies only raw per-peer reads.
         let next_hop = {
             let view = NodeRoutingView {
@@ -3525,7 +3556,7 @@ impl Node {
         let skip = self.non_full_peers();
         let next_hop_id = self.tree_state.find_next_hop(&dest_coords, &skip)?;
 
-        self.peers.get(&next_hop_id).filter(|p| p.can_send())
+        self.peers.get(&next_hop_id)
     }
 
     /// Classify a transit forward by route class from tree coordinates.
@@ -4064,7 +4095,7 @@ impl Node {
 
 /// Shell-side [`routing::RoutingView`] seam over live `Node` state — the sole
 /// routing read adapter the shell retains. It hands the sans-IO routing core
-/// borrowed peers plus raw `may_reach` / `can_send` / `link_cost` / `coords`
+/// borrowed peers plus raw `may_reach` / `link_cost` / `coords`
 /// reads so selection and error synthesis live in `proto::routing::core`; no
 /// routing decision logic remains here.
 ///
@@ -4111,10 +4142,6 @@ impl routing::RoutingView for NodeRoutingView<'_> {
 
     fn peer_may_reach<'a>(&'a self, peer: Self::Peer<'a>, dest: &NodeAddr) -> bool {
         peer.1.may_reach(dest)
-    }
-
-    fn peer_can_send<'a>(&'a self, peer: Self::Peer<'a>) -> bool {
-        peer.1.can_send()
     }
 
     fn peer_link_cost<'a>(&'a self, peer: Self::Peer<'a>) -> f64 {

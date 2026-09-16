@@ -21,6 +21,7 @@ use tracing::{debug, trace};
 use tokio::io::AsyncWriteExt;
 
 use crate::transport::framing::read_fmp_packet;
+use crate::transport::stream::{ConnId, PooledConn, remove_own};
 use crate::transport::{
     ConnectionState, PacketTx, ReceivedPacket, TransportAddr, TransportError, TransportId,
 };
@@ -46,6 +47,17 @@ pub(crate) struct ProxiedConnection<M> {
     pub established_at: Instant,
     /// Per-transport metadata (tor: `Direction`; nym: `()`).
     pub meta: M,
+    /// Identity of this connection, shared with its writer and receive loop.
+    /// Either loop removes the entry at its address only when the entry
+    /// carries this id, so a loop that outlives its connection cannot remove
+    /// a newer connection at the same address.
+    pub id: ConnId,
+}
+
+impl<M> PooledConn for ProxiedConnection<M> {
+    fn conn_id(&self) -> ConnId {
+        self.id
+    }
 }
 
 /// Shared connection pool: addr -> per-connection state.
@@ -152,13 +164,17 @@ pub(crate) const SEND_QUEUE_DEPTH: usize = 64;
 /// Teardown mirrors [`proxied_receive_loop`]: the pool entry is removed and
 /// `on_remove` fires only when the removal returned `Some`, taking the
 /// metadata from the removed entry, so a concurrent `close`/`stop` of the same
-/// address cannot double-count.
+/// address cannot double-count. The entry is removed only when it carries
+/// this connection's `id`. A writer can outlive its entry, and by the time its
+/// write fails a newer connection may hold the address; that one is left
+/// alone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxied_send_loop<S: ProxiedStats, M>(
     mut writer: OwnedWriteHalf,
     mut frames: mpsc::Receiver<Vec<u8>>,
     transport_id: TransportId,
     remote_addr: TransportAddr,
+    id: ConnId,
     pool: ProxiedPool<M>,
     stats: Arc<S>,
     label: &'static str,
@@ -187,7 +203,7 @@ pub(crate) async fn proxied_send_loop<S: ProxiedStats, M>(
                 );
                 let removed = {
                     let mut guard = pool.lock().await;
-                    guard.remove(&remote_addr)
+                    remove_own(&mut guard, &remote_addr, id)
                 };
                 if let Some(conn) = removed {
                     conn.recv_task.abort();
@@ -233,11 +249,20 @@ pub(crate) async fn proxied_send_loop<S: ProxiedStats, M>(
 /// must not run its cleanup before the accept loop has inserted the pool entry
 /// and bumped its counter, or the removal finds nothing, `on_remove` never
 /// fires, and the increment is stranded for the life of the process.
+///
+/// `id` is the connection's identity. The cleanup removes the entry at
+/// `remote_addr` only when it carries this id, so a loop whose entry has
+/// already been replaced by a newer connection at the same address leaves
+/// that connection alone. When it does remove its own entry it also stops the
+/// entry's writer: the loop ended on EOF, a read error or a missed deadline,
+/// and frames still queued for a connection in that state are not worth
+/// writing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
     mut reader: OwnedReadHalf,
     transport_id: TransportId,
     remote_addr: TransportAddr,
+    id: ConnId,
     packet_tx: PacketTx,
     pool: ProxiedPool<M>,
     mtu: u16,
@@ -334,8 +359,308 @@ pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
     // concurrent close/stop teardown of the same address can never
     // double-count.
     let mut pool_guard = pool.lock().await;
-    if let Some(removed) = pool_guard.remove(&remote_addr) {
+    if let Some(removed) = remove_own(&mut pool_guard, &remote_addr, id) {
         drop(pool_guard);
+        removed.send_task.abort();
         on_remove(&*stats, &removed.meta);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::packet_channel;
+    use crate::transport::stream::next_conn_id;
+    use portable_atomic::{AtomicU64, Ordering};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
+    /// Counters the shared loops write, plus how often `on_remove` fired.
+    #[derive(Default)]
+    struct CountingStats {
+        send_errors: AtomicU64,
+        recv_errors: AtomicU64,
+        removed: AtomicU64,
+    }
+
+    impl ProxiedStats for CountingStats {
+        fn record_recv(&self, _bytes: usize) {}
+        fn record_recv_error(&self) {
+            self.recv_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        fn record_send(&self, _bytes: usize) {}
+        fn record_send_error(&self) {
+            self.send_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The `on_remove` hook the tests pass to both loops.
+    fn count_removal(stats: &CountingStats, _meta: &()) {
+        stats.removed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pool entry that stands for some other connection at the same
+    /// address, marked by its MTU.
+    fn successor() -> ProxiedConnection<()> {
+        ProxiedConnection {
+            send_tx: mpsc::channel(1).0,
+            send_task: tokio::spawn(async {}),
+            recv_task: tokio::spawn(async {}),
+            mtu: 1234,
+            established_at: Instant::now(),
+            meta: (),
+            id: next_conn_id(),
+        }
+    }
+
+    /// Poll `f` every 10ms until it holds or `limit` elapses.
+    async fn wait_until<F: FnMut() -> bool>(mut f: F, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if f() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A writer whose write fails must not remove a newer connection that has
+    /// taken its address in the pool, nor run `on_remove` for it.
+    #[tokio::test]
+    async fn proxied_writer_error_leaves_a_newer_connection_at_the_same_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let client = TcpStream::connect(listen).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        socket2::SockRef::from(&server)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(server);
+        let (_read_half, write_half) = client.into_split();
+        let remote = TransportAddr::from_string(&listen.to_string());
+
+        let pool: ProxiedPool<()> = Arc::new(Mutex::new(HashMap::new()));
+        let stats = Arc::new(CountingStats::default());
+        pool.lock().await.insert(remote.clone(), successor());
+
+        let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_DEPTH);
+        let writer = tokio::spawn(proxied_send_loop(
+            write_half,
+            send_rx,
+            TransportId::new(1),
+            remote.clone(),
+            next_conn_id(),
+            pool.clone(),
+            stats.clone(),
+            "Test",
+            count_removal,
+        ));
+
+        let frame = vec![0xAB; 114];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !writer.is_finished() && Instant::now() < deadline {
+            let _ = send_tx.try_send(frame.clone());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(writer.is_finished(), "the writer never hit a write error");
+        assert_eq!(
+            stats.send_errors.load(Ordering::Relaxed),
+            1,
+            "the writer's error path must have run"
+        );
+
+        assert_eq!(
+            pool.lock().await.get(&remote).map(|c| c.mtu),
+            Some(1234),
+            "a failed writer removed the newer connection at its address"
+        );
+        assert_eq!(stats.removed.load(Ordering::Relaxed), 0);
+    }
+
+    /// A receive loop that ends on EOF must stop its writer rather than leave
+    /// it writing to a peer that has gone.
+    ///
+    /// The writer is parked on a peer that does not read, with a full queue.
+    /// The peer then half-closes, which ends the receive loop, and only
+    /// afterwards reads. A writer left running delivers every frame it had
+    /// queued; a stopped one delivers fewer.
+    #[tokio::test]
+    async fn proxied_receive_teardown_stops_the_writer() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(8).unwrap();
+        let listen = listener.local_addr().unwrap();
+
+        let client = TcpStream::connect(listen).await.unwrap();
+        socket2::SockRef::from(&client)
+            .set_send_buffer_size(64 * 1024)
+            .unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let remote = TransportAddr::from_string(&listen.to_string());
+        let (read_half, write_half) = client.into_split();
+
+        let (packet_tx, _packet_rx) = packet_channel(10);
+        let pool: ProxiedPool<()> = Arc::new(Mutex::new(HashMap::new()));
+        let stats = Arc::new(CountingStats::default());
+        let (send_tx, send_rx) = mpsc::channel(SEND_QUEUE_DEPTH);
+        let id = next_conn_id();
+        let send_task = tokio::spawn(proxied_send_loop(
+            write_half,
+            send_rx,
+            TransportId::new(1),
+            remote.clone(),
+            id,
+            pool.clone(),
+            stats.clone(),
+            "Test",
+            count_removal,
+        ));
+        let recv_task = tokio::spawn({
+            let pool = pool.clone();
+            let stats = stats.clone();
+            let remote = remote.clone();
+            async move {
+                proxied_receive_loop(
+                    read_half,
+                    TransportId::new(1),
+                    remote,
+                    id,
+                    packet_tx,
+                    pool,
+                    1400,
+                    stats,
+                    "Test",
+                    None,
+                    None,
+                    count_removal,
+                )
+                .await;
+            }
+        });
+        pool.lock().await.insert(
+            remote.clone(),
+            ProxiedConnection {
+                send_tx,
+                send_task,
+                recv_task,
+                mtu: 1400,
+                established_at: Instant::now(),
+                meta: (),
+                id,
+            },
+        );
+
+        // Fill without stopping at the first refusal, yielding so the writer
+        // runs, and never keep a sender past the fill.
+        let frame = vec![0xAB; 1400];
+        let mut queued = 0usize;
+        let mut refused = 0usize;
+        for _ in 0..8000 {
+            let sent = {
+                let guard = pool.lock().await;
+                guard
+                    .get(&remote)
+                    .map(|c| c.send_tx.try_send(frame.clone()).is_ok())
+            };
+            if sent == Some(true) {
+                queued += 1;
+            } else {
+                refused += 1;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let capacity = pool.lock().await.get(&remote).map(|c| c.send_tx.capacity());
+        assert_eq!(
+            capacity,
+            Some(0),
+            "setup did not park the writer: queued={queued} refused={refused}"
+        );
+        assert!(refused > 0, "setup never filled the queue: queued={queued}");
+
+        peer.shutdown().await.unwrap();
+        assert!(
+            wait_until(
+                || stats.removed.load(Ordering::Relaxed) == 1,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the receive loop should have torn the connection down on EOF"
+        );
+
+        let mut buf = vec![0u8; 64 * 1024];
+        let read = timeout(Duration::from_secs(10), async {
+            let mut total = 0usize;
+            loop {
+                match peer.read(&mut buf).await {
+                    Ok(0) | Err(_) => return total,
+                    Ok(n) => total += n,
+                }
+            }
+        })
+        .await
+        .expect("the connection was never closed toward the peer");
+        assert!(read > 0, "the kernel buffers held written frames");
+        assert!(
+            read < queued * frame.len(),
+            "the writer kept writing after its receive loop tore the connection down: \
+             read={read} queued_bytes={}",
+            queued * frame.len()
+        );
+    }
+
+    /// A receive loop's teardown must leave alone a newer entry at its address,
+    /// and must not run `on_remove` for it.
+    #[tokio::test]
+    async fn proxied_receive_teardown_leaves_a_newer_connection_at_the_same_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let client = TcpStream::connect(listen).await.unwrap();
+        let (server, peer_addr) = listener.accept().await.unwrap();
+        let remote = TransportAddr::from_string(&peer_addr.to_string());
+        let (read_half, _write_half) = server.into_split();
+
+        let (packet_tx, _packet_rx) = packet_channel(10);
+        let pool: ProxiedPool<()> = Arc::new(Mutex::new(HashMap::new()));
+        let stats = Arc::new(CountingStats::default());
+        pool.lock().await.insert(remote.clone(), successor());
+
+        drop(client);
+        proxied_receive_loop(
+            read_half,
+            TransportId::new(1),
+            remote.clone(),
+            next_conn_id(),
+            packet_tx,
+            pool.clone(),
+            1400,
+            stats.clone(),
+            "Test",
+            None,
+            None,
+            count_removal,
+        )
+        .await;
+        assert_eq!(
+            stats.recv_errors.load(Ordering::Relaxed),
+            1,
+            "the loop should have ended on EOF"
+        );
+
+        assert_eq!(
+            pool.lock().await.get(&remote).map(|c| c.mtu),
+            Some(1234),
+            "the teardown removed a newer connection at its address"
+        );
+        assert_eq!(
+            stats.removed.load(Ordering::Relaxed),
+            0,
+            "the teardown ran on_remove for a connection it did not remove"
+        );
     }
 }

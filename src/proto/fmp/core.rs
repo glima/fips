@@ -265,8 +265,6 @@ pub(crate) struct EstablishSnapshot {
     pub existing_peer_epoch: Option<[u8; 8]>,
     /// The existing peer has an established Noise session.
     pub has_session: bool,
-    /// The existing peer's session is healthy.
-    pub is_healthy: bool,
     /// The existing peer already holds a pending post-rekey session awaiting
     /// K-bit cutover. On XX this is one of the two dual-init tie-break states
     /// (the widened window IK never reached) — NOT an unconditional reject.
@@ -439,7 +437,7 @@ pub(crate) trait LifecycleView {
     /// timeout/failed predicate; the core decides retry-then-teardown.
     fn stale_connections(&self, now_ms: u64, timeout_ms: u64) -> Vec<ConnSnapshot>;
 
-    /// Snapshot every active peer with a session that is healthy, pre-computing
+    /// Snapshot every active peer with a session, pre-computing
     /// its rekey-relevant ages and timer predicates (see [`PeerSnapshot`]). The
     /// shell resolves every clock read here; the core applies the thresholds.
     fn rekey_peers(&self) -> Vec<PeerSnapshot>;
@@ -474,7 +472,7 @@ pub(crate) enum InboundDecision {
     /// same promote sequence as [`Promote`](InboundDecision::Promote). `peer` is
     /// the teardown / reconnect target.
     RestartThenPromote { peer: NodeAddr },
-    /// Same-epoch cross-connection resolved inline on `msg3`: a healthy session
+    /// Same-epoch cross-connection resolved inline on `msg3`: a session
     /// with no rekey of ours in flight received a concurrent `msg3` on a
     /// different link that declares no rekey — so it is a fresh dial crossing
     /// ours. `our_inbound_wins` (the larger-NodeAddr side) selects
@@ -484,7 +482,7 @@ pub(crate) enum InboundDecision {
         peer: NodeAddr,
         our_inbound_wins: bool,
     },
-    /// Same-epoch `msg3` on a healthy session, declared by its sender to replace
+    /// Same-epoch `msg3` on a session, declared by its sender to replace
     /// that very session: respond as the rekey responder. The shell extracts the
     /// fresh Noise session from the live
     /// connection, allocates a new index, and stores it as the peer's pending
@@ -658,7 +656,7 @@ impl Fmp {
             .collect()
     }
 
-    /// Decide the per-tick rekey choreography for the healthy peers the shell
+    /// Decide the per-tick rekey choreography for the peers the shell
     /// snapshotted. Reproduces the pre-refactor priority and phase grouping
     /// exactly:
     ///
@@ -773,7 +771,7 @@ impl Fmp {
     ///    ([`Mismatch`](RekeyClaim::Mismatch)) → [`ResendMsg2`], not a reject:
     ///    the sender has already committed to its pending session and the reject
     ///    path sends nothing back.
-    /// 4. Same epoch, no marker, different link, healthy session → inline
+    /// 4. Same epoch, no marker, different link, with a session → inline
     ///    [`CrossConnect`] (the XX widening: IK resolves this on `msg2`).
     ///    `our_inbound_wins` is the larger-NodeAddr side, matching
     ///    `cross_connection_winner(our, peer, /*outbound=*/ false)`. Taken
@@ -781,7 +779,7 @@ impl Fmp {
     ///    this tie-break cannot see that state, so declining here would diverge
     ///    the pair; the executor abandons the displaced rekey instead.
     /// 5. Same epoch, marker naming the session we hold
-    ///    ([`Matches`](RekeyClaim::Matches)), healthy session → [`RekeyRespond`],
+    ///    ([`Matches`](RekeyClaim::Matches)), with a session → [`RekeyRespond`],
     ///    whatever the local `rekey.enabled` says: that flag governs whether we
     ///    initiate rekeys, never whether we accept one, or an asymmetric setting
     ///    would diverge the two ends of the link.
@@ -866,11 +864,7 @@ impl Fmp {
                 // The `SwapToInboundSession` arm therefore abandons that rekey as
                 // part of the swap, the same way the rekey-responder arm does when
                 // it loses the dual-rekey tie-break.
-                if snap.rekey_claim == RekeyClaim::None
-                    && snap.different_link
-                    && snap.has_session
-                    && snap.is_healthy
-                {
+                if snap.rekey_claim == RekeyClaim::None && snap.different_link && snap.has_session {
                     // `cross_connection_winner(our, peer, this_is_outbound=false)`:
                     // the smaller node prefers its outbound, so our *inbound*
                     // wins iff we are the larger node (the exact negation of the
@@ -892,7 +886,7 @@ impl Fmp {
                 // timer. The sender's declaration matching the session we hold is
                 // the authoritative signal, and it is a property of the wire, not
                 // of our config.
-                if snap.rekey_claim == RekeyClaim::Matches && snap.has_session && snap.is_healthy {
+                if snap.rekey_claim == RekeyClaim::Matches && snap.has_session {
                     // Widened dual-init tie-break: both the still-in-progress and
                     // the already-pending states resolve by the smaller NodeAddr.
                     if snap.rekey_in_progress || snap.pending_new_session {

@@ -24,6 +24,7 @@ use crate::transport::socks5::{
     Socks5Auth, Socks5Dialer, SocksTarget, poll_connecting, proxied_receive_loop,
     proxied_send_loop,
 };
+use crate::transport::stream::{ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id};
 use stats::NymStats;
 
 use std::collections::HashMap;
@@ -358,12 +359,14 @@ impl NymTransport {
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
         let mtu = self.config.mtu();
+        let id = next_conn_id();
 
         let recv_task = tokio::spawn(async move {
             nym_receive_loop(
                 read_half,
                 transport_id,
                 remote_addr.clone(),
+                id,
                 packet_tx,
                 pool,
                 mtu,
@@ -378,6 +381,7 @@ impl NymTransport {
             send_rx,
             transport_id,
             addr.clone(),
+            id,
             self.pool.clone(),
             self.stats.clone(),
             "Nym",
@@ -391,6 +395,7 @@ impl NymTransport {
             mtu,
             established_at: Instant::now(),
             meta: (),
+            id,
         };
 
         let mut pool = self.pool.lock().await;
@@ -521,12 +526,14 @@ impl NymTransport {
         let pool = self.pool.clone();
         let recv_stats = self.stats.clone();
         let remote_addr = addr.clone();
+        let id = next_conn_id();
 
         let recv_task = tokio::spawn(async move {
             nym_receive_loop(
                 read_half,
                 transport_id,
                 remote_addr.clone(),
+                id,
                 packet_tx,
                 pool,
                 mtu,
@@ -541,6 +548,7 @@ impl NymTransport {
             send_rx,
             transport_id,
             addr.clone(),
+            id,
             self.pool.clone(),
             self.stats.clone(),
             "Nym",
@@ -554,6 +562,7 @@ impl NymTransport {
             mtu,
             established_at: Instant::now(),
             meta: (),
+            id,
         };
 
         if let Ok(mut pool) = self.pool.try_lock() {
@@ -576,11 +585,22 @@ impl NymTransport {
     }
 
     /// Close a specific connection asynchronously.
+    ///
+    /// Aborts the receive task and lets the writer finish the frames already
+    /// queued, within [`WRITER_DRAIN_TIMEOUT`], without waiting for it. This
+    /// mirrors `TcpTransport::close_connection_async`.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
-            conn.recv_task.abort();
-            conn.send_task.abort();
+            let ProxiedConnection {
+                send_tx,
+                send_task,
+                recv_task,
+                ..
+            } = conn;
+            drop(send_tx);
+            recv_task.abort();
+            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
             debug!(
                 transport_id = %self.transport_id,
                 remote_addr = %addr,
@@ -680,10 +700,12 @@ fn parse_target_addr(addr: &TransportAddr) -> Result<SocksTarget, TransportError
 /// exhaust, and the mixnet's Sphinx routing makes a first frame legitimately
 /// slow, so a TCP-scale deadline here would drop good connections to defend
 /// a cap that does not exist.
+#[allow(clippy::too_many_arguments)]
 async fn nym_receive_loop(
     reader: tokio::net::tcp::OwnedReadHalf,
     transport_id: TransportId,
     remote_addr: TransportAddr,
+    id: ConnId,
     packet_tx: PacketTx,
     pool: ProxiedPool<()>,
     mtu: u16,
@@ -693,6 +715,7 @@ async fn nym_receive_loop(
         reader,
         transport_id,
         remote_addr.clone(),
+        id,
         packet_tx,
         pool,
         mtu,
@@ -1025,6 +1048,193 @@ mod tests {
             .expect("timeout waiting for packet")
             .expect("channel closed");
         assert_eq!(received.data, frame);
+
+        nym.stop_async().await.unwrap();
+        dest.stop_async().await.unwrap();
+    }
+
+    // ========================================================================
+    // Connection identity and failure teardown
+    // ========================================================================
+
+    /// Poll `f` every 10ms until it holds or `limit` elapses.
+    async fn wait_until<F: FnMut() -> bool>(mut f: F, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if f() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A destination TCP transport behind a mock SOCKS5 proxy, and a started
+    /// Nym transport dialing through it.
+    async fn nym_via_mock_proxy() -> (
+        TcpTransport,
+        crate::transport::PacketRx,
+        NymTransport,
+        TransportAddr,
+    ) {
+        let (dest_tx, dest_rx) = packet_channel(32);
+        let dest_config = TcpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        };
+        let mut dest = TcpTransport::new(TransportId::new(100), None, dest_config, dest_tx);
+        dest.start_async().await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+
+        let mock = MockSocks5Server::new(dest_addr).await.unwrap();
+        let proxy_addr = mock.addr();
+        let _proxy_handle = mock.spawn();
+
+        let (nym_tx, _nym_rx) = packet_channel(32);
+        let nym_config = NymConfig {
+            socks5_addr: Some(proxy_addr.to_string()),
+            startup_timeout_secs: Some(5),
+            connect_timeout_ms: Some(5000),
+            ..Default::default()
+        };
+        let mut nym = NymTransport::new(TransportId::new(200), None, nym_config, nym_tx);
+        nym.start_async().await.unwrap();
+        let target = TransportAddr::from_string(&dest_addr.to_string());
+        (dest, dest_rx, nym, target)
+    }
+
+    /// A connection displaced from the pool by a newer one at the same address
+    /// must not remove the newer one when its own receive loop ends.
+    ///
+    /// Both are built by `promote_connection`, and the MTU marks which entry
+    /// is pooled. The last step checks the newer connection still removes its
+    /// own entry.
+    #[tokio::test]
+    async fn nym_displaced_connection_cannot_remove_its_successor() {
+        let (tx, _rx) = packet_channel(32);
+        let nym = NymTransport::new(TransportId::new(1), None, make_config(), tx);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let remote = TransportAddr::from_string(&listen.to_string());
+
+        let a = TcpStream::connect(listen).await.unwrap();
+        let (sa, _) = listener.accept().await.unwrap();
+        let b = TcpStream::connect(listen).await.unwrap();
+        let (sb, _) = listener.accept().await.unwrap();
+
+        nym.promote_connection(&remote, a, 1400);
+        nym.promote_connection(&remote, b, 1300);
+        {
+            let pool = nym.pool.lock().await;
+            assert_eq!(pool.len(), 1);
+            assert_eq!(pool.get(&remote).map(|c| c.mtu), Some(1300));
+        }
+
+        drop(sa);
+        assert!(
+            wait_until(
+                || nym.stats().snapshot().recv_errors == 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the displaced connection's receive loop should have read EOF"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            nym.pool.lock().await.get(&remote).map(|c| c.mtu),
+            Some(1300),
+            "the displaced connection's teardown removed its successor"
+        );
+
+        drop(sb);
+        assert!(
+            wait_until(
+                || nym.stats().snapshot().recv_errors == 2,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the newer connection's receive loop should have read EOF"
+        );
+        assert!(
+            wait_until(
+                || nym.pool.try_lock().map(|p| p.is_empty()).unwrap_or(false),
+                Duration::from_secs(2)
+            )
+            .await,
+            "the newer connection's teardown should remove its own entry"
+        );
+    }
+
+    /// A connection built by connect-on-send removes its own entry when the
+    /// far side closes.
+    #[tokio::test]
+    async fn nym_connect_teardown_removes_its_own_entry() {
+        let (mut dest, mut dest_rx, mut nym, target) = nym_via_mock_proxy().await;
+
+        let frame = build_msg1_frame();
+        nym.send_async(&target, &frame).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(5), dest_rx.recv())
+            .await
+            .expect("timeout waiting for packet")
+            .expect("channel closed");
+        assert_eq!(received.data, frame);
+        assert_eq!(nym.pool.lock().await.len(), 1);
+
+        dest.stop_async().await.unwrap();
+        assert!(
+            wait_until(
+                || nym.pool.try_lock().map(|p| p.is_empty()).unwrap_or(false),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the receive loop should remove its own entry"
+        );
+        assert_eq!(
+            nym.stats().snapshot().recv_errors,
+            1,
+            "the empty pool must be the receive loop's teardown"
+        );
+
+        nym.stop_async().await.unwrap();
+    }
+
+    // ========================================================================
+    // Deliberate close finishes the frames already queued
+    // ========================================================================
+
+    /// A frame queued immediately before a deliberate close must still reach
+    /// the peer through the proxy, and the close must still end the
+    /// connection at the far side.
+    #[tokio::test]
+    async fn nym_frame_queued_just_before_close_still_reaches_the_peer() {
+        let (mut dest, mut dest_rx, mut nym, target) = nym_via_mock_proxy().await;
+
+        let frame = build_msg1_frame();
+        nym.send_async(&target, &frame).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), dest_rx.recv())
+            .await
+            .expect("timeout waiting for the first frame")
+            .expect("channel closed");
+        assert_eq!(first.data, frame);
+
+        nym.send_async(&target, &frame).await.unwrap();
+        nym.close_connection_async(&target).await;
+
+        let second = tokio::time::timeout(Duration::from_secs(2), dest_rx.recv())
+            .await
+            .expect("a frame queued just before close was never written")
+            .expect("channel closed");
+        assert_eq!(second.data, frame);
+        assert!(
+            wait_until(
+                || dest.stats().snapshot().pool_inbound == 0,
+                Duration::from_secs(5)
+            )
+            .await,
+            "the close must still end the connection once the queue is written"
+        );
 
         nym.stop_async().await.unwrap();
         dest.stop_async().await.unwrap();

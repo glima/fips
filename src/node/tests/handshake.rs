@@ -217,13 +217,6 @@ async fn test_two_node_handshake_udp() {
 
     node_b.handle_encrypted_frame(encrypted_packet_b).await;
 
-    // Verify B's peer was touched (last_seen updated)
-    let peer_a = node_b.get_peer(&peer_a_node_addr).unwrap();
-    assert!(
-        peer_a.is_healthy(),
-        "Peer A on B should still be healthy after receiving encrypted frame"
-    );
-
     // === Phase 5: Encrypted frame B → A ===
 
     // Prepend inner header (timestamp + msg_type) as the real send path does
@@ -250,13 +243,6 @@ async fn test_two_node_handshake_udp() {
         .expect("Channel closed");
 
     node_a.handle_encrypted_frame(encrypted_packet_a).await;
-
-    // Verify A's peer was touched
-    let peer_b = node_a.get_peer(&peer_b_node_addr).unwrap();
-    assert!(
-        peer_b.is_healthy(),
-        "Peer B on A should still be healthy after receiving encrypted frame"
-    );
 
     // Clean up transports
     for (_, t) in node_a.transports.iter_mut() {
@@ -704,8 +690,6 @@ async fn test_cross_connection_both_initiate() {
 
     assert!(peer_b_on_a.has_session(), "Peer B on A should have session");
     assert!(peer_a_on_b.has_session(), "Peer A on B should have session");
-    assert!(peer_b_on_a.can_send(), "Peer B on A should be sendable");
-    assert!(peer_a_on_b.can_send(), "Peer A on B should be sendable");
 
     // The property the tie-break exists to produce: both ends kept the SAME
     // session, not merely a session each. The index pair is what makes that
@@ -1916,13 +1900,35 @@ async fn test_msg3_dual_rekey_won_frees_index() {
     stop_hs(&mut responder).await;
 }
 
+/// Complete a Noise XX handshake between two identities and return the
+/// initiator's session, standing in for the fresh keys a cross-connection swap
+/// installs.
+fn replacement_session(ours: &Identity, theirs: &Identity) -> crate::noise::NoiseSession {
+    use crate::noise::HandshakeState;
+
+    let mut initiator = HandshakeState::new_initiator(ours.keypair());
+    let mut responder = HandshakeState::new_responder(theirs.keypair());
+    initiator.set_local_epoch([0x11; 8]);
+    responder.set_local_epoch([0x22; 8]);
+
+    let msg1 = initiator.write_message_1().unwrap();
+    responder.read_message_1(&msg1).unwrap();
+    let msg2 = responder.write_message_2().unwrap();
+    initiator.read_message_2(&msg2).unwrap();
+    let msg3 = initiator.write_message_3().unwrap();
+    responder.read_message_3(&msg3).unwrap();
+
+    initiator.into_session().unwrap()
+}
+
 #[tokio::test]
 async fn test_msg3_resend_msg2_frees_index() {
-    // A declared rekey landing on a peer whose link is no longer healthy. The
-    // marker matches, so this is unambiguously a rekey and not a crossing dial;
-    // the classifier's health conjunct is what sends it to the duplicate arm,
-    // and the shell must then free the msg1-allocated index and leave the
-    // existing session alone.
+    // A declared rekey naming keys the responder no longer holds. Production
+    // reaches this when a cross-connection swap replaces the responder's keys
+    // for the peer while the peer's rekey is in flight: the msg3 marker then
+    // resolves to a mismatch, which is unambiguously a rekey and not a crossing
+    // dial, and the classifier sends it to the duplicate arm. The shell must
+    // then free the msg1-allocated index and leave the existing session alone.
     //
     // A bare second handshake will not reach this arm: it declares no rekey, and
     // an undeclared msg3 on a different link is a cross-connection, on which
@@ -1960,9 +1966,6 @@ async fn test_msg3_resend_msg2_frees_index() {
         .unwrap()
         .test_backdate_session_established(std::time::Duration::from_secs(120));
 
-    let before = responder.node.get_peer(&peer_addr).unwrap();
-    let session_before = (before.our_index(), before.their_index());
-
     // The rekey's msg1 allocates a fresh index; its msg3 then frees it on the
     // duplicate arm.
     let msg3b = drive_rekey_to_msg3(&mut initiator, &mut responder).await;
@@ -1972,20 +1975,67 @@ async fn test_msg3_resend_msg2_frees_index() {
         "the rekey msg1 allocated a fresh index"
     );
 
-    // The link goes quiet past the heartbeat threshold while the rekey is in
-    // flight, exactly as the tick loop would mark it. An unhealthy peer is not a
-    // rekey candidate, so the declared rekey falls through to the duplicate arm.
-    // Marked after the msg1/msg2 exchange, since nothing on the handshake path
-    // re-marks a peer connected but a later `touch` would.
+    // The index the msg3 marker declares: the responder's index as the
+    // initiator knows it.
+    let declared = initiator
+        .node
+        .get_peer(&responder_addr)
+        .unwrap()
+        .their_index()
+        .expect("initiator holds the responder's index");
+
+    // While the rekey is in flight, replace the responder's keys for the peer
+    // exactly as the outbound cross-connection swap does: a fresh index and
+    // session on the peer, the index map moved to the new index, the old index
+    // freed, and the peer's control machine told of the swap.
+    let fresh_index = responder.node.index_allocator.allocate().unwrap();
+    let session = replacement_session(responder.node.identity(), initiator.node.identity());
+    let (old_index, their_index, transport_id, link) = {
+        let peer = responder.node.get_peer_mut(&peer_addr).unwrap();
+        let their_index = peer
+            .their_index()
+            .expect("responder holds the peer's index");
+        let old_index = peer.replace_session(session, fresh_index, their_index);
+        (
+            old_index.expect("responder held an index before the swap"),
+            their_index,
+            peer.transport_id().expect("peer has a transport"),
+            peer.link_id(),
+        )
+    };
     responder
         .node
-        .get_peer_mut(&peer_addr)
-        .unwrap()
-        .mark_stale();
-    assert!(
-        !responder.node.get_peer(&peer_addr).unwrap().is_healthy(),
-        "the peer must be unhealthy, or this reaches the rekey-responder arm"
+        .peers_by_index
+        .remove(&(transport_id, old_index.as_u32()));
+    let _ = responder.node.index_allocator.free(old_index);
+    responder
+        .node
+        .peers_by_index
+        .insert((transport_id, fresh_index.as_u32()), peer_addr);
+    let acts = responder.node.peer_machines.get_mut(&link).unwrap().step(
+        crate::peer::machine::PeerEvent::CrossConnResolved {
+            outcome: crate::peer::machine::CrossConnOutcome::Swap {
+                our_index: fresh_index,
+                their_index,
+            },
+        },
+        Node::now_ms(),
+        &mut responder.node.index_allocator,
     );
+    assert!(
+        acts.is_empty(),
+        "cross-connection resolution is a pure observation"
+    );
+
+    assert_ne!(
+        responder.node.get_peer(&peer_addr).unwrap().our_index(),
+        Some(declared),
+        "the responder must no longer hold the keys the msg3 declares, or this \
+         reaches the rekey-responder arm"
+    );
+
+    let before = responder.node.get_peer(&peer_addr).unwrap();
+    let session_before = (before.our_index(), before.their_index());
 
     responder.node.handle_msg3(msg3b).await;
 

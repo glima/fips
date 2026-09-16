@@ -99,6 +99,50 @@ mod tests {
         );
     }
 
+    /// The traversal path binds its socket plainly on port zero, so the
+    /// socket reaches `adopt` carrying neither reuse flag. Adoption has to
+    /// add them after the fact, or the per-peer connected socket's bind to
+    /// the same address is refused with `EADDRINUSE`. Either flag on the
+    /// holder admits that bind on Linux, so the successful open cannot tell
+    /// whether both were set; each flag is also read back.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_adopted_plain_socket_carries_both_reuse_flags_and_admits_a_connected_socket_on_its_port()
+    {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("failed to bind the peer");
+        let peer_addr = peer.local_addr().expect("peer local address");
+
+        let plain = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("failed to bind the holder");
+        {
+            let probe = socket2::SockRef::from(&plain);
+            assert!(
+                !probe.reuse_address().expect("read SO_REUSEADDR"),
+                "precondition: a plain bind must arrive without SO_REUSEADDR",
+            );
+            assert!(
+                !probe.reuse_port().expect("read SO_REUSEPORT"),
+                "precondition: a plain bind must arrive without SO_REUSEPORT",
+            );
+        }
+
+        let adopted = UdpRawSocket::adopt(plain, 65536, 65536).expect("failed to adopt the holder");
+
+        let joined = super::open_connected_fd(adopted.local_addr(), peer_addr, 65536, 65536);
+        // SAFETY: `adopted` owns this fd and outlives every use of the borrow.
+        let fd = unsafe { BorrowedFd::borrow_raw(adopted.as_raw_fd()) };
+        let flags = socket2::SockRef::from(&fd);
+        let reuse_address = flags.reuse_address().expect("read SO_REUSEADDR");
+        let reuse_port = flags.reuse_port().expect("read SO_REUSEPORT");
+
+        if let Err(err) = &joined {
+            panic!("a connected socket must be able to bind the adopted socket's port: {err}");
+        }
+        assert!(reuse_address, "the adopted socket must carry SO_REUSEADDR");
+        assert!(reuse_port, "the adopted socket must carry SO_REUSEPORT");
+    }
+
     #[tokio::test]
     async fn test_async_udp_socket_send_recv() {
         let sock1 = UdpRawSocket::open("127.0.0.1:0".parse().unwrap(), 65536, 65536)
@@ -122,6 +166,131 @@ mod tests {
         assert_eq!(n, payload.len());
         assert_eq!(&buf[..n], payload);
         assert_eq!(src, addr1);
+    }
+
+    /// Measurement: duplicate local ports among many concurrently held
+    /// port-zero UDP binds, with reuse flags set before the bind and with
+    /// reuse flags set after it by `adopt`.
+    ///
+    /// A reuse flag set before a port-zero bind lets the kernel hand out a
+    /// port another flagged socket already holds; set after the bind it only
+    /// lets a later socket join. Three arms, each run over several trials:
+    ///
+    /// - `pre` flags each socket and then binds it, which is the ordering
+    ///   that must not be used for a traversal socket. It is built here from
+    ///   socket2 because no such helper exists in the tree. It must show
+    ///   duplicates: if it shows none, this run could not have seen the
+    ///   hazard, and the measurement fails rather than passing.
+    /// - `post` binds exactly as the traversal path does and then adopts,
+    ///   so `adopt` flags each socket while other threads are still binding.
+    /// - `orphan` holds sockets flagged before their bind, as a connected
+    ///   socket is, and counts later plain binds handed one of their ports.
+    ///
+    /// Coverage gap: nothing that gates runs this, because the port
+    /// allocator is probabilistic. It measures the kernel behaviour the
+    /// adoption path relies on, not the traversal binds themselves, so a
+    /// change that flagged those binds before binding would not turn it red.
+    ///
+    /// Run with:
+    ///   cargo test --lib transport::udp::io::tests::measure_duplicate_ephemeral_ports -- --ignored --nocapture
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "probabilistic kernel port-allocator measurement; run explicitly with --ignored --nocapture"]
+    fn measure_duplicate_ephemeral_ports_for_reuse_flags_set_before_and_after_bind() {
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::collections::HashSet;
+        use std::sync::Barrier;
+
+        const N: usize = 500;
+        const TRIALS: usize = 5;
+        const THREADS: usize = 8;
+        const HELD: usize = 200;
+        const BUF: usize = 65536;
+
+        fn plain_bind() -> std::net::UdpSocket {
+            std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("plain port-zero bind")
+        }
+
+        fn flagged_bind() -> std::net::UdpSocket {
+            let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("socket");
+            sock.set_reuse_port(true).expect("set SO_REUSEPORT");
+            sock.set_reuse_address(true).expect("set SO_REUSEADDR");
+            let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
+            sock.bind(&any.into()).expect("flagged port-zero bind");
+            sock.into()
+        }
+
+        /// Bind `n` sockets across `THREADS` threads released together,
+        /// adopting each one as soon as it is bound, and hold every socket
+        /// until all the threads have finished.
+        fn bind_concurrently(n: usize, bind: fn() -> std::net::UdpSocket) -> Vec<UdpRawSocket> {
+            let barrier = Barrier::new(THREADS);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..THREADS)
+                    .map(|t| {
+                        let share = n / THREADS + usize::from(t < n % THREADS);
+                        let barrier = &barrier;
+                        s.spawn(move || {
+                            barrier.wait();
+                            (0..share)
+                                .map(|_| UdpRawSocket::adopt(bind(), BUF, BUF).expect("adopt"))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("bind thread panicked"))
+                    .collect()
+            })
+        }
+
+        fn duplicates(socks: &[UdpRawSocket]) -> usize {
+            let distinct: HashSet<u16> = socks.iter().map(|s| s.local_addr().port()).collect();
+            socks.len() - distinct.len()
+        }
+
+        let mut pre = Vec::with_capacity(TRIALS);
+        let mut post = Vec::with_capacity(TRIALS);
+        let mut orphan = Vec::with_capacity(TRIALS);
+        for _ in 0..TRIALS {
+            pre.push(duplicates(&bind_concurrently(N, flagged_bind)));
+            post.push(duplicates(&bind_concurrently(N, plain_bind)));
+
+            let held: Vec<std::net::UdpSocket> = (0..HELD).map(|_| flagged_bind()).collect();
+            let held_ports: HashSet<u16> = held
+                .iter()
+                .map(|s| s.local_addr().expect("held local address").port())
+                .collect();
+            let later = bind_concurrently(N, plain_bind);
+            orphan.push(
+                later
+                    .iter()
+                    .filter(|s| held_ports.contains(&s.local_addr().port()))
+                    .count(),
+            );
+        }
+
+        eprintln!("duplicate ports per {N} binds, {THREADS} threads, {TRIALS} trials");
+        eprintln!("  pre    (flags before bind): {pre:?}");
+        eprintln!("  post   (flags after bind):  {post:?}");
+        eprintln!("  orphan ({HELD} held pre-flagged, later plain binds): {orphan:?}");
+
+        assert!(
+            pre.iter().sum::<usize>() > 0,
+            "the before-bind arm showed no duplicates, so this run could not have seen the \
+             hazard at N = {N}; raise N rather than reading the other arms as clean",
+        );
+        assert_eq!(
+            post.iter().sum::<usize>(),
+            0,
+            "flags set after bind: {post:?}"
+        );
+        assert_eq!(
+            orphan.iter().sum::<usize>(),
+            0,
+            "orphan collisions: {orphan:?}"
+        );
     }
 
     /// Microbench: compare per-packet `recv_from` (single recvmsg syscall +

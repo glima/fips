@@ -692,30 +692,30 @@ fn test_node_sendable_peers() {
     let mut node = make_node();
     let transport_id = TransportId::new(1);
 
-    // Add a healthy peer
+    // Add a peer
     let link_id1 = LinkId::new(1);
     let identity1 = seed_completed_connection(&mut node, link_id1, transport_id, 1000);
     let node_addr1 = *identity1.node_addr();
     node.promote_connection(link_id1, identity1, 2000).unwrap();
 
-    // Add another peer and mark it stale (still sendable)
+    // Add another peer
     let link_id2 = LinkId::new(2);
     let identity2 = seed_completed_connection(&mut node, link_id2, transport_id, 1000);
     node.promote_connection(link_id2, identity2, 2000).unwrap();
 
-    // Add a third peer and mark it disconnected (not sendable)
+    // Add a third peer
     let link_id3 = LinkId::new(3);
     let identity3 = seed_completed_connection(&mut node, link_id3, transport_id, 1000);
     let node_addr3 = *identity3.node_addr();
     node.promote_connection(link_id3, identity3, 2000).unwrap();
-    node.get_peer_mut(&node_addr3).unwrap().mark_disconnected();
 
     assert_eq!(node.peer_count(), 3);
-    assert_eq!(node.sendable_peer_count(), 2);
+    assert_eq!(node.sendable_peer_count(), 3);
 
     let sendable: Vec<_> = node.sendable_peers().collect();
-    assert_eq!(sendable.len(), 2);
+    assert_eq!(sendable.len(), 3);
     assert!(sendable.iter().any(|p| p.node_addr() == &node_addr1));
+    assert!(sendable.iter().any(|p| p.node_addr() == &node_addr3));
 }
 
 // === RX Loop Tests ===

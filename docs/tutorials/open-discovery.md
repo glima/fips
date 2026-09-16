@@ -200,11 +200,14 @@ You should see considerably more entries than before:
 Each entry has its own `connectivity` state, and every entry
 that appears here completed a handshake at least once: a peer
 whose advert was stale, or that NAT traversal never reached,
-produces no entry at all rather than a failed one. Healthy links
-read `connected`. A link not heard from recently reads `stale`
-and still carries traffic; one that dropped and is being retried
-reads `reconnecting`, and one explicitly torn down reads
-`disconnected`. Neither of the last two can send.
+produces no entry at all rather than a failed one. A link heard
+from within the last heartbeat interval
+(`node.heartbeat_interval_secs`, 10 seconds by default) reads
+`connected`. One silent for longer reads `stale`; it still
+carries traffic, and it reads `connected` again as soon as the
+peer is heard from. A link that stays silent until it is declared
+dead is removed, so its entry disappears rather than changing
+state.
 
 To get a list of just the connected links:
 

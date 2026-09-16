@@ -284,7 +284,7 @@ sudo fipsctl show peers
 
 In addition to your configured `test-us01` peer, you may see
 an entry for `test-us03` (the open-discovery test mesh node).
-It will have `connectivity` active and its own
+It will have `connectivity` `connected` and its own
 `transport_addr`. This peering appeared without you
 configuring anything — the test-mesh open-discovery node saw
 your advert, dialed the endpoint, and Noise XX established

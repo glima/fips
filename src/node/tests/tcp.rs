@@ -459,3 +459,43 @@ async fn test_api_disconnect_closes_the_tcp_connection() {
 
     cleanup_nodes(&mut nodes).await;
 }
+
+/// The Disconnect `api_disconnect` sends must reach the peer before the TCP
+/// connection closes, so the peer forgets this node at once.
+///
+/// The send only queues the Disconnect for the connection's writer, and the
+/// close follows in the same call. Nothing else removes the peer on node 1
+/// within the wait: its TCP EOF removes only the pool entry, and link-dead
+/// detection takes far longer.
+#[tokio::test]
+async fn api_disconnect_delivers_the_disconnect_before_closing() {
+    let mut nodes = vec![make_test_node_tcp().await, make_test_node_tcp().await];
+
+    initiate_handshake(&mut nodes, 0, 1).await;
+    drain_all_packets(&mut nodes, false).await;
+
+    let addr_0 = *nodes[0].node.node_addr();
+    let node1_npub = nodes[1].node.npub();
+    assert!(
+        nodes[1].node.get_peer(&addr_0).is_some(),
+        "node 1 should have node 0 as peer"
+    );
+
+    nodes[0]
+        .node
+        .api_disconnect(&node1_npub)
+        .await
+        .expect("api_disconnect should succeed");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while nodes[1].node.get_peer(&addr_0).is_some() && std::time::Instant::now() < deadline {
+        spanning_tree::process_available_packets(&mut nodes).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        nodes[1].node.get_peer(&addr_0).is_none(),
+        "node 1 never received the Disconnect sent before the close"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
