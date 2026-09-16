@@ -7,7 +7,7 @@ use crate::config::MmpConfig;
 use crate::node::REKEY_JITTER_SECS;
 use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
 use crate::proto::bloom::BloomFilter;
-use crate::proto::fmp::{NegotiationPayload, NodeProfile};
+use crate::proto::fmp::{NegotiationPayload, NodeProfile, RekeyMsg2Decision, RekeyMsg2Reject};
 use crate::proto::mmp::MmpPeerState;
 use crate::proto::stp::{ParentDeclaration, TreeCoordinate};
 use crate::transport::{LinkId, LinkStats, TransportAddr, TransportId};
@@ -29,6 +29,26 @@ use std::time::Instant;
 /// not establish that the rekey was answered by the peer already holding the
 /// link.
 type RekeyMsg2Completion = (Vec<u8>, NoiseSession, Option<[u8; 8]>, NodeAddr);
+
+/// How an initiator-side rekey msg2 ended, when the rekey cycle can continue.
+///
+/// Only [`Installed`](Self::Installed) consumes the rekey handshake. The other
+/// two leave it exactly as it was before the msg2 was read, so the peer's own
+/// msg2 can still complete the cycle.
+#[derive(Debug)]
+pub(crate) enum RekeyMsg2Step {
+    /// The static-key gate allowed the install: msg3 is written and the
+    /// handshake has become a session.
+    Installed(Box<RekeyMsg2Completion>),
+    /// The msg2 read and its static-key gate rejected it. `learned_peer` is the
+    /// address its static derives to.
+    Rejected {
+        reason: RekeyMsg2Reject,
+        learned_peer: NodeAddr,
+    },
+    /// The msg2 did not read or its negotiation payload did not decrypt.
+    Unreadable(NoiseError),
+}
 
 /// Draw a fresh per-session rekey jitter from `[-REKEY_JITTER_SECS, +REKEY_JITTER_SECS]`.
 fn draw_rekey_jitter() -> i64 {
@@ -1300,29 +1320,39 @@ impl ActivePeer {
 
     /// Complete the rekey by processing msg2 (initiator side, XX pattern).
     ///
-    /// Takes the stored handshake state, reads XX msg2, generates XX msg3, and
-    /// returns (msg3_bytes, completed NoiseSession, remote startup epoch,
-    /// learned peer node address). Clears the handshake-related fields but
-    /// leaves rekey_our_index for set_pending_session to use. The remote epoch
-    /// is surfaced so the caller can detect a peer restart (changed epoch)
-    /// during recovery rekey; the learned node address is surfaced so the
-    /// caller can gate the install on static-key continuity.
+    /// Reads XX msg2 against the stored handshake state, decrypts its
+    /// negotiation payload, and asks `decide` whether the static key it learned
+    /// may replace this peer's session. Only on
+    /// [`Install`](RekeyMsg2Decision::Install) is the handshake taken: msg3 is
+    /// written, the session is completed, and the msg1 resend fields are
+    /// cleared, leaving rekey_our_index for set_pending_session to use. The
+    /// remote epoch is surfaced so the caller can detect a peer restart
+    /// (changed epoch) during recovery rekey.
     ///
-    /// Completing the handshake here is deliberately identity-agnostic: this
-    /// is the crypto leaf, and whether the learned identity may replace the
-    /// peer's session is a decision, taken by the caller against the FMP core.
-    pub fn complete_rekey_msg2(
+    /// Nothing authenticates a msg2 before this read, and the index it names
+    /// travels in cleartext in the rekey msg1, so the message may be a forgery.
+    /// A msg2 that does not read, whose payload does not decrypt, or that the
+    /// gate rejects puts the handshake back in its pre-read state and returns
+    /// [`Unreadable`](RekeyMsg2Step::Unreadable) or
+    /// [`Rejected`](RekeyMsg2Step::Rejected), with the msg1 resend schedule
+    /// untouched. `Err` means the cycle cannot continue: there was no rekey
+    /// handshake, or completing an allowed install failed after the handshake
+    /// was taken.
+    ///
+    /// The peer does not decide whether the learned identity may replace its
+    /// session; the caller supplies that decision, taken against the FMP core,
+    /// and this runs it before anything is consumed.
+    pub(crate) fn complete_rekey_msg2(
         &mut self,
         msg2_bytes: &[u8],
         our_profile: NodeProfile,
-    ) -> Result<RekeyMsg2Completion, NoiseError> {
-        let mut hs = self
-            .rekey_handshake
-            .take()
-            .ok_or_else(|| NoiseError::WrongState {
-                expected: "rekey handshake in progress".to_string(),
-                got: "no handshake state".to_string(),
-            })?;
+        decide: impl FnOnce(NodeAddr) -> RekeyMsg2Decision,
+    ) -> Result<RekeyMsg2Step, NoiseError> {
+        let no_handshake = || NoiseError::WrongState {
+            expected: "rekey handshake in progress".to_string(),
+            got: "no handshake state".to_string(),
+        };
+        let hs = self.rekey_handshake.as_mut().ok_or_else(no_handshake)?;
 
         // Split msg2 into base XX part and any extra (negotiation payload)
         let base_size = crate::noise::HANDSHAKE_MSG2_SIZE;
@@ -1332,17 +1362,43 @@ impl ActivePeer {
             (msg2_bytes, None)
         };
 
-        hs.read_message_2(base_msg2)?;
+        // A failed read restores the handshake itself.
+        let rollback = match hs.try_read_message_2(base_msg2) {
+            Ok(rollback) => rollback,
+            Err(e) => return Ok(RekeyMsg2Step::Unreadable(e)),
+        };
+
+        // Must decrypt negotiation payload (if present) to keep hash chain
+        // in sync, even though rekey doesn't use the negotiation result.
+        if let Some(encrypted_neg) = extra
+            && let Err(e) = hs.decrypt_payload(encrypted_neg)
+        {
+            hs.restore_message_2(rollback);
+            return Ok(RekeyMsg2Step::Unreadable(e));
+        }
+
+        let Some(remote_static) = hs.remote_static() else {
+            hs.restore_message_2(rollback);
+            return Ok(RekeyMsg2Step::Unreadable(NoiseError::WrongState {
+                expected: "remote static learned from msg2".to_string(),
+                got: "no remote static".to_string(),
+            }));
+        };
+        let learned_peer = NodeAddr::from_pubkey(&remote_static.x_only_public_key().0);
+
+        if let RekeyMsg2Decision::Reject { reason } = decide(learned_peer) {
+            hs.restore_message_2(rollback);
+            return Ok(RekeyMsg2Step::Rejected {
+                reason,
+                learned_peer,
+            });
+        }
+
+        let mut hs = self.rekey_handshake.take().ok_or_else(no_handshake)?;
 
         // The remote static identity (and its startup epoch) is available once
         // msg2 has been read; capture it for peer-restart detection.
         let remote_epoch = hs.remote_epoch();
-
-        // Must decrypt negotiation payload (if present) to keep hash chain
-        // in sync, even though rekey doesn't use the negotiation result.
-        if let Some(encrypted_neg) = extra {
-            let _ = hs.decrypt_payload(encrypted_neg)?;
-        }
 
         // Declare this handshake a rekey of the session already installed, naming
         // the index the RESPONDER receives on (our `their_index`) so it can match
@@ -1377,17 +1433,26 @@ impl ActivePeer {
         }
         let session = hs.into_session()?;
 
-        // Derive the learned identity from the session rather than the consumed
-        // handshake so the address returned is provably the one the session
-        // about to be installed is bound to.
-        let learned_peer = NodeAddr::from_pubkey(&session.remote_static_xonly());
+        // The gate read the static from the handshake; the session copies the
+        // same key, so the address the gate allowed is the one the session about
+        // to be installed is bound to.
+        debug_assert_eq!(
+            NodeAddr::from_pubkey(&session.remote_static_xonly()),
+            learned_peer,
+            "the installed session is bound to the identity the gate allowed"
+        );
 
         // Clear msg1 resend state
         self.rekey_msg1 = None;
         self.rekey_msg1_next_resend = 0;
         self.rekey_msg1_resend_count = 0;
 
-        Ok((msg3, session, remote_epoch, learned_peer))
+        Ok(RekeyMsg2Step::Installed(Box::new((
+            msg3,
+            session,
+            remote_epoch,
+            learned_peer,
+        ))))
     }
 
     /// Complete the rekey by processing msg3 (responder side, XX pattern).

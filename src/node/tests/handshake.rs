@@ -2951,8 +2951,9 @@ async fn test_anonymous_self_connect_drop_disposes_machine() {
 
 /// Establish initiator↔responder, start a real rekey on the initiator, then
 /// let a third node answer the rekey msg1 with a valid XX msg2 built from its
-/// OWN static. The initiator must reject it and keep the established session
-/// live and usable.
+/// OWN static. The initiator must reject it, keep the established session live
+/// and usable, and keep the rekey cycle so the real responder's msg2, arriving
+/// second, still completes it.
 #[tokio::test]
 async fn test_rekey_msg2_foreign_static_rejected() {
     let mut rekey_config = Config::new();
@@ -3009,9 +3010,10 @@ async fn test_rekey_msg2_foreign_static_rejected() {
     );
 
     // The attacker observes the cleartext rekey msg1 on path and answers it
-    // first, under its own static. The real responder never sees it.
+    // first, under its own static. The real responder gets the same msg1 and
+    // answers it second.
     let rekey_msg1 = recv_phase(&mut responder.packet_rx, 1, "rekey msg1").await;
-    attacker.node.handle_msg1(rekey_msg1).await;
+    attacker.node.handle_msg1(rekey_msg1.clone()).await;
     let forged_msg2 = recv_phase(&mut initiator.packet_rx, 2, "forged rekey msg2").await;
     initiator.node.handle_msg2(forged_msg2).await;
 
@@ -3026,10 +3028,7 @@ async fn test_rekey_msg2_foreign_static_rejected() {
         peer.pending_new_session().is_none(),
         "a foreign static must not be installed as the pending session"
     );
-    assert!(
-        !peer.rekey_in_progress(),
-        "the rejected rekey cycle is abandoned"
-    );
+    assert!(peer.rekey_in_progress(), "the rejected rekey cycle is kept");
     assert_eq!(peer.link_id(), peer_link, "the peer keeps its link");
 
     // The established session is byte-for-byte the one we started with, still
@@ -3045,19 +3044,40 @@ async fn test_rekey_msg2_foreign_static_rejected() {
         "the established session stays bound to the real peer"
     );
 
-    // The rekey index is returned and its msg2 dispatch entry is gone, so a
-    // late (or replayed) msg2 on that index cannot re-enter the dead cycle.
+    // The rekey keeps its index and its msg2 dispatch entry, so the real
+    // responder's msg2 can still reach the cycle.
     assert_eq!(
         initiator.node.index_allocator.count(),
-        baseline,
-        "the rejected rekey must free its index"
+        baseline + 1,
+        "the kept rekey cycle keeps its index"
+    );
+    assert!(
+        initiator
+            .node
+            .pending_outbound
+            .contains_key(&(initiator.transport_id, rekey_index.as_u32())),
+        "the kept rekey cycle keeps its dispatch entry"
+    );
+    initiator.node.debug_assert_peer_maps_coherent();
+
+    // The real responder's msg2 completes the kept cycle.
+    responder.node.handle_msg1(rekey_msg1).await;
+    let genuine_msg2 = recv_phase(&mut initiator.packet_rx, 2, "genuine rekey msg2").await;
+    initiator.node.handle_msg2(genuine_msg2).await;
+    let peer = initiator.node.get_peer(&responder_addr).expect("kept");
+    assert_eq!(
+        peer.pending_new_session()
+            .expect("the genuine msg2 installs the pending session")
+            .remote_static_xonly(),
+        responder.node.identity().pubkey(),
+        "the pending session is bound to the real peer"
     );
     assert!(
         !initiator
             .node
             .pending_outbound
             .contains_key(&(initiator.transport_id, rekey_index.as_u32())),
-        "the rejected rekey's dispatch entry must not survive"
+        "the completed rekey's dispatch entry is gone"
     );
     initiator.node.debug_assert_peer_maps_coherent();
 
@@ -3160,12 +3180,12 @@ async fn test_forged_rekey_msg2_is_counted_as_rekey_static_mismatch_not_bad_stat
     // dropped earlier for some unrelated reason.
     assert_eq!(initiator.node.peer_count(), 1, "peer set unchanged");
     assert!(
-        !initiator
+        initiator
             .node
             .get_peer(&responder_addr)
             .unwrap()
             .rekey_in_progress(),
-        "the rejected rekey cycle is abandoned"
+        "the rejected rekey cycle is kept"
     );
 
     assert_eq!(
@@ -3178,6 +3198,211 @@ async fn test_forged_rekey_msg2_is_counted_as_rekey_static_mismatch_not_bad_stat
         0,
         "and is no longer hidden in the undifferentiated bucket"
     );
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+    stop_hs(&mut attacker).await;
+}
+
+/// A rekey msg2 that names the live rekey index but does not authenticate
+/// leaves the rekey cycle in place, and the responder's genuine msg2 then
+/// completes it on both ends.
+///
+/// Nothing authenticates a msg2 before the handshake reads it, and the index it
+/// names travels in cleartext in the rekey msg1, so anyone on the path can send
+/// one first. The forgery here carries a valid curve point as its ephemeral, so
+/// the read gets as far as mixing it into the handshake before failing.
+#[tokio::test]
+async fn test_rekey_msg2_that_fails_to_authenticate_keeps_the_cycle() {
+    use crate::noise::HANDSHAKE_MSG2_SIZE;
+    use crate::proto::fmp::wire::build_msg2;
+
+    let mut rekey_config = Config::new();
+    rekey_config.node.rekey.enabled = true;
+    rekey_config.node.rekey.after_secs = 30;
+
+    let mut initiator = make_hs_node(rekey_config).await;
+    let mut responder = make_hs_node(Config::new()).await;
+
+    let responder_addr =
+        *PeerIdentity::from_pubkey_full(responder.node.identity().pubkey_full()).node_addr();
+    let initiator_addr =
+        *PeerIdentity::from_pubkey_full(initiator.node.identity().pubkey_full()).node_addr();
+
+    let msg3 = drive_to_msg3(&mut initiator, &mut responder, 1000).await;
+    responder.node.handle_msg3(msg3).await;
+    assert_eq!(initiator.node.peer_count(), 1);
+    assert_eq!(
+        initiator.node.stats().handshake.bad_state,
+        0,
+        "the clean handshake charges no catch-all reject"
+    );
+
+    initiator
+        .node
+        .get_peer_mut(&responder_addr)
+        .unwrap()
+        .test_backdate_session_established(std::time::Duration::from_secs(120));
+    initiator.node.check_rekey().await;
+    let rekey_index = initiator
+        .node
+        .get_peer(&responder_addr)
+        .unwrap()
+        .rekey_our_index()
+        .expect("cadence started a rekey");
+
+    // The responder answers the rekey msg1; its msg2 is held back.
+    let rekey_msg1 = recv_phase(&mut responder.packet_rx, 1, "rekey msg1").await;
+    responder.node.handle_msg1(rekey_msg1).await;
+    let genuine_msg2 = recv_phase(&mut initiator.packet_rx, 2, "genuine rekey msg2").await;
+
+    // The forgery arrives first, from the responder's address, as a spoofed
+    // source would.
+    let mut forged_noise = Identity::generate().pubkey_full().serialize().to_vec();
+    forged_noise.resize(HANDSHAKE_MSG2_SIZE, 0xA5);
+    let forged = ReceivedPacket::new(
+        initiator.transport_id,
+        responder.addr.clone(),
+        build_msg2(SessionIndex::new(0x5EED_F00D), rekey_index, &forged_noise),
+    );
+    initiator.node.handle_msg2(forged).await;
+
+    assert_eq!(
+        initiator.node.stats().handshake.bad_state,
+        1,
+        "the forged msg2 reached the rekey read and was charged once"
+    );
+    let peer = initiator.node.get_peer(&responder_addr).unwrap();
+    assert!(
+        peer.rekey_in_progress(),
+        "a msg2 that fails to authenticate keeps the rekey cycle"
+    );
+    assert!(peer.pending_new_session().is_none());
+    assert!(
+        initiator
+            .node
+            .pending_outbound
+            .contains_key(&(initiator.transport_id, rekey_index.as_u32())),
+        "the kept rekey cycle keeps its dispatch entry"
+    );
+
+    // The genuine msg2 completes the cycle, and its msg3 reaches the responder.
+    initiator.node.handle_msg2(genuine_msg2).await;
+    let rekey_msg3 = recv_phase(&mut responder.packet_rx, 3, "rekey msg3").await;
+    responder.node.handle_msg3(rekey_msg3).await;
+
+    // Both ends hold a pending session, and each end's indices are the other's
+    // crossed: an initiator that lost the cycle, or completed it against a
+    // poisoned handshake, cannot pair with the responder this way.
+    let ours = initiator.node.get_peer(&responder_addr).unwrap();
+    let theirs = responder.node.get_peer(&initiator_addr).unwrap();
+    assert!(ours.pending_new_session().is_some(), "initiator installed");
+    assert!(
+        theirs.pending_new_session().is_some(),
+        "responder installed"
+    );
+    assert_eq!(
+        (ours.pending_our_index(), ours.pending_their_index()),
+        (theirs.pending_their_index(), theirs.pending_our_index()),
+        "the two ends of the rekey pair up"
+    );
+    initiator.node.debug_assert_peer_maps_coherent();
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}
+
+/// A rekey msg2 whose base message reads but whose negotiation payload does not
+/// decrypt leaves the rekey cycle in place, and the genuine msg2 still installs.
+///
+/// The base read succeeding is what separates this from a msg2 that fails to
+/// authenticate outright: the handshake has already taken the sender's
+/// ephemeral and static when the payload fails, so it has to be put back.
+#[tokio::test]
+async fn test_rekey_msg2_with_a_corrupt_negotiation_payload_keeps_the_cycle() {
+    use crate::noise::HANDSHAKE_MSG2_SIZE;
+    use crate::proto::fmp::wire::Msg2Header;
+
+    let mut rekey_config = Config::new();
+    rekey_config.node.rekey.enabled = true;
+    rekey_config.node.rekey.after_secs = 30;
+
+    let mut initiator = make_hs_node(rekey_config).await;
+    let mut responder = make_hs_node(Config::new()).await;
+    let mut attacker = make_hs_node(Config::new()).await;
+
+    let responder_addr =
+        *PeerIdentity::from_pubkey_full(responder.node.identity().pubkey_full()).node_addr();
+
+    let msg3 = drive_to_msg3(&mut initiator, &mut responder, 1000).await;
+    responder.node.handle_msg3(msg3).await;
+    assert_eq!(initiator.node.peer_count(), 1);
+    assert_eq!(initiator.node.stats().handshake.bad_state, 0);
+
+    initiator
+        .node
+        .get_peer_mut(&responder_addr)
+        .unwrap()
+        .test_backdate_session_established(std::time::Duration::from_secs(120));
+    initiator.node.check_rekey().await;
+    let rekey_index = initiator
+        .node
+        .get_peer(&responder_addr)
+        .unwrap()
+        .rekey_our_index()
+        .expect("cadence started a rekey");
+
+    // The attacker answers the rekey msg1 with a valid msg2 of its own, and one
+    // byte of the trailing negotiation payload is flipped on the way.
+    let rekey_msg1 = recv_phase(&mut responder.packet_rx, 1, "rekey msg1").await;
+    attacker.node.handle_msg1(rekey_msg1.clone()).await;
+    let mut corrupt_msg2 = recv_phase(&mut initiator.packet_rx, 2, "attacker rekey msg2").await;
+    let header = Msg2Header::parse(&corrupt_msg2.data).expect("msg2 header");
+    assert!(
+        corrupt_msg2.data.len() > header.noise_msg2_offset + HANDSHAKE_MSG2_SIZE,
+        "the msg2 must carry a negotiation payload past the base message"
+    );
+    let last = corrupt_msg2.data.len() - 1;
+    corrupt_msg2.data[last] ^= 0x01;
+    initiator.node.handle_msg2(corrupt_msg2).await;
+
+    assert_eq!(
+        initiator.node.stats().handshake.bad_state,
+        1,
+        "the corrupt msg2 reached the rekey read and was charged once"
+    );
+    assert_eq!(
+        initiator.node.stats().handshake.rekey_static_mismatch,
+        0,
+        "the payload failed before the static-key gate"
+    );
+    let peer = initiator.node.get_peer(&responder_addr).unwrap();
+    assert!(
+        peer.rekey_in_progress(),
+        "a msg2 whose payload fails to decrypt keeps the rekey cycle"
+    );
+    assert!(peer.pending_new_session().is_none());
+    assert!(
+        initiator
+            .node
+            .pending_outbound
+            .contains_key(&(initiator.transport_id, rekey_index.as_u32())),
+        "the kept rekey cycle keeps its dispatch entry"
+    );
+
+    // The real responder's msg2 installs.
+    responder.node.handle_msg1(rekey_msg1).await;
+    let genuine_msg2 = recv_phase(&mut initiator.packet_rx, 2, "genuine rekey msg2").await;
+    initiator.node.handle_msg2(genuine_msg2).await;
+    let peer = initiator.node.get_peer(&responder_addr).unwrap();
+    assert_eq!(
+        peer.pending_new_session()
+            .expect("the genuine msg2 installs the pending session")
+            .remote_static_xonly(),
+        responder.node.identity().pubkey(),
+        "the pending session is bound to the real peer"
+    );
+    initiator.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
     stop_hs(&mut responder).await;

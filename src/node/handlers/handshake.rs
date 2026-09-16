@@ -12,17 +12,16 @@ use crate::node::dataplane::PeerActionCtx;
 use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
-use crate::peer::ActivePeer;
 use crate::peer::machine::{
     CrossConnOutcome, HandshakeCrypto, PeerAction, PeerEvent, PeerMachine, TimerKind,
 };
+use crate::peer::{ActivePeer, RekeyMsg2Step};
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, Msg3Header, build_msg2, build_msg3};
 use crate::proto::fmp::{
     DialMsg2Decision, DialMsg2Reject, DialMsg2Snapshot, Disconnect, DisconnectReason,
     EPOCH_RESTART_MIN_INTERVAL_SECS, EstablishSnapshot, InboundDecision, InboundReject,
-    NegotiationPayload, OutboundSnapshot, PromotionResult, RekeyClaim, RekeyMsg2Decision,
-    RekeyMsg2Reject, RekeyMsg2Snapshot, WireOutcome, cross_connection_winner,
-    decide_fmp_negotiation,
+    NegotiationPayload, OutboundSnapshot, PromotionResult, RekeyClaim, RekeyMsg2Reject,
+    RekeyMsg2Snapshot, WireOutcome, cross_connection_winner, decide_fmp_negotiation,
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
 use crate::utils::index::SessionIndex;
@@ -583,32 +582,33 @@ impl Node {
 
                 let mut rekey_completed = false;
                 let our_profile = self.node_profile();
+                // Static-key continuity gate. The rekey msg2 was matched to this
+                // peer by the session index WE allocated, which travels in the
+                // cleartext rekey msg1 header and is observable on path; under
+                // XX the responder's static is learned from msg2 rather than
+                // pinned a priori, so crypto success alone does not prove the
+                // peer already holding this link is the one that answered. The
+                // core decides, inside complete_rekey_msg2 and before the
+                // handshake is consumed. A reject costs the established session
+                // nothing: its send/recv cipher state is never touched here and
+                // set_remote_epoch is confined to the install arm. It costs the
+                // rekey cycle nothing either: the handshake is restored to its
+                // pre-read state and the msg1 resend schedule is untouched, so
+                // the peer's genuine msg2 can still complete the cycle.
+                let fmp = &self.fmp;
+                let continuity = |learned_peer| {
+                    fmp.rekey_outbound(&RekeyMsg2Snapshot {
+                        established_peer: peer_node_addr,
+                        learned_peer,
+                    })
+                };
                 if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
-                    match peer.complete_rekey_msg2(noise_msg2, our_profile) {
-                        Ok((msg3_bytes, session, remote_epoch, learned_peer)) => {
-                            // Static-key continuity gate. The rekey msg2 was
-                            // matched to this peer by the session index WE
-                            // allocated, which travels in the cleartext rekey
-                            // msg1 header and is observable on path; under XX
-                            // the responder's static is learned from msg2
-                            // rather than pinned a priori, so crypto success
-                            // alone does not prove the peer already holding
-                            // this link is the one that answered. The core
-                            // decides. A Reject costs the established session
-                            // nothing: its send/recv cipher state is never
-                            // touched here and set_remote_epoch is confined to
-                            // the Install arm, so the working session survives
-                            // intact and usable. The rekey cycle, by contrast,
-                            // is already gone — complete_rekey_msg2 above
-                            // consumed the handshake state and cleared the
-                            // msg1-resend fields — which is why the reject arm
-                            // must abandon the cycle rather than retry it.
-                            let continuity = self.fmp.rekey_outbound(&RekeyMsg2Snapshot {
-                                established_peer: peer_node_addr,
-                                learned_peer,
-                            });
-                            match continuity {
-                                RekeyMsg2Decision::Install => {
+                    match peer.complete_rekey_msg2(noise_msg2, our_profile, continuity) {
+                        Ok(step) => {
+                            match step {
+                                RekeyMsg2Step::Installed(completion) => {
+                                    let (msg3_bytes, session, remote_epoch, _learned_peer) =
+                                        *completion;
                                     let our_index =
                                         peer.rekey_our_index().unwrap_or(header.receiver_idx);
                                     // Detect a peer restart: the epoch carried in this
@@ -716,32 +716,45 @@ impl Node {
                                             HandshakeReject::BadState,
                                         ));
                                     }
+                                    self.pending_outbound.remove(&key);
                                 }
-                                RekeyMsg2Decision::Reject {
+                                RekeyMsg2Step::Rejected {
                                     reason: RekeyMsg2Reject::StaticMismatch,
+                                    learned_peer,
                                 } => {
-                                    // Not our peer: the freshly derived session
-                                    // is never installed (it falls out of
-                                    // scope here), this rekey cycle is
-                                    // abandoned, and the current session, its
+                                    // Not our peer: no session was derived, no
+                                    // msg3 is sent, and the current session, its
                                     // indices and its recorded epoch are left
-                                    // exactly as they were. No msg3 is sent,
-                                    // so the impostor learns nothing beyond
-                                    // what it already observed on the wire.
+                                    // exactly as they were, so the impostor
+                                    // learns nothing beyond what it already
+                                    // observed on the wire. The rekey cycle and
+                                    // its dispatch entry stay for the peer's own
+                                    // msg2.
                                     warn!(
                                         peer = %display_name,
                                         established = %peer_node_addr,
                                         learned = %learned_peer,
                                         "rekey-msg2 initiator: learned static is not the established peer, keeping current session"
                                     );
-                                    if let Some(idx) = peer.abandon_rekey() {
-                                        if let Some(tid) = peer.transport_id() {
-                                            self.peers_by_index.remove(&(tid, idx.as_u32()));
-                                        }
-                                        let _ = self.index_allocator.free(idx);
-                                    }
                                     self.stats_mut().record_reject(RejectReason::Handshake(
                                         HandshakeReject::RekeyStaticMismatch,
+                                    ));
+                                }
+                                RekeyMsg2Step::Unreadable(e) => {
+                                    // The msg2 may be a forgery naming our
+                                    // cleartext rekey index. The handshake was
+                                    // restored, so keep the cycle and its
+                                    // dispatch entry for the genuine msg2. If
+                                    // none arrives, the msg1 resend budget
+                                    // abandons the cycle as it would for a lost
+                                    // one.
+                                    debug!(
+                                        peer = %display_name,
+                                        error = %e,
+                                        "Rekey msg2 did not authenticate, keeping the rekey cycle"
+                                    );
+                                    self.stats_mut().record_reject(RejectReason::Handshake(
+                                        HandshakeReject::BadState,
                                     ));
                                 }
                             }
@@ -760,20 +773,23 @@ impl Node {
                             }
                             self.stats_mut()
                                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                            self.pending_outbound.remove(&key);
                         }
                     }
+                } else {
+                    self.pending_outbound.remove(&key);
                 }
 
                 // Feed the control machine the completed-rekey observation so its
-                // shadow index and rekey phase stay coherent. Only on success —
-                // the failure path above reverts the rekey and leaves the machine
+                // shadow index and rekey phase stay coherent. Only on an install
+                // with its msg3 sent — every other path above either keeps the
+                // cycle as it was or abandons it, and leaves the machine
                 // untouched. The crypto effect already ran inline; this emits no
                 // action.
                 if rekey_completed {
                     self.observe_rekey_msg2(&peer_node_addr, header.sender_idx);
                 }
 
-                self.pending_outbound.remove(&key);
                 return;
             }
 

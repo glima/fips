@@ -557,9 +557,9 @@ pub(crate) enum RekeyMsg2Decision {
     /// cutover, the unchanged pre-existing behaviour.
     Install,
     /// The rekey was answered by some other identity: drop this `msg2` with a
-    /// handshake reject, abandon the rekey cycle, and leave the established
-    /// session completely undisturbed. `reason` selects only the diagnostic
-    /// log line.
+    /// handshake reject, keep the rekey cycle so the established peer's own
+    /// `msg2` can still complete it, and leave the established session
+    /// completely undisturbed. `reason` selects only the diagnostic log line.
     Reject { reason: RekeyMsg2Reject },
 }
 
@@ -939,8 +939,8 @@ impl Fmp {
     /// A rekey may only replace the session of the peer that already holds the
     /// link, so the identity learned from `msg2` must derive to the established
     /// peer's node address. Anything else is
-    /// [`Reject`](RekeyMsg2Decision::Reject) — the shell abandons the rekey and
-    /// keeps the current session. A match is
+    /// [`Reject`](RekeyMsg2Decision::Reject) — the shell drops the `msg2`, keeps
+    /// the rekey cycle and keeps the current session. A match is
     /// [`Install`](RekeyMsg2Decision::Install), the unchanged legitimate path.
     pub(crate) fn rekey_outbound(&self, snap: &RekeyMsg2Snapshot) -> RekeyMsg2Decision {
         if snap.learned_peer != snap.established_peer {

@@ -210,11 +210,11 @@ pub enum HandshakeReject {
     /// Initiator-side rekey msg2 completed the Noise read, but the static
     /// key it revealed is not the key the established session is bound to
     /// — the msg2 did not come from the peer we are rekeying with. The
-    /// rekey cycle is abandoned and the working session is left untouched.
-    /// Unlike the rest of the cluster this arm cannot be reached by
-    /// routine handshake noise: the rekey msg1 header travels in the
-    /// clear, so a sustained rate here means an on-path attacker is
-    /// forging rekey msg2 and suppressing key rotation. Tracked via
+    /// msg2 is dropped, the rekey cycle is kept for the peer's own msg2, and
+    /// the working session is left untouched. Unlike the rest of the cluster
+    /// this arm cannot be reached by routine handshake noise: the rekey msg1
+    /// header travels in the clear, so a sustained rate here means an on-path
+    /// attacker is forging rekey msg2. Tracked via
     /// [`HandshakeStats::rekey_static_mismatch`](crate::node::stats::HandshakeStats).
     RekeyStaticMismatch,
 }

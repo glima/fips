@@ -743,6 +743,18 @@ with v0.5.x or earlier peers.
   socket is adopted, after its bind, so the traversal bind still receives a
   port no other socket holds.
 
+#### Link rekey
+
+- A forged rekey msg2 no longer ends the rekey cycle. The initiator matches
+  msg2 to the rekey by an index that rekey msg1 carries in cleartext, so anyone
+  on the path could answer first, either with a msg2 that does not authenticate
+  or with a valid one under another static key, and either one abandoned the
+  cycle, so rotation could be suppressed for as long as the forgeries
+  continued. The initiator now restores its handshake after such a msg2 and
+  keeps the cycle, and the peer's own msg2 completes the rekey. Each forgery
+  costs the initiator the msg2 key agreement until the cycle ends; the msg1
+  resend budget bounds that. The wire format is unchanged.
+
 #### Control socket
 
 - `show_links` (`fipsctl show links`) now reports the traffic a link has

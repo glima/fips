@@ -157,9 +157,9 @@ pub struct HandshakeStats {
     pub unknown_connection: u64,
     /// Initiator-side rekey msg2 read cleanly but revealed a static key
     /// other than the one the established session is bound to, so the
-    /// rekey cycle was abandoned and the working session kept. A
-    /// sustained rate here is an on-path attacker forging rekey msg2 and
-    /// suppressing key rotation, not routine handshake noise.
+    /// msg2 was dropped, and the rekey cycle and the working session were
+    /// kept. A sustained rate here is an on-path attacker forging rekey
+    /// msg2, not routine handshake noise.
     pub rekey_static_mismatch: u64,
 }
 

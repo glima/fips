@@ -8,6 +8,7 @@
 mod active;
 pub(crate) mod machine;
 
+pub(crate) use active::RekeyMsg2Step;
 pub use active::{ActivePeer, ConnectivityState};
 
 use crate::NodeAddr;
