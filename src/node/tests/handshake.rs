@@ -1885,6 +1885,7 @@ async fn test_msg3_dual_rekey_won_frees_index() {
     let peer_link = responder.node.get_peer(&peer_addr).unwrap().link_id();
     assert_eq!(responder.node.peer_machines.len(), 1);
     assert!(responder.node.peer_machines.contains_key(&peer_link));
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
     assert!(
         responder
@@ -2057,6 +2058,7 @@ async fn test_msg3_resend_msg2_frees_index() {
     let peer_link = responder.node.get_peer(&peer_addr).unwrap().link_id();
     assert_eq!(responder.node.peer_machines.len(), 1);
     assert!(responder.node.peer_machines.contains_key(&peer_link));
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
     assert!(
         responder
@@ -2113,6 +2115,7 @@ async fn test_inbound_machine_born_at_msg1_and_crystallized_at_promote() {
         ));
         assert_eq!(machine.our_index(), leg_index);
     }
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
 
     // msg3 promotes; the SAME machine survives and crystallizes in place.
@@ -2131,6 +2134,7 @@ async fn test_inbound_machine_born_at_msg1_and_crystallized_at_promote() {
         .expect("machine survives promotion");
     assert_eq!(machine.state(), PeerState::Established { addr: peer_addr });
     assert_eq!(machine.our_index(), peer_index);
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
 
     // The initiator's dial-persisted machine crystallized in place too.
@@ -2148,6 +2152,7 @@ async fn test_inbound_machine_born_at_msg1_and_crystallized_at_promote() {
             addr: responder_addr
         }
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -2182,6 +2187,7 @@ async fn test_msg3_crypto_fail_disposes_leg_machine() {
         0,
         "msg1-allocated index returned"
     );
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -2242,6 +2248,7 @@ async fn test_msg3_rekey_respond_disposes_leg_machine() {
         "the rekey window leg's machine is disposed with the leg"
     );
     assert!(responder.node.peer_machines.contains_key(&peer_link));
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -2697,7 +2704,9 @@ async fn test_fresh_dial_crossing_our_rekey_converges() {
         "the displaced rekey must leave no pending session behind"
     );
     assert!(on_responder.has_session());
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -2742,6 +2751,7 @@ async fn test_anonymous_dial_births_identityless_machine_at_leg_birth() {
         PeerState::Discovered,
         "no event is dispatched on the inline dial path"
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     let mut initiator = initiator;
@@ -2763,6 +2773,7 @@ async fn test_anonymous_msg2_crystallizes_identity_and_promotes() {
         .await
         .expect("anonymous dial");
     let leg_link = initiator.node.connections().next().unwrap().1.link_id();
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     // Responder answers msg1 with msg2; the initiator's msg2 processing learns
@@ -2798,6 +2809,7 @@ async fn test_anonymous_msg2_crystallizes_identity_and_promotes() {
             addr: responder_addr
         }
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     // Complete the exchange so the responder promotes too, and both sides
@@ -2805,6 +2817,7 @@ async fn test_anonymous_msg2_crystallizes_identity_and_promotes() {
     let msg3_pkt = recv_phase(&mut responder.packet_rx, 3, "msg3").await;
     responder.node.handle_msg3(msg3_pkt).await;
     assert_eq!(responder.node.peer_count(), 1);
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -2933,6 +2946,7 @@ async fn test_anonymous_self_connect_drop_disposes_machine() {
          outbound leg must not take it down"
     );
 
+    #[cfg(debug_assertions)]
     node.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut node).await;
@@ -3058,6 +3072,7 @@ async fn test_rekey_msg2_foreign_static_rejected() {
             .contains_key(&(initiator.transport_id, rekey_index.as_u32())),
         "the kept rekey cycle keeps its dispatch entry"
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     // The real responder's msg2 completes the kept cycle.
@@ -3079,6 +3094,7 @@ async fn test_rekey_msg2_foreign_static_rejected() {
             .contains_key(&(initiator.transport_id, rekey_index.as_u32())),
         "the completed rekey's dispatch entry is gone"
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     // ...and it is still usable: the initiator encrypts under the surviving
@@ -3306,6 +3322,7 @@ async fn test_rekey_msg2_that_fails_to_authenticate_keeps_the_cycle() {
         (theirs.pending_their_index(), theirs.pending_our_index()),
         "the two ends of the rekey pair up"
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -3402,6 +3419,7 @@ async fn test_rekey_msg2_with_a_corrupt_negotiation_payload_keeps_the_cycle() {
         responder.node.identity().pubkey(),
         "the pending session is bound to the real peer"
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -3463,6 +3481,7 @@ async fn test_rekey_msg2_matching_static_installs() {
             .contains_key(&(initiator.transport_id, rekey_index.as_u32())),
         "the rekey index maps to the peer, awaiting K-bit cutover"
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -3577,6 +3596,7 @@ async fn test_dial_msg2_foreign_static_rejected() {
         baseline,
         "the rejected dial must free the index it allocated"
     );
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     // The gate sits ahead of the msg3 send, so the impostor's handshake is
@@ -3703,12 +3723,14 @@ async fn test_dial_msg2_matching_static_promotes() {
     assert_eq!(initiator.node.peer_count(), 1);
     let peer = initiator.node.get_peer(&responder_addr).expect("promoted");
     assert_eq!(peer.link_id(), leg_link, "promote keeps the leg's link");
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     // The responder completes its own side from the msg3 the gate let through.
     let msg3 = recv_phase(&mut responder.packet_rx, 3, "msg3").await;
     responder.node.handle_msg3(msg3).await;
     assert_eq!(responder.node.peer_count(), 1);
+    #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
@@ -3762,6 +3784,7 @@ async fn test_anonymous_dial_msg2_promotes_whoever_answers() {
     );
     let peer = initiator.node.get_peer(&responder_addr).expect("promoted");
     assert_eq!(peer.link_id(), leg_link);
+    #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
 
     let msg3 = recv_phase(&mut responder.packet_rx, 3, "msg3").await;
