@@ -3741,7 +3741,10 @@ fn handshake_presence_tracks_the_carrier_not_the_noise_handles() {
             "rekey-msg2 discriminator: {when}"
         );
         // Fires the live-carrier coherence assertion; a machine that had gone
-        // invisible would panic here rather than fail an assert_eq above.
+        // invisible would panic here rather than fail an assert_eq above. The
+        // helper only exists in debug builds, so the rest of this test carries
+        // on without it under `--release`.
+        #[cfg(debug_assertions)]
         node.debug_assert_peer_maps_coherent();
     };
 

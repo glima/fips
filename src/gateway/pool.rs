@@ -5,7 +5,7 @@
 //! with conntrack to determine active sessions.
 
 use crate::NodeAddr;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv6Addr;
 use std::time::Instant;
 use tracing::{debug, info};
@@ -93,25 +93,127 @@ pub struct MappingInfo {
     pub last_ref_secs: u64,
 }
 
-/// Trait for querying conntrack session counts.
+/// Path the conntrack table is read from.
+const CONNTRACK_PROC_PATH: &str = "/proc/net/nf_conntrack";
+
+/// Active conntrack sessions counted by destination address.
+///
+/// Taken once per tick, so the pool does a map lookup per mapping instead of
+/// reading and scanning the whole conntrack table per mapping under its lock.
+#[derive(Debug, Clone, Default)]
+pub struct ConntrackSnapshot {
+    sessions: HashMap<Ipv6Addr, u32>,
+}
+
+impl ConntrackSnapshot {
+    /// Build a snapshot from counts already keyed by destination address.
+    pub fn from_counts(sessions: HashMap<Ipv6Addr, u32>) -> Self {
+        Self { sessions }
+    }
+
+    /// Sessions whose destination is `virtual_ip`, or zero if there are none.
+    pub fn sessions_for(&self, virtual_ip: Ipv6Addr) -> u32 {
+        self.sessions.get(&virtual_ip).copied().unwrap_or(0)
+    }
+
+    /// Number of distinct destination addresses the snapshot saw.
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Whether the snapshot saw no sessions at all.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
+/// Trait for taking a conntrack session snapshot.
 pub trait ConntrackQuerier: Send + Sync {
-    /// Returns the number of active conntrack entries whose original
-    /// destination matches the given virtual IP.
-    fn active_sessions(&self, virtual_ip: Ipv6Addr) -> Result<u32, std::io::Error>;
+    /// Read the conntrack table once and count sessions by destination.
+    fn snapshot(&self) -> Result<ConntrackSnapshot, std::io::Error>;
 }
 
 /// Conntrack querier that parses /proc/net/nf_conntrack.
 pub struct ProcConntrack;
 
 impl ConntrackQuerier for ProcConntrack {
-    fn active_sessions(&self, virtual_ip: Ipv6Addr) -> Result<u32, std::io::Error> {
-        let content = std::fs::read_to_string("/proc/net/nf_conntrack")?;
-        let target = virtual_ip.to_string();
-        let count = content
-            .lines()
-            .filter(|line| line.contains(&format!("dst={target}")))
-            .count();
-        Ok(count as u32)
+    fn snapshot(&self) -> Result<ConntrackSnapshot, std::io::Error> {
+        let content = std::fs::read_to_string(CONNTRACK_PROC_PATH)?;
+        Ok(ConntrackSnapshot::from_counts(parse_conntrack(&content)))
+    }
+}
+
+/// Count conntrack lines by the destination addresses they name.
+///
+/// Every `dst=` value is parsed as an address and compared as an address. The
+/// kernel prints tuples as `src=%pI6 dst=%pI6`, the full uncompressed form with
+/// leading zeros, so a session to `fd01::1` is written
+/// `dst=fd01:0000:0000:0000:0000:0000:0000:0001`; the previous code searched
+/// each line for the address's compressed `Display` form, which cannot occur in
+/// a fixed-width field, so it counted nothing on any kernel.
+///
+/// A conntrack line carries the original and the reply tuple, each with its own
+/// `dst=`, and the line is counted once per distinct address among them. That
+/// keeps the meaning the count had before, which was "this line mentions the
+/// address". A value that does not parse as an IPv6 address is skipped, which
+/// is how IPv4 lines and any future field are ignored.
+fn parse_conntrack(content: &str) -> HashMap<Ipv6Addr, u32> {
+    let mut counts: HashMap<Ipv6Addr, u32> = HashMap::new();
+    let mut seen: HashSet<Ipv6Addr> = HashSet::new();
+
+    for line in content.lines() {
+        seen.clear();
+        for token in line.split_whitespace() {
+            let Some(value) = token.strip_prefix("dst=") else {
+                continue;
+            };
+            let Ok(addr) = value.parse::<Ipv6Addr>() else {
+                continue;
+            };
+            seen.insert(addr);
+        }
+        for addr in &seen {
+            *counts.entry(*addr).or_insert(0) += 1;
+        }
+    }
+
+    counts
+}
+
+/// Whether a conntrack read outcome is new or a repeat of the last one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadReport {
+    /// The outcome differs from the previous read, or is the first.
+    Changed,
+    /// The same outcome as the previous read.
+    Repeated,
+}
+
+/// Remembers the last conntrack read outcome.
+///
+/// A kernel built without `CONFIG_NF_CONNTRACK_PROCFS` has no
+/// `/proc/net/nf_conntrack` at all, so every read fails the same way and a
+/// per-tick warning would repeat for the life of the process. Warning on a
+/// change of outcome still separates "the source is unreadable" from "there
+/// are no sessions", which the pool could not distinguish before, without
+/// filling the log.
+#[derive(Debug, Default)]
+pub struct ConntrackReadLog {
+    last: Option<Option<std::io::ErrorKind>>,
+}
+
+impl ConntrackReadLog {
+    /// Record a read outcome and say whether it is new.
+    ///
+    /// `None` is a successful read; `Some(kind)` is a failure of that kind.
+    pub fn observe(&mut self, outcome: Option<std::io::ErrorKind>) -> ReadReport {
+        let report = if self.last == Some(outcome) {
+            ReadReport::Repeated
+        } else {
+            ReadReport::Changed
+        };
+        self.last = Some(outcome);
+        report
     }
 }
 
@@ -168,6 +270,21 @@ impl VirtualIpPool {
         })
     }
 
+    /// Refresh an existing mapping's TTL clock, never creating one.
+    ///
+    /// Returns whether a mapping for `node_addr` existed. A query the gateway
+    /// answers without an address still says the client is using the name, so
+    /// it must keep the mapping alive without minting one.
+    pub fn refresh_if_present(&mut self, node_addr: NodeAddr) -> bool {
+        match self.mappings.get_mut(&node_addr) {
+            Some(mapping) => {
+                mapping.last_referenced = Instant::now();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Allocate a virtual IP for the given node. Idempotent: returns
     /// existing mapping if one exists.
     pub fn allocate(
@@ -176,9 +293,10 @@ impl VirtualIpPool {
         mesh_addr: Ipv6Addr,
         dns_name: &str,
     ) -> Result<(Ipv6Addr, bool), PoolError> {
-        // Idempotent: return existing mapping
-        if let Some(mapping) = self.mappings.get_mut(&node_addr) {
-            mapping.last_referenced = Instant::now();
+        // Idempotent: return existing mapping, refreshed.
+        if self.refresh_if_present(node_addr)
+            && let Some(mapping) = self.mappings.get(&node_addr)
+        {
             return Ok((mapping.virtual_ip, false));
         }
 
@@ -215,15 +333,16 @@ impl VirtualIpPool {
 
     /// Periodic tick — drives state transitions. Returns events for
     /// the NAT and network modules.
-    pub fn tick(&mut self, now: Instant, conntrack: &dyn ConntrackQuerier) -> Vec<PoolEvent> {
+    pub fn tick(&mut self, now: Instant, conntrack: &ConntrackSnapshot) -> Vec<PoolEvent> {
         let mut events = Vec::new();
         let mut to_free = Vec::new();
         let ttl = std::time::Duration::from_secs(self.ttl_secs);
         let grace = std::time::Duration::from_secs(self.grace_secs);
 
         for (node_addr, mapping) in &mut self.mappings {
-            // Query conntrack for active sessions
-            let sessions = conntrack.active_sessions(mapping.virtual_ip).unwrap_or(0);
+            // One map lookup: the conntrack table was read once, before the
+            // pool lock was taken.
+            let sessions = conntrack.sessions_for(mapping.virtual_ip);
             mapping.session_count = sessions;
 
             // Live data-plane traffic pins the mapping: refresh the TTL
@@ -372,26 +491,24 @@ fn parse_ipv6_cidr(cidr: &str) -> Result<(Ipv6Addr, u32), PoolError> {
 mod tests {
     use super::*;
 
-    /// Mock conntrack that returns a configurable session count.
-    struct MockConntrack {
+    /// Session counts a test sets directly, handed to `tick` as the snapshot
+    /// the tick task would have read from conntrack.
+    #[derive(Default)]
+    struct Sessions {
         counts: HashMap<Ipv6Addr, u32>,
     }
 
-    impl MockConntrack {
+    impl Sessions {
         fn new() -> Self {
-            Self {
-                counts: HashMap::new(),
-            }
+            Self::default()
         }
 
         fn set(&mut self, addr: Ipv6Addr, count: u32) {
             self.counts.insert(addr, count);
         }
-    }
 
-    impl ConntrackQuerier for MockConntrack {
-        fn active_sessions(&self, virtual_ip: Ipv6Addr) -> Result<u32, std::io::Error> {
-            Ok(*self.counts.get(&virtual_ip).unwrap_or(&0))
+        fn snapshot(&self) -> ConntrackSnapshot {
+            ConntrackSnapshot::from_counts(self.counts.clone())
         }
     }
 
@@ -475,7 +592,7 @@ mod tests {
     #[test]
     fn test_mapping_lifecycle_allocated_to_free() {
         let mut pool = VirtualIpPool::new("fd01::/120", 1, 1).unwrap();
-        let ct = MockConntrack::new();
+        let ct = Sessions::new();
         let node = make_node_addr(1);
         let mesh = make_mesh_addr(1);
 
@@ -483,13 +600,13 @@ mod tests {
 
         // Tick before TTL — no change
         let now = Instant::now();
-        let events = pool.tick(now, &ct);
+        let events = pool.tick(now, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings.len(), 1);
 
         // Tick after TTL with no sessions — enters draining
         let later = now + std::time::Duration::from_secs(2);
-        let events = pool.tick(later, &ct);
+        let events = pool.tick(later, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings.len(), 1);
         assert_eq!(
@@ -499,7 +616,7 @@ mod tests {
 
         // Tick after grace period — freed
         let after_grace = later + std::time::Duration::from_secs(2);
-        let events = pool.tick(after_grace, &ct);
+        let events = pool.tick(after_grace, &ct.snapshot());
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], PoolEvent::MappingRemoved { .. }));
         assert_eq!(pool.mappings.len(), 0);
@@ -509,7 +626,7 @@ mod tests {
     #[test]
     fn test_mapping_lifecycle_active_draining_free() {
         let mut pool = VirtualIpPool::new("fd01::/120", 1, 1).unwrap();
-        let mut ct = MockConntrack::new();
+        let mut ct = Sessions::new();
         let node = make_node_addr(1);
         let mesh = make_mesh_addr(1);
 
@@ -518,25 +635,25 @@ mod tests {
         // Simulate active sessions
         ct.set(vip, 3);
         let now = Instant::now();
-        let events = pool.tick(now, &ct);
+        let events = pool.tick(now, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings[&node].state, MappingState::Active);
 
         // TTL expires after sessions drop to 0 → Draining
         let later = now + std::time::Duration::from_secs(2);
         ct.set(vip, 0);
-        let events = pool.tick(later, &ct);
+        let events = pool.tick(later, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings[&node].state, MappingState::Draining);
 
         // Still draining, grace period not elapsed
-        let events = pool.tick(later, &ct);
+        let events = pool.tick(later, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings[&node].state, MappingState::Draining);
 
         // Grace period elapsed → Free
         let much_later = later + std::time::Duration::from_secs(2);
-        let events = pool.tick(much_later, &ct);
+        let events = pool.tick(much_later, &ct.snapshot());
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], PoolEvent::MappingRemoved { .. }));
         assert_eq!(pool.mappings.len(), 0);
@@ -548,7 +665,7 @@ mod tests {
         // spanning well past the TTL must never be reclaimed and must
         // stay Active: live traffic refreshes last_referenced each tick.
         let mut pool = VirtualIpPool::new("fd01::/120", 1, 1).unwrap();
-        let mut ct = MockConntrack::new();
+        let mut ct = Sessions::new();
         let node = make_node_addr(1);
         let mesh = make_mesh_addr(1);
 
@@ -557,14 +674,14 @@ mod tests {
 
         let mut t = Instant::now();
         // First tick activates the mapping.
-        let events = pool.tick(t, &ct);
+        let events = pool.tick(t, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings[&node].state, MappingState::Active);
 
         // Advance many TTL-spans with continuous traffic.
         for _ in 0..10 {
             t += std::time::Duration::from_secs(5); // 5x the 1s TTL
-            let events = pool.tick(t, &ct);
+            let events = pool.tick(t, &ct.snapshot());
             assert!(events.is_empty(), "mapping must not be reclaimed");
             assert_eq!(
                 pool.mappings[&node].state,
@@ -580,7 +697,7 @@ mod tests {
         // Active -> drains when sessions hit 0 -> regains sessions before
         // grace elapses -> recovers to Active and is not freed.
         let mut pool = VirtualIpPool::new("fd01::/120", 1, 5).unwrap();
-        let mut ct = MockConntrack::new();
+        let mut ct = Sessions::new();
         let node = make_node_addr(1);
         let mesh = make_mesh_addr(1);
 
@@ -589,21 +706,21 @@ mod tests {
         // Activate with traffic.
         ct.set(vip, 1);
         let now = Instant::now();
-        let events = pool.tick(now, &ct);
+        let events = pool.tick(now, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings[&node].state, MappingState::Active);
 
         // TTL passes with sessions dropping to 0 -> Draining.
         let drained = now + std::time::Duration::from_secs(2);
         ct.set(vip, 0);
-        let events = pool.tick(drained, &ct);
+        let events = pool.tick(drained, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings[&node].state, MappingState::Draining);
 
         // Traffic resumes before grace (5s) elapses -> recover to Active.
         let resumed = drained + std::time::Duration::from_secs(2);
         ct.set(vip, 3);
-        let events = pool.tick(resumed, &ct);
+        let events = pool.tick(resumed, &ct.snapshot());
         assert!(events.is_empty());
         assert_eq!(pool.mappings[&node].state, MappingState::Active);
         assert!(pool.mappings[&node].drain_start.is_none());
@@ -616,7 +733,7 @@ mod tests {
         // fresh drain_start so the full grace window is honored again,
         // not reclaimed immediately off a stale drain_start.
         let mut pool = VirtualIpPool::new("fd01::/120", 1, 5).unwrap();
-        let mut ct = MockConntrack::new();
+        let mut ct = Sessions::new();
         let node = make_node_addr(1);
         let mesh = make_mesh_addr(1);
 
@@ -625,36 +742,36 @@ mod tests {
         // Activate.
         ct.set(vip, 1);
         let now = Instant::now();
-        pool.tick(now, &ct);
+        pool.tick(now, &ct.snapshot());
         assert_eq!(pool.mappings[&node].state, MappingState::Active);
 
         // First drain.
         let first_drain = now + std::time::Duration::from_secs(2);
         ct.set(vip, 0);
-        pool.tick(first_drain, &ct);
+        pool.tick(first_drain, &ct.snapshot());
         assert_eq!(pool.mappings[&node].state, MappingState::Draining);
 
         // Recover.
         let recover = first_drain + std::time::Duration::from_secs(2);
         ct.set(vip, 2);
-        pool.tick(recover, &ct);
+        pool.tick(recover, &ct.snapshot());
         assert_eq!(pool.mappings[&node].state, MappingState::Active);
 
         // Second drain begins; drain_start must be re-stamped fresh.
         let second_drain = recover + std::time::Duration::from_secs(2);
         ct.set(vip, 0);
-        pool.tick(second_drain, &ct);
+        pool.tick(second_drain, &ct.snapshot());
         assert_eq!(pool.mappings[&node].state, MappingState::Draining);
 
         // Just before the fresh grace window expires (5s): not reclaimed.
         let before_grace = second_drain + std::time::Duration::from_secs(4);
-        let events = pool.tick(before_grace, &ct);
+        let events = pool.tick(before_grace, &ct.snapshot());
         assert!(events.is_empty(), "fresh grace window must be honored");
         assert_eq!(pool.mappings.len(), 1);
 
         // After the fresh grace window: reclaimed.
         let after_grace = second_drain + std::time::Duration::from_secs(6);
-        let events = pool.tick(after_grace, &ct);
+        let events = pool.tick(after_grace, &ct.snapshot());
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], PoolEvent::MappingRemoved { .. }));
         assert_eq!(pool.mappings.len(), 0);
@@ -695,5 +812,100 @@ mod tests {
         // /96 = 32 host bits, but pool caps at 2^16
         let pool = VirtualIpPool::new("fd01::/96", 60, 60).unwrap();
         assert_eq!(pool.total, 65535); // 2^16 - 1 (skip addr 0)
+    }
+
+    /// A conntrack line in the form the kernel prints.
+    ///
+    /// Built from the kernel's own format string, not captured from a running
+    /// kernel: `net/netfilter/nf_conntrack_standalone.c` prints each tuple with
+    /// `"src=%pI6 dst=%pI6 "`, and `%pI6` is the full uncompressed form with
+    /// leading zeros (`Documentation/core-api/printk-formats.rst`). Both were
+    /// read at v6.8. The host this was written on has no
+    /// `/proc/net/nf_conntrack` to capture from, because its kernel is built
+    /// without `CONFIG_NF_CONNTRACK_PROCFS`; OpenWrt's generic kernel config
+    /// sets it, which is the kernel this parser exists for.
+    const KERNEL_LINE: &str = "ipv6     10 tcp      6 431999 ESTABLISHED \
+         src=fd02:0000:0000:0000:0000:0000:0000:0020 \
+         dst=fd01:0000:0000:0000:0000:0000:0000:0001 sport=45678 dport=8000 \
+         src=fd01:0000:0000:0000:0000:0000:0000:0001 \
+         dst=fd02:0000:0000:0000:0000:0000:0000:0020 sport=8000 dport=45678 \
+         [ASSURED] mark=0 use=1";
+
+    #[test]
+    fn conntrack_parse_counts_a_kernel_format_line_for_its_virtual_ip() {
+        let counts = parse_conntrack(KERNEL_LINE);
+        let virtual_ip: Ipv6Addr = "fd01::1".parse().unwrap();
+
+        assert_eq!(
+            counts.get(&virtual_ip).copied().unwrap_or(0),
+            1,
+            "the kernel writes the uncompressed form, so matching on the \
+             address's compressed Display form counts nothing"
+        );
+
+        // Healthy path: a different address in the same pool is not counted.
+        let other: Ipv6Addr = "fd01::10".parse().unwrap();
+        assert_eq!(counts.get(&other).copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn conntrack_parse_counts_a_line_once_however_many_tuples_name_the_address() {
+        // A hairpin flow: the address is the destination of both tuples.
+        let line = "ipv6     10 udp      17 29 \
+             src=fd01:0000:0000:0000:0000:0000:0000:0001 \
+             dst=fd01:0000:0000:0000:0000:0000:0000:0001 sport=1 dport=2 \
+             src=fd01:0000:0000:0000:0000:0000:0000:0001 \
+             dst=fd01:0000:0000:0000:0000:0000:0000:0001 sport=2 dport=1 \
+             mark=0 use=1";
+        let counts = parse_conntrack(line);
+        let virtual_ip: Ipv6Addr = "fd01::1".parse().unwrap();
+
+        assert_eq!(counts.get(&virtual_ip).copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn conntrack_parse_counts_each_line_that_names_the_address() {
+        let content = format!("{KERNEL_LINE}\n{KERNEL_LINE}\n");
+        let counts = parse_conntrack(&content);
+        let virtual_ip: Ipv6Addr = "fd01::1".parse().unwrap();
+
+        assert_eq!(counts.get(&virtual_ip).copied().unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn conntrack_parse_skips_a_value_that_is_not_an_ipv6_address() {
+        let content = "ipv4     2 tcp      6 431999 ESTABLISHED src=192.0.2.1 \
+             dst=192.0.2.2 sport=1 dport=2 mark=0 use=1\n";
+
+        assert!(parse_conntrack(content).is_empty());
+    }
+
+    #[test]
+    fn conntrack_snapshot_reads_zero_for_an_address_it_did_not_see() {
+        let snapshot = ConntrackSnapshot::from_counts(parse_conntrack(KERNEL_LINE));
+
+        assert_eq!(snapshot.sessions_for("fd01::1".parse().unwrap()), 1);
+        assert_eq!(snapshot.sessions_for("fd01::99".parse().unwrap()), 0);
+        assert!(ConntrackSnapshot::default().is_empty());
+    }
+
+    #[test]
+    fn conntrack_read_log_warns_on_a_new_outcome_and_not_on_a_repeat() {
+        use std::io::ErrorKind;
+
+        let mut log = ConntrackReadLog::default();
+
+        // The sequence a kernel without the proc file produces, then a source
+        // that comes back, then fails again.
+        assert_eq!(log.observe(Some(ErrorKind::NotFound)), ReadReport::Changed);
+        assert_eq!(log.observe(Some(ErrorKind::NotFound)), ReadReport::Repeated);
+        assert_eq!(log.observe(None), ReadReport::Changed);
+        assert_eq!(log.observe(None), ReadReport::Repeated);
+        assert_eq!(log.observe(Some(ErrorKind::NotFound)), ReadReport::Changed);
+        assert_eq!(
+            log.observe(Some(ErrorKind::PermissionDenied)),
+            ReadReport::Changed,
+            "a different failure is a different outcome and is worth a line"
+        );
     }
 }

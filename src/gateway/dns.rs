@@ -357,6 +357,32 @@ async fn handle_query(
         }
     };
 
+    // What the client actually asked for. Only AAAA and ANY are answered with
+    // an address, and only those may mint a mapping: allocating for a query
+    // type the gateway answers with NODATA let any LAN host take a pool
+    // address per name without ever being given one.
+    let client_qtype = query
+        .questions
+        .first()
+        .map(|q| q.qtype)
+        .unwrap_or(QTYPE::TYPE(TYPE::AAAA));
+
+    if !matches!(client_qtype, QTYPE::TYPE(TYPE::AAAA) | QTYPE::ANY) {
+        // The client is still using the name, so an existing mapping's TTL
+        // clock is refreshed. A client that re-queries a mapped name with both
+        // A and AAAA should not lose half of its refresh, and with no
+        // conntrack sessions a DNS reference is all that keeps a mapping
+        // alive. Nothing is created.
+        let refreshed = pool.lock().await.refresh_if_present(node_addr);
+        debug!(
+            name = %fips_name,
+            mesh_addr = %mesh_addr,
+            refreshed,
+            "Non-AAAA .fips query, returning NODATA"
+        );
+        return build_nodata(&query, ttl);
+    }
+
     // Allocate virtual IP from pool
     let mut pool_guard = pool.lock().await;
     let (virtual_ip, is_new) = match pool_guard.allocate(node_addr, mesh_addr, &fips_name) {
@@ -387,22 +413,7 @@ async fn handle_query(
         "Resolved .fips query"
     );
 
-    // Check what the client originally asked for.
-    // Only return an AAAA record if the client asked for AAAA (or ANY).
-    // For A queries, return an empty NOERROR — the client's resolver will
-    // use the AAAA answer from its parallel AAAA query instead.
-    let client_qtype = query
-        .questions
-        .first()
-        .map(|q| q.qtype)
-        .unwrap_or(QTYPE::TYPE(TYPE::AAAA));
-
-    match client_qtype {
-        QTYPE::TYPE(TYPE::AAAA) | QTYPE::ANY => build_aaaa_response(&query, virtual_ip, ttl),
-        // All other types (A, HTTPS, etc.): return NODATA — the name exists
-        // but has no records of the requested type.
-        _ => build_nodata(&query, ttl),
-    }
+    build_aaaa_response(&query, virtual_ip, ttl)
 }
 
 #[cfg(test)]
@@ -416,15 +427,26 @@ mod tests {
 
     /// Build a client-facing AAAA query.
     fn build_query(id: u16, qname: &str) -> Vec<u8> {
+        build_query_of_type(id, qname, QTYPE::TYPE(TYPE::AAAA))
+    }
+
+    /// Build a client-facing query of any type.
+    fn build_query_of_type(id: u16, qname: &str, qtype: QTYPE) -> Vec<u8> {
         let mut packet = Packet::new_query(id);
-        let question = Question::new(
-            Name::new_unchecked(qname),
-            QTYPE::TYPE(TYPE::AAAA),
-            CLASS::IN.into(),
-            false,
-        );
+        let question = Question::new(Name::new_unchecked(qname), qtype, CLASS::IN.into(), false);
         packet.questions.push(question);
         packet.build_bytes_vec_compressed().unwrap()
+    }
+
+    /// Assert the response is NODATA: NOERROR with no answer records.
+    fn assert_nodata(response: &[u8]) {
+        let packet = Packet::parse(response).unwrap();
+        assert_eq!(packet.rcode(), RCODE::NoError);
+        assert!(
+            packet.answers.is_empty(),
+            "expected NODATA, got {} answer(s)",
+            packet.answers.len()
+        );
     }
 
     /// Build an upstream NOERROR AAAA answer.
@@ -640,6 +662,115 @@ mod tests {
             event_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn an_a_query_returns_nodata_and_mints_no_mapping() {
+        let upstream_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+        let upstream = upstream_socket.local_addr().unwrap();
+        let handle = spawn_upstream(upstream_socket, |id| {
+            vec![build_answer(id, "test.fips", "fd00::1")]
+        });
+
+        let pool = test_pool();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let response = handle_query(
+            &build_query_of_type(0x1234, "test.fips", QTYPE::TYPE(TYPE::A)),
+            upstream,
+            TEST_TTL,
+            &pool,
+            &event_tx,
+        )
+        .await
+        .unwrap();
+        handle.await.unwrap();
+
+        assert_nodata(&response);
+        assert!(
+            matches!(event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "an A query minted a mapping, so any LAN host can take a pool \
+             address per name with a query type it is never given one for"
+        );
+        assert!(
+            pool.lock()
+                .await
+                .mapping_info(std::time::Instant::now())
+                .is_empty(),
+            "an A query left a mapping in the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_a_query_refreshes_an_existing_mapping_without_creating_one() {
+        let pool = test_pool();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+
+        // An AAAA query mints the mapping.
+        let upstream_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+        let upstream = upstream_socket.local_addr().unwrap();
+        let handle = spawn_upstream(upstream_socket, |id| {
+            vec![build_answer(id, "test.fips", "fd00::1")]
+        });
+        let response = handle_query(
+            &build_query(0x1234, "test.fips"),
+            upstream,
+            TEST_TTL,
+            &pool,
+            &event_tx,
+        )
+        .await
+        .unwrap();
+        handle.await.unwrap();
+        let virtual_ip = assert_pool_answer(&response);
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            PoolEvent::MappingCreated { .. }
+        ));
+
+        let before = {
+            let guard = pool.lock().await;
+            guard
+                .lookup_virtual_ip(&virtual_ip)
+                .unwrap()
+                .last_referenced
+        };
+
+        // An A query for the same name refreshes it and creates nothing. A
+        // client that re-queries a mapped name with both types must not lose
+        // half of its refresh: with no conntrack sessions, the DNS reference
+        // is the only thing keeping the mapping alive.
+        let upstream_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+        let upstream = upstream_socket.local_addr().unwrap();
+        let handle = spawn_upstream(upstream_socket, |id| {
+            vec![build_answer(id, "test.fips", "fd00::1")]
+        });
+        let response = handle_query(
+            &build_query_of_type(0x1235, "test.fips", QTYPE::TYPE(TYPE::A)),
+            upstream,
+            TEST_TTL,
+            &pool,
+            &event_tx,
+        )
+        .await
+        .unwrap();
+        handle.await.unwrap();
+
+        assert_nodata(&response);
+
+        let guard = pool.lock().await;
+        let mapping = guard
+            .lookup_virtual_ip(&virtual_ip)
+            .expect("the A query removed or replaced the mapping");
+        assert!(
+            mapping.last_referenced > before,
+            "the A query did not refresh the mapping's TTL clock"
+        );
+        drop(guard);
+
+        assert!(
+            matches!(event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "the A query sent a second MappingCreated"
+        );
     }
 
     #[tokio::test]

@@ -24,7 +24,7 @@ use tokio::signal::unix::{SignalKind, signal};
 #[cfg(target_os = "linux")]
 use tokio::sync::{Mutex, mpsc, watch};
 #[cfg(target_os = "linux")]
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 #[cfg(target_os = "linux")]
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -51,6 +51,53 @@ struct Args {
 fn main() {
     eprintln!("fips-gateway requires Linux (nftables unavailable on this platform)");
     std::process::exit(1);
+}
+
+/// Take a conntrack snapshot off the runtime thread.
+///
+/// A failed read yields an empty snapshot, so every mapping reads zero
+/// sessions, which is what the pool did with an unreadable source before. The
+/// alternative, treating "unknown" as "in use", would pin every mapping forever
+/// on a kernel with no conntrack proc file and turn a read error into a pool
+/// that never reclaims. The cost is the opposite error: a mapping carrying live
+/// traffic can be reclaimed early while the source is unreadable.
+#[cfg(target_os = "linux")]
+async fn read_conntrack(log: &mut pool::ConntrackReadLog) -> pool::ConntrackSnapshot {
+    use fips::gateway::pool::ConntrackQuerier;
+
+    match tokio::task::spawn_blocking(|| pool::ProcConntrack.snapshot()).await {
+        Ok(Ok(snapshot)) => {
+            log.observe(None);
+            snapshot
+        }
+        Ok(Err(e)) => {
+            report_unreadable_conntrack(log, e.kind(), &e.to_string());
+            pool::ConntrackSnapshot::default()
+        }
+        Err(e) => {
+            report_unreadable_conntrack(log, std::io::ErrorKind::Other, &e.to_string());
+            pool::ConntrackSnapshot::default()
+        }
+    }
+}
+
+/// Log an unreadable conntrack source once per change of outcome.
+#[cfg(target_os = "linux")]
+fn report_unreadable_conntrack(
+    log: &mut pool::ConntrackReadLog,
+    kind: std::io::ErrorKind,
+    error: &str,
+) {
+    match log.observe(Some(kind)) {
+        pool::ReadReport::Changed => warn!(
+            error,
+            "Conntrack unreadable; every mapping reads zero sessions"
+        ),
+        pool::ReadReport::Repeated => debug!(
+            error,
+            "Conntrack still unreadable; every mapping reads zero sessions"
+        ),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -379,7 +426,7 @@ async fn main() {
     let tick_event_tx = event_tx;
     let tick_nat_count = Arc::clone(&nat_count);
     let mut tick_shutdown = shutdown_rx.clone();
-    let conntrack = pool::ProcConntrack;
+    let mut conntrack_log = pool::ConntrackReadLog::default();
     let snap_config = control::SnapshotConfig {
         pool_cidr: gw_config.pool.clone(),
         lan_interface: gw_config.lan_interface.clone(),
@@ -395,6 +442,11 @@ async fn main() {
             tokio::select! {
                 _ = interval.tick() => {
                     let now = Instant::now();
+                    // Read conntrack once, off the runtime thread and before
+                    // the pool lock: the runtime is current-thread, so a
+                    // blocking read here would stall the DNS resolver, and the
+                    // read must not happen under the lock the resolver needs.
+                    let conntrack = read_conntrack(&mut conntrack_log).await;
                     let mut pool_guard = tick_pool.lock().await;
                     let events = pool_guard.tick(now, &conntrack);
 

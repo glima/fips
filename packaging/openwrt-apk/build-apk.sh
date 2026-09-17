@@ -94,6 +94,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # The installed-filesystem payload (init scripts, config, sysctl, etc.) is
 # shared with the .ipk package; there is one canonical copy in openwrt-ipk/.
 FILES_DIR="$PROJECT_ROOT/packaging/openwrt-ipk/files"
+SCRIPTS_SRC="$PROJECT_ROOT/packaging/openwrt-ipk/scripts"
 DIST_DIR="$PROJECT_ROOT/dist"
 
 PKG_NAME="fips"
@@ -228,33 +229,15 @@ EOF
 
 # ---- maintainer scripts ----
 # Map our opkg maintainer scripts onto apk's lifecycle phases:
-#   opkg postinst -> apk post-install   (enable + start services)
+#   opkg postinst -> apk post-install   (enable + start the daemon)
 #   opkg prerm    -> apk pre-deinstall  (stop + disable services)
 
-cat > "$SCRIPTS_DIR/post-install" <<'EOF'
-#!/bin/sh
-# Run first-boot UCI setup (the script deletes itself when done).
-if [ -x /etc/uci-defaults/90-fips-setup ]; then
-    /etc/uci-defaults/90-fips-setup && rm -f /etc/uci-defaults/90-fips-setup
-fi
-
-/etc/init.d/fips enable
-/etc/init.d/fips start
-/etc/init.d/fips-gateway enable
-/etc/init.d/fips-gateway start
-exit 0
-EOF
-
-cat > "$SCRIPTS_DIR/pre-deinstall" <<'EOF'
-#!/bin/sh
-/etc/init.d/fips-gateway stop    2>/dev/null || true
-/etc/init.d/fips-gateway disable 2>/dev/null || true
-/etc/init.d/fips stop            2>/dev/null || true
-/etc/init.d/fips disable         2>/dev/null || true
-exit 0
-EOF
-
-chmod 0755 "$SCRIPTS_DIR/post-install" "$SCRIPTS_DIR/pre-deinstall"
+# Both bodies come from packaging/openwrt-ipk/scripts/, the same files the
+# .ipk ships, so the two packagers cannot drift apart and testing/openwrt/
+# exercises what both install. apk runs post-install only on a fresh install,
+# so the postinst's upgrade branch is unreachable here.
+install -m 0755 "$SCRIPTS_SRC/postinst" "$SCRIPTS_DIR/post-install"
+install -m 0755 "$SCRIPTS_SRC/prerm"    "$SCRIPTS_DIR/pre-deinstall"
 
 # ---------------------------------------------------------------------------
 # 3. Assemble the .apk via apk mkpkg

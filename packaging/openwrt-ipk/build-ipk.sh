@@ -81,6 +81,7 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FILES_DIR="$SCRIPT_DIR/files"
+SCRIPTS_SRC="$SCRIPT_DIR/scripts"   # maintainer scripts (metadata, not payload)
 DIST_DIR="$PROJECT_ROOT/dist"
 
 PKG_NAME="fips"
@@ -212,30 +213,10 @@ cat > "$CONTROL_DIR/conffiles" <<EOF
 /etc/fips/fips.yaml
 EOF
 
-cat > "$CONTROL_DIR/postinst" <<'EOF'
-#!/bin/sh
-# Run first-boot UCI setup (the script deletes itself when done).
-if [ -x /etc/uci-defaults/90-fips-setup ]; then
-    /etc/uci-defaults/90-fips-setup && rm -f /etc/uci-defaults/90-fips-setup
-fi
-
-/etc/init.d/fips enable
-/etc/init.d/fips start
-/etc/init.d/fips-gateway enable
-/etc/init.d/fips-gateway start
-exit 0
-EOF
-chmod 0755 "$CONTROL_DIR/postinst"
-
-cat > "$CONTROL_DIR/prerm" <<'EOF'
-#!/bin/sh
-/etc/init.d/fips-gateway stop    2>/dev/null || true
-/etc/init.d/fips-gateway disable 2>/dev/null || true
-/etc/init.d/fips stop            2>/dev/null || true
-/etc/init.d/fips disable         2>/dev/null || true
-exit 0
-EOF
-chmod 0755 "$CONTROL_DIR/prerm"
+# The maintainer scripts live in files of their own rather than in heredocs
+# here, so testing/openwrt/ can run the same bodies the package ships.
+install -m 0755 "$SCRIPTS_SRC/postinst" "$CONTROL_DIR/postinst"
+install -m 0755 "$SCRIPTS_SRC/prerm"    "$CONTROL_DIR/prerm"
 
 # ---- pack ----
 

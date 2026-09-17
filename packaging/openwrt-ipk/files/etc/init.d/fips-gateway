@@ -26,6 +26,14 @@ DAEMON_DNS_PORT=5354
 GLOBAL_PREFIX="2001:2:f1b5::1/64"
 
 start_service() {
+	# The gateway daemon exits when gateway.enabled is not true, so without
+	# this check starting a disabled gateway would still take dnsmasq's .fips
+	# upstream away from the daemon and point it at a port nothing listens on.
+	if [ "$(gateway_config_enabled)" != "true" ]; then
+		logger -t fips-gateway "gateway.enabled is not true in $CONFIG; not starting"
+		return 1
+	fi
+
 	# Apply gateway sysctls (proxy_ndp, IPv6 forwarding).
 	sysctl -p /etc/sysctl.d/fips-gateway.conf 2>/dev/null || true
 
@@ -70,6 +78,13 @@ stop_service() {
 
 reload_service() {
 	restart
+}
+
+# Extract the gateway "enabled" flag from fips.yaml.
+# Prints the value indented under the top-level "gateway:" block, or nothing
+# when there is no such block.
+gateway_config_enabled() {
+	awk '/^gateway:/{found=1; next} found && /^[^ ]/{found=0} found && /enabled:/{gsub(/.*enabled:[[:space:]]*/, ""); gsub(/["'"'"']/, ""); print; exit}' "$CONFIG"
 }
 
 # Extract the gateway pool CIDR from fips.yaml.

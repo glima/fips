@@ -121,15 +121,44 @@ const LEGACY_SYSTEM_CONFIG_DIR: &str = "/etc/fips";
 /// - `key_path` sits in `system_dir`, so an operator using `./fips.yaml` or a
 ///   user config is never redirected to a system key
 /// - a key does exist at `legacy_dir`
-fn legacy_key_fallback(key_path: &Path, system_dir: &Path, legacy_dir: &Path) -> Option<PathBuf> {
-    if system_dir == legacy_dir || key_path.exists() {
-        return None;
+///
+/// Returns an error when either location cannot be examined, which the caller
+/// aborts on: a lookup that failed is not evidence that no key is there.
+fn legacy_key_fallback(
+    key_path: &Path,
+    system_dir: &Path,
+    legacy_dir: &Path,
+) -> Result<Option<PathBuf>, ConfigError> {
+    if system_dir == legacy_dir || key_file_present(key_path)? {
+        return Ok(None);
     }
     if key_path.parent() != Some(system_dir) {
-        return None;
+        return Ok(None);
     }
     let legacy = legacy_dir.join(KEY_FILENAME);
-    legacy.exists().then_some(legacy)
+    Ok(key_file_present(&legacy)?.then_some(legacy))
+}
+
+/// Report whether an identity key file is present, distinguishing a genuine
+/// absence from a lookup that could not be made.
+///
+/// `Path::exists` answers false to both, which is what a persistent start must
+/// not do: a key symlinked onto a volume that did not mount, or one in a
+/// directory the daemon may not search, would read as a first boot and the
+/// node would generate and run under a new identity that every peer
+/// allowlisting its old npub refuses. `symlink_metadata` reports a symlink
+/// itself as present, so the read that follows fails and aborts the start,
+/// and any other lookup error is returned for the caller to abort on. Only
+/// `NotFound` is an absence, which is the first-boot case.
+fn key_file_present(path: &Path) -> Result<bool, ConfigError> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ConfigError::KeyPathUnreadable {
+            path: path.to_path_buf(),
+            source: e,
+        }),
+    }
 }
 
 /// Derive the public key file path from a config file path.
@@ -509,6 +538,10 @@ pub fn write_pub_file(path: &Path, npub: &str) -> Result<(), ConfigError> {
 ///   2. Persistent key file (`fips.key`) — reused across restarts
 ///   3. Generate new — creates keypair, writes `fips.key` and `fips.pub`
 ///
+///   A key file that exists but cannot be read, including one whose metadata
+///   the daemon cannot look up at all, aborts the start. Only a key file that
+///   is genuinely absent reaches step 3.
+///
 /// - **`nsec` set explicitly**: always uses that, regardless of `persistent`.
 ///
 /// Returns the nsec string (bech32 or hex) to be used for identity creation.
@@ -539,8 +572,10 @@ pub fn resolve_identity(
     let pub_path = pub_file_path(&config_ref);
 
     if config.node.identity.persistent {
-        // Persistent mode: load existing key file or generate-and-persist
-        if key_path.exists() {
+        // Persistent mode: load existing key file or generate-and-persist.
+        // A key path the daemon cannot examine aborts the start here rather
+        // than falling through to generation.
+        if key_file_present(&key_path)? {
             // Held in a guard, not a bare `String`: if the parse below fails,
             // the `?` returns and a bare local would be freed uncleared.
             let nsec = Zeroizing::new(read_key_file(&key_path)?);
@@ -567,7 +602,7 @@ pub fn resolve_identity(
             &key_path,
             Path::new(SYSTEM_CONFIG_DIR),
             Path::new(LEGACY_SYSTEM_CONFIG_DIR),
-        ) {
+        )? {
             // Guarded for the same reason as the current-path read above.
             let nsec = Zeroizing::new(read_key_file(&legacy)?);
             let identity = Identity::from_secret_str(&nsec)?;
@@ -746,6 +781,12 @@ pub enum ConfigError {
 
     #[error("refusing to write key file through a symlink: {path}")]
     KeyPathIsSymlink { path: PathBuf },
+
+    #[error("cannot determine whether the identity key file {path} exists: {source}")]
+    KeyPathUnreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
@@ -1727,7 +1768,7 @@ node:
 
         let key_path = system.join(KEY_FILENAME);
         assert_eq!(
-            legacy_key_fallback(&key_path, &system, &legacy),
+            legacy_key_fallback(&key_path, &system, &legacy).unwrap(),
             Some(legacy_key),
             "a key stranded at the legacy path must be adopted, not regenerated"
         );
@@ -1741,7 +1782,10 @@ node:
         write_stub_key(&legacy);
         let key_path = write_stub_key(&system);
 
-        assert_eq!(legacy_key_fallback(&key_path, &system, &legacy), None);
+        assert_eq!(
+            legacy_key_fallback(&key_path, &system, &legacy).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1753,7 +1797,7 @@ node:
         write_stub_key(&dir);
         let absent = dir.join("nonexistent").join(KEY_FILENAME);
 
-        assert_eq!(legacy_key_fallback(&absent, &dir, &dir), None);
+        assert_eq!(legacy_key_fallback(&absent, &dir, &dir).unwrap(), None);
     }
 
     #[test]
@@ -1768,7 +1812,10 @@ node:
         write_stub_key(&legacy);
 
         let key_path = elsewhere.join(KEY_FILENAME);
-        assert_eq!(legacy_key_fallback(&key_path, &system, &legacy), None);
+        assert_eq!(
+            legacy_key_fallback(&key_path, &system, &legacy).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1780,7 +1827,36 @@ node:
         std::fs::create_dir_all(&system).unwrap();
 
         let key_path = system.join(KEY_FILENAME);
-        assert_eq!(legacy_key_fallback(&key_path, &system, &legacy), None);
+        assert_eq!(
+            legacy_key_fallback(&key_path, &system, &legacy).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_key_whose_metadata_cannot_be_read_is_present_not_absent() {
+        // A dangling symlink is the case that matters in the field: a key
+        // symlinked onto a volume that did not mount. Reading it as an
+        // absence sends a persistent node on to generate a new identity.
+        let root = TempDir::new().unwrap();
+        let legacy = root.path().join("etc/fips");
+        let system = root.path().join("usr/local/etc/fips");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let legacy_key = legacy.join(KEY_FILENAME);
+        std::os::unix::fs::symlink(
+            root.path().join("unmounted").join(KEY_FILENAME),
+            &legacy_key,
+        )
+        .unwrap();
+
+        let key_path = system.join(KEY_FILENAME);
+        assert_eq!(
+            legacy_key_fallback(&key_path, &system, &legacy).unwrap(),
+            Some(legacy_key),
+            "a legacy key the daemon cannot stat must be reported present, so the read aborts"
+        );
     }
 
     #[test]
@@ -2151,6 +2227,73 @@ node:
         let resolved2 = resolve_identity(&config, std::slice::from_ref(&config_path)).unwrap();
         assert!(matches!(resolved2.source, IdentitySource::KeyFile(_)));
         assert_eq!(resolved.nsec, resolved2.nsec);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_start_aborts_when_the_key_path_is_a_dangling_symlink() {
+        // The key is symlinked onto a volume that did not mount. The node
+        // must not read that as a first boot and take a new identity, which
+        // every peer whose allowlist names the old npub would then refuse.
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("fips.yaml");
+        let key_path = temp_dir.path().join("fips.key");
+        let unmounted = temp_dir.path().join("unmounted").join("fips.key");
+
+        fs::write(&config_path, "node:\n  identity:\n    persistent: true\n").unwrap();
+        std::os::unix::fs::symlink(&unmounted, &key_path).unwrap();
+
+        let config = Config::load_file(&config_path).unwrap();
+        // `ResolvedIdentity` carries the secret and has no `Debug`, so the
+        // failure is matched rather than unwrapped.
+        let Err(err) = resolve_identity(&config, std::slice::from_ref(&config_path)) else {
+            panic!("a key path that cannot be read must abort the start, not generate a new key");
+        };
+
+        assert!(
+            err.to_string().contains(&key_path.display().to_string()),
+            "the diagnostic must name the key path, got {err}"
+        );
+        assert!(
+            key_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be left in place"
+        );
+        assert!(
+            !unmounted.exists(),
+            "nothing may be written through the symlink"
+        );
+        assert!(
+            !temp_dir.path().join("fips.pub").exists(),
+            "an aborted start writes neither key file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_start_aborts_when_the_key_path_cannot_be_examined() {
+        // A key path whose parent is not a directory fails the lookup with an
+        // error that is not an absence, the same shape as a directory the
+        // daemon may not search, and unlike a permission case it behaves the
+        // same for root.
+        let temp_dir = TempDir::new().unwrap();
+        let blocked = temp_dir.path().join("blocked");
+        fs::write(&blocked, "not a directory\n").unwrap();
+        let config_path = blocked.join("fips.yaml");
+
+        let mut config = Config::new();
+        config.node.identity.persistent = true;
+
+        let Err(err) = resolve_identity(&config, std::slice::from_ref(&config_path)) else {
+            panic!("a key path that cannot be examined must abort the start");
+        };
+        assert!(
+            err.to_string().contains(&blocked.display().to_string()),
+            "the diagnostic must name the key path, got {err}"
+        );
     }
 
     #[test]

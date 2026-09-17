@@ -4,6 +4,7 @@
 //! TCP transport.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
@@ -49,8 +50,8 @@ pub(crate) struct TcpConnection {
     /// MSS-derived MTU for this connection (used for dynamic MTU re-reading).
     #[allow(dead_code)]
     pub(crate) mtu: u16,
-    /// When the connection was established.
-    #[allow(dead_code)]
+    /// When the connection was established. Read by `key_for_remote` to pick
+    /// the newest of several inbound entries sharing a peer address.
     pub(crate) established_at: Instant,
     /// Direction of the connection — drives pool-inbound/outbound accounting.
     pub(crate) direction: Direction,
@@ -67,8 +68,67 @@ impl PooledConn for TcpConnection {
     }
 }
 
+/// Key identifying one pooled connection.
+///
+/// The kernel names a TCP connection by its four-tuple, so a listener on a
+/// wildcard address can accept two connections whose peer `ip:port` is the
+/// same on two different local addresses. An inbound entry therefore carries
+/// the accepted socket's local address as well, and two such connections get
+/// two entries rather than displacing each other.
+///
+/// Outbound entries carry no local address. Nothing distinguishes two
+/// outbound connections to one peer, since the transport keeps at most one,
+/// and leaving the local address out keeps the connect-on-send lookup a
+/// single hash probe.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PoolKey {
+    /// Remote address, as the peer is named by callers and packets.
+    pub(crate) remote: TransportAddr,
+    /// Local address of an accepted socket; `None` for outbound.
+    pub(crate) local: Option<SocketAddr>,
+}
+
+impl PoolKey {
+    /// Key for a connection this node opened.
+    pub(crate) fn outbound(remote: TransportAddr) -> Self {
+        Self {
+            remote,
+            local: None,
+        }
+    }
+
+    /// Key for a connection the listener accepted on `local`.
+    pub(crate) fn inbound(remote: TransportAddr, local: SocketAddr) -> Self {
+        Self {
+            remote,
+            local: Some(local),
+        }
+    }
+}
+
+/// The pooled connections, keyed by [`PoolKey`].
+pub(crate) type PoolMap = HashMap<PoolKey, TcpConnection>;
+
 /// Shared connection pool.
-pub(crate) type ConnectionPool = Arc<Mutex<HashMap<TransportAddr, TcpConnection>>>;
+pub(crate) type ConnectionPool = Arc<Mutex<PoolMap>>;
+
+/// Resolve a bare remote address to the key of the connection to use for it.
+///
+/// Callers that send, close or query by peer address know only the remote, so
+/// the four-tuple has to be recovered. An outbound entry is tried first, so the
+/// common case is one hash probe. Inbound entries also carry a local address,
+/// so they are found by scanning for the remote and taking the most recently
+/// established, which is the connection a peer that reconnected is using.
+pub(crate) fn key_for_remote(pool: &PoolMap, remote: &TransportAddr) -> Option<PoolKey> {
+    let outbound = PoolKey::outbound(remote.clone());
+    if pool.contains_key(&outbound) {
+        return Some(outbound);
+    }
+    pool.iter()
+        .filter(|(key, _)| &key.remote == remote)
+        .max_by_key(|(_, conn)| conn.established_at)
+        .map(|(key, _)| key.clone())
+}
 
 /// A pending background connection attempt.
 ///

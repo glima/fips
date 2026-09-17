@@ -11,8 +11,6 @@ use std::time::Duration;
 use portable_atomic::{AtomicU64, Ordering};
 use tokio::task::JoinHandle;
 
-use crate::transport::TransportAddr;
-
 /// Identity of one pooled stream connection.
 ///
 /// The pool is keyed by address, and a newer connection can take an address
@@ -36,20 +34,26 @@ pub(crate) trait PooledConn {
     fn conn_id(&self) -> ConnId;
 }
 
-/// Remove the entry at `addr`, but only if it is connection `id`.
+/// Remove the entry at `key`, but only if it is connection `id`.
 ///
 /// This is the only way a connection's own writer or receive loop removes a
-/// pool entry. An entry with another id belongs to a newer connection at the
-/// same address, and is left alone.
-pub(crate) fn remove_own<C: PooledConn>(
-    pool: &mut HashMap<TransportAddr, C>,
-    addr: &TransportAddr,
-    id: ConnId,
-) -> Option<C> {
-    if pool.get(addr)?.conn_id() != id {
+/// pool entry. An entry with another id belongs to a newer connection under
+/// the same key, and is left alone.
+///
+/// The key type is the pool's own: a transport that pools by peer address
+/// passes a `TransportAddr`, and one that pools by four-tuple passes its own
+/// key. The identity check is the same either way, and it stays necessary
+/// after a key is made more specific, because a peer can still reconnect on
+/// the same four-tuple.
+pub(crate) fn remove_own<K, C>(pool: &mut HashMap<K, C>, key: &K, id: ConnId) -> Option<C>
+where
+    K: std::hash::Hash + Eq,
+    C: PooledConn,
+{
+    if pool.get(key)?.conn_id() != id {
         return None;
     }
-    pool.remove(addr)
+    pool.remove(key)
 }
 
 /// How long a deliberately closed connection's writer may keep writing the

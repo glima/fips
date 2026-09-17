@@ -736,6 +736,25 @@ with v0.5.x or earlier peers.
   platforms with the connected-socket fast path); elsewhere the heartbeat alone
   carries the new address.
 
+- Two inbound TCP connections that share a peer address but arrive on different
+  local addresses no longer share one pool entry. The kernel names a connection
+  by its four-tuple, so a listener on a wildcard address, which is what the
+  shipped configuration binds, can accept two connections whose peer `ip:port`
+  is the same on two different local addresses. The pool was keyed by the peer
+  address alone: the second connection's entry replaced the first's while the
+  inbound-connection counter counted both, the first connection's teardown then
+  removed the second's entry, and the second's own teardown found nothing to
+  remove, so the counter ended one above the connections it counts. That counter
+  gates the inbound connection limit, so a host repeating the collision could
+  hold it at the limit and lock out further inbound TCP connections until the
+  daemon restarted. Inbound entries now carry the accepted socket's local
+  address in their pool key as well as the remote one.
+- A peer that moves to a new address now loses the per-peer `connect(2)`-ed UDP
+  socket pinned to the address it left. `set_current_addr` returns whether the
+  address actually changed so the caller can drop the stale socket, and the
+  decrypt-worker completion path already acted on that return; the in-line
+  decrypt path discarded it, so the socket stayed installed and the send path
+  kept preferring it over the wildcard listen socket.
 - A peer reached by NAT traversal now gets its per-peer connected UDP socket.
   The adopted traversal socket carried no address-reuse flags, so the connected
   socket's bind to the same port was refused with `EADDRINUSE` on every tick and
@@ -779,6 +798,88 @@ with v0.5.x or earlier peers.
   peer on the path it already has. The `reconnecting` and `disconnected`
   values the open-discovery tutorial described never occurred, and the
   tutorial no longer lists them. The response shape is unchanged.
+
+#### Identity & config
+
+- A persistent node whose identity key path cannot be examined now refuses to
+  start instead of coming up under a new identity. `Path::exists` reports false
+  both for a key that is absent and for one whose metadata cannot be read, so a
+  key symlinked onto a volume that did not mount, or one in a directory the
+  daemon cannot search, read as a first boot: the node generated a fresh
+  identity, failed to store it, and carried on under an npub that every peer
+  whose allowlist names the old one refuses. Only a `NotFound` result is now
+  treated as an absence; any other failure to stat the path aborts the start and
+  names the path. A dangling symlink likewise aborts rather than being replaced.
+  The legacy `/etc/fips/fips.key` lookup follows the same rule.
+
+#### Gateway
+
+- A `.fips` query the gateway answers without an address no longer takes an
+  address from the pool. Every query type was allocated a mapping before the
+  code looked at what the client had asked for, and an A or HTTPS query was
+  then answered with NODATA, so any host that can reach the LAN resolver could
+  consume the pool one name at a time with a query type it is never given an
+  address for. Only AAAA and ANY allocate now. A non-AAAA query for a name that
+  already has a mapping still refreshes that mapping's TTL clock, so a client
+  querying both types does not lose half of its refresh.
+- Conntrack sessions are matched by address rather than by text, so live
+  traffic pins a gateway mapping again. The session count searched each
+  `/proc/net/nf_conntrack` line for `dst=` followed by the virtual IP in its
+  compressed form (`fd01::1`), while the kernel prints tuples in the full
+  uncompressed form (`dst=fd01:0000:0000:0000:0000:0000:0000:0001`), so the
+  count was zero for every mapping on every kernel. Nothing pinned an in-use
+  mapping, and one whose client did not re-query DNS was reclaimed about two
+  minutes after its last DNS reference while its traffic was still flowing.
+  Each `dst=` value is now parsed as an address and compared as one.
+- The conntrack table is read once per tick instead of once per mapping, and
+  the read happens off the runtime thread. The whole file was read and scanned
+  for each mapping in turn, while the pool lock was held, on the same
+  single-threaded runtime that serves DNS. The tick now takes one snapshot with
+  a blocking task before it takes the lock, and the pool does a map lookup per
+  mapping.
+- A conntrack source that cannot be read is reported. It still counts as zero
+  sessions for every mapping, as it always has, so reclamation keeps working
+  rather than pinning the whole pool; but the first failure and each change of
+  outcome after it are now logged, so an unreadable source is no longer
+  indistinguishable from an idle one. A kernel built without
+  `CONFIG_NF_CONNTRACK_PROCFS` has no `/proc/net/nf_conntrack` at all and fails
+  identically every tick, so a repeat is logged at debug rather than warn.
+- The NAT table is rebuilt in one netlink transaction. A rebuild deleted the
+  `fips_gateway` table in a batch of its own, discarded that batch's result,
+  and only then sent the batch that recreated the table, the chains, the
+  `fips0` masquerade and every per-mapping rule. Between the two sends the
+  gateway had no NAT at all, and a recreate the kernel refused left the table
+  absent for good, taking down forwarding for every existing mapping rather
+  than failing the one change that was being made. The delete and the recreate
+  now share a single batch, which the kernel applies as one transaction, so a
+  refused rebuild leaves the previous table in the packet path. The rules sent
+  are unchanged.
+- A new OpenWrt install no longer enables and starts `fips-gateway`. The
+  generated postinst turned it on unconditionally, contradicting the init
+  script's own header, the package README and the deployment tutorial, all of
+  which say the service ships disabled and is enabled deliberately. The
+  documented `service fips-gateway enable` / `service fips-gateway start` steps
+  are unchanged, and the shipped `fips.yaml` still carries `gateway.enabled:
+  true`, so enabling the service is all that is needed.
+- **The first upgrade to this release re-enables and starts `fips-gateway` on
+  any router that has the package installed, including one where the gateway
+  was disabled by hand.** Every released package's prerm disabled the service
+  on its way out, leaving nothing behind that says whether the operator wanted
+  it on, so an upgrade cannot tell the two apart and keeps the gateway running
+  rather than silently turning off a working one. If you had disabled it, run
+  `service fips-gateway disable` once after upgrading. Later upgrades preserve
+  whatever state the service is in: the new prerm stops the services on an
+  upgrade but no longer disables them.
+- `start_service` in the `fips-gateway` init script now reads `gateway.enabled`
+  from `/etc/fips/fips.yaml` before doing anything. Starting a gateway that the
+  config disables used to hand dnsmasq's `.fips` forwarding to the gateway's
+  port, add the LAN prefix and advertise the pool route, and only then start a
+  daemon that exits immediately because the gateway is disabled, leaving `.fips`
+  resolution pointed at a port nothing listens on.
+- The four OpenWrt maintainer-script bodies now live in
+  `packaging/openwrt-ipk/scripts/` instead of inside heredocs in the two build
+  scripts, so the `.ipk` and `.apk` packages install the same bodies and the
+  scenarios in `testing/openwrt/` run what ships.
 
 #### Packaging
 

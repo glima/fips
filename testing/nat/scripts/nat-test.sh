@@ -415,10 +415,23 @@ require_bootstrap_activity() {
     fi
 }
 
+# Data-plane assertion, and the last step of every scenario. Like the two path
+# assertions above it, it stays silent on success and names the container, the
+# destination and what it read on failure; ping's own output is the only record
+# of whether resolution, routing or the data path broke, so it is captured
+# rather than discarded to /dev/null. Callers wrap it in the same
+# `|| { dump_*_diagnostics; return 1; }` shape, because a bare call lets `set -e`
+# tear the script down before any diagnostics run.
 ping_peer() {
     local container="$1"
     local npub="$2"
-    docker exec "$container" ping6 -c 3 -W 5 "${npub}.fips" >/dev/null
+    local output rc=0
+    output="$(docker exec "$container" ping6 -c 3 -W 5 "${npub}.fips" 2>&1)" || rc=$?
+    if [ "$rc" != 0 ]; then
+        echo "PING FAIL: $container -> ${npub}.fips: ping6 exited ${rc}:" >&2
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
 }
 
 run_cone() {
@@ -453,8 +466,14 @@ run_cone() {
     }
     # shellcheck disable=SC1090
     source "$CONFIG_DIR/cone/npubs.env"
-    ping_peer fips-nat-cone-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B"
-    ping_peer fips-nat-cone-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A"
+    ping_peer fips-nat-cone-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B" || {
+        dump_cone_diagnostics
+        return 1
+    }
+    ping_peer fips-nat-cone-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A" || {
+        dump_cone_diagnostics
+        return 1
+    }
     cleanup
 }
 
@@ -492,8 +511,14 @@ run_symmetric() {
     require_bootstrap_activity fips-nat-symmetric-b${FIPS_CI_NAME_SUFFIX:-}
     # shellcheck disable=SC1090
     source "$CONFIG_DIR/symmetric/npubs.env"
-    ping_peer fips-nat-symmetric-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B"
-    ping_peer fips-nat-symmetric-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A"
+    ping_peer fips-nat-symmetric-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B" || {
+        dump_symmetric_diagnostics
+        return 1
+    }
+    ping_peer fips-nat-symmetric-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A" || {
+        dump_symmetric_diagnostics
+        return 1
+    }
     cleanup
 }
 
@@ -528,8 +553,14 @@ run_lan() {
     }
     # shellcheck disable=SC1090
     source "$CONFIG_DIR/lan/npubs.env"
-    ping_peer fips-nat-lan-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B"
-    ping_peer fips-nat-lan-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A"
+    ping_peer fips-nat-lan-a${FIPS_CI_NAME_SUFFIX:-} "$NPUB_B" || {
+        dump_lan_diagnostics
+        return 1
+    }
+    ping_peer fips-nat-lan-b${FIPS_CI_NAME_SUFFIX:-} "$NPUB_A" || {
+        dump_lan_diagnostics
+        return 1
+    }
     # Skip the final teardown when the mesh-lab harness wraps this
     # script: it needs to docker-logs the containers before teardown,
     # and will run its own cleanup after capture. Failure paths above
