@@ -75,6 +75,72 @@ pub(crate) fn drain_writer(send_task: JoinHandle<()>, bound: Duration) -> JoinHa
     })
 }
 
+/// How long a filled send queue must stay full, with nothing sending, before a
+/// test treats its writer as parked.
+#[cfg(test)]
+pub(crate) const PARK_SETTLE: Duration = Duration::from_millis(300);
+
+/// How many settle intervals a test waits for its writer to stay parked.
+#[cfg(test)]
+pub(crate) const PARK_ROUNDS: usize = 10;
+
+/// Fill a connection's send queue behind a peer that does not read, until the
+/// writer is parked in `write_all`, and return how many frames were queued.
+///
+/// `offer` tries to queue one frame and says whether it was accepted;
+/// `capacity` reads the queue's free slots, `None` if the connection is gone.
+/// Every one of 8000 offers is made whatever the previous one returned, with a
+/// yield between them so the writer runs. Then the queue must read full after
+/// a settle interval with nothing sending. Free capacity only grows while
+/// nothing sends, so a full reading means the writer took no frame for the
+/// whole interval, which it can do only while blocked in `write_all`.
+///
+/// A queue that is not full is topped up and the interval repeated, because a
+/// late ACK can free send-buffer space after the fill ends and let the writer
+/// take a few frames before it parks again; FreeBSD delays that ACK on
+/// loopback. A writer that never stays parked for a whole interval panics.
+#[cfg(test)]
+pub(crate) async fn park_writer(
+    mut offer: impl AsyncFnMut() -> bool,
+    mut capacity: impl AsyncFnMut() -> Option<usize>,
+) -> usize {
+    let mut queued = 0usize;
+    let mut refused = 0usize;
+    for _ in 0..8000 {
+        if offer().await {
+            queued += 1;
+        } else {
+            refused += 1;
+        }
+        tokio::task::yield_now().await;
+    }
+    let mut seen = Vec::with_capacity(PARK_ROUNDS);
+    for _ in 0..PARK_ROUNDS {
+        tokio::time::sleep(PARK_SETTLE).await;
+        let free = capacity().await;
+        seen.push(free);
+        match free {
+            Some(0) => {
+                assert!(refused > 0, "setup never filled the queue: queued={queued}");
+                return queued;
+            }
+            Some(n) => {
+                for _ in 0..=n {
+                    if !offer().await {
+                        break;
+                    }
+                    queued += 1;
+                }
+            }
+            None => break,
+        }
+    }
+    panic!(
+        "setup did not park the writer: queued={queued} refused={refused} \
+         capacity after each settle={seen:?}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +181,83 @@ mod tests {
             .await
             .expect("the drain timer kept running after the writer exited")
             .unwrap();
+    }
+
+    /// Depth of the modelled send queue in the `park_writer` tests.
+    const MODEL_DEPTH: usize = 4;
+
+    /// A queue a late ACK drained after the fill is topped up, and the helper
+    /// returns at the first settle that finds it still full.
+    ///
+    /// The first capacity read drains 2 frames and later reads drain none, so
+    /// the fill queues 4, the top-up queues 2 more, and the second read ends
+    /// the wait.
+    #[tokio::test(start_paused = true)]
+    async fn park_writer_tops_up_a_queue_a_late_ack_drained_and_returns_once_it_stays_full() {
+        let len = std::cell::Cell::new(0usize);
+        let drain = std::cell::Cell::new(2usize);
+        let calls = std::cell::Cell::new(0usize);
+        let queued = park_writer(
+            async || {
+                let accept = len.get() < MODEL_DEPTH;
+                if accept {
+                    len.set(len.get() + 1);
+                }
+                accept
+            },
+            async || {
+                calls.set(calls.get() + 1);
+                len.set(len.get().saturating_sub(drain.take()));
+                Some(MODEL_DEPTH - len.get())
+            },
+        )
+        .await;
+        assert_eq!(queued, 6, "fill of 4 plus a top-up of 2");
+        assert_eq!(
+            calls.get(),
+            2,
+            "the second settle should find the queue full"
+        );
+    }
+
+    /// A writer that takes a frame in every settle interval never counts as
+    /// parked.
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "setup did not park the writer")]
+    async fn park_writer_panics_when_the_writer_takes_a_frame_in_every_settle() {
+        let len = std::cell::Cell::new(0usize);
+        let drain = std::cell::Cell::new(1usize);
+        park_writer(
+            async || {
+                let accept = len.get() < MODEL_DEPTH;
+                if accept {
+                    len.set(len.get() + 1);
+                }
+                accept
+            },
+            async || {
+                len.set(len.get().saturating_sub(drain.get()));
+                Some(MODEL_DEPTH - len.get())
+            },
+        )
+        .await;
+    }
+
+    /// A connection that is gone by the settle check never counts as parked.
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "setup did not park the writer")]
+    async fn park_writer_panics_when_the_connection_is_gone() {
+        let len = std::cell::Cell::new(0usize);
+        park_writer(
+            async || {
+                let accept = len.get() < MODEL_DEPTH;
+                if accept {
+                    len.set(len.get() + 1);
+                }
+                accept
+            },
+            async || None,
+        )
+        .await;
     }
 }

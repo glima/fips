@@ -1356,6 +1356,7 @@ mod tests {
     use super::*;
     use crate::transport::framing::build_msg1_frame;
     use crate::transport::packet_channel;
+    use crate::transport::stream::park_writer;
     use tokio::time::{Duration, timeout};
 
     /// Poll `f` every 10ms until it holds or `limit` elapses.
@@ -2386,40 +2387,25 @@ mod tests {
         socket.listen(8).unwrap()
     }
 
-    /// Fill `remote`'s send queue behind a peer that does not read, until the
+    /// Fill `remote`'s send queue behind a peer that does not read until the
     /// writer is parked in `write_all`, and return how many frames were
-    /// queued.
-    ///
-    /// Every send is attempted whatever the previous one returned, with a
-    /// yield between sends so the writer runs. A queue still full 300 ms
-    /// after the last send means the writer could not drain it, which is the
-    /// state the caller's teardown needs; anything else panics rather than
-    /// letting the caller pass without it.
+    /// queued. The fill and the parked-writer check are `park_writer`'s.
     async fn park_tcp_writer(t: &TcpTransport, remote: &TransportAddr, frame: &[u8]) -> usize {
-        let mut queued = 0usize;
-        let mut refused = 0usize;
-        for _ in 0..8000 {
-            match timeout(Duration::from_secs(2), t.send_async(remote, frame)).await {
-                Ok(Ok(_)) => queued += 1,
-                Ok(Err(_)) => refused += 1,
+        park_writer(
+            async || match timeout(Duration::from_secs(2), t.send_async(remote, frame)).await {
+                Ok(Ok(_)) => true,
+                Ok(Err(_)) => false,
                 Err(_) => panic!("send blocked on a peer that stopped reading"),
-            }
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let capacity = t
-            .pool
-            .lock()
-            .await
-            .get(remote)
-            .map(|c| c.send_tx.capacity());
-        assert_eq!(
-            capacity,
-            Some(0),
-            "setup did not park the writer: queued={queued} refused={refused}"
-        );
-        assert!(refused > 0, "setup never filled the queue: queued={queued}");
-        queued
+            },
+            async || {
+                t.pool
+                    .lock()
+                    .await
+                    .get(remote)
+                    .map(|c| c.send_tx.capacity())
+            },
+        )
+        .await
     }
 
     /// Read `stream` to EOF within `limit`, returning the byte count, or

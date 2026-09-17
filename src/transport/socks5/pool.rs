@@ -370,7 +370,7 @@ pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
 mod tests {
     use super::*;
     use crate::transport::packet_channel;
-    use crate::transport::stream::next_conn_id;
+    use crate::transport::stream::{next_conn_id, park_writer};
     use portable_atomic::{AtomicU64, Ordering};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -555,33 +555,19 @@ mod tests {
             },
         );
 
-        // Fill without stopping at the first refusal, yielding so the writer
-        // runs, and never keep a sender past the fill.
+        // Never keep a sender past the fill: the teardown below relies on the
+        // pool entry holding the only one.
         let frame = vec![0xAB; 1400];
-        let mut queued = 0usize;
-        let mut refused = 0usize;
-        for _ in 0..8000 {
-            let sent = {
-                let guard = pool.lock().await;
-                guard
+        let queued = park_writer(
+            async || {
+                pool.lock()
+                    .await
                     .get(&remote)
-                    .map(|c| c.send_tx.try_send(frame.clone()).is_ok())
-            };
-            if sent == Some(true) {
-                queued += 1;
-            } else {
-                refused += 1;
-            }
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let capacity = pool.lock().await.get(&remote).map(|c| c.send_tx.capacity());
-        assert_eq!(
-            capacity,
-            Some(0),
-            "setup did not park the writer: queued={queued} refused={refused}"
-        );
-        assert!(refused > 0, "setup never filled the queue: queued={queued}");
+                    .is_some_and(|c| c.send_tx.try_send(frame.clone()).is_ok())
+            },
+            async || pool.lock().await.get(&remote).map(|c| c.send_tx.capacity()),
+        )
+        .await;
 
         peer.shutdown().await.unwrap();
         assert!(
