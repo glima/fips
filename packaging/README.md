@@ -240,12 +240,16 @@ daemon dies the first time it shells out. ARM builds must pass
 `--dynamic`, and then `ldd` on the appliance is the check that the
 base drift is not real.
 
-The build host's architecture and FreeBSD major must still match the
-target's: pfSense CE 2.8.1 is FreeBSD 15 amd64; CE 2.9.0 and Plus 26.x are
-FreeBSD 16 (amd64, plus aarch64 for Plus on ARM appliances), and `pkg` refuses a
-mismatched ABI. No aarch64 package is published: rustup ships no
-toolchain for aarch64 FreeBSD, so such a build cannot honour the
-`rust-toolchain.toml` pin. It is build-it-yourself.
+The build host's architecture must match the target's, and `pkg`
+refuses a mismatched ABI major, so the package carries the target's:
+pfSense CE 2.8.1 is FreeBSD 15 amd64; CE 2.9.0 and Plus 26.x are
+FreeBSD 16 (amd64, plus aarch64 for Plus on ARM appliances). The
+FreeBSD 16 amd64 package is the FreeBSD 15.1 build relabelled
+(`--no-build --abi FreeBSD:16:amd64`): static binaries from an older
+release on a newer kernel is the direction FreeBSD supports, and it has
+been run on Plus 26.03.1 and 26.07. No aarch64 package is published:
+rustup ships no toolchain for aarch64 FreeBSD, so such a build cannot
+honour the `rust-toolchain.toml` pin. It is build-it-yourself.
 
 ```sh
 # Build (on FreeBSD; this Makefile needs GNU make — pkg install gmake)

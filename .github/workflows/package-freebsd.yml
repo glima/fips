@@ -229,19 +229,22 @@ jobs:
 
   pfsense:
     name: Build and check the pfSense package (x86_64)
-    # A job of its own, and deliberately NOT a dependency of `release`. A
-    # pfSense-only failure — a new key in the common dns: block, a
-    # dependency that stops linking statically, a checker regression — reds
-    # this check and nothing else; it can never hide behind the FreeBSD
-    # job's result, and it cannot block the FreeBSD release asset. The
-    # pfSense package is therefore never a release asset. It is published
-    # here as a workflow artifact (30-day retention) for anyone to test,
-    # until someone has installed it on a real pfSense box; see
-    # packaging/pfsense/README.md.
+    # A job of its own, so a pfSense-only failure — a new key in the common
+    # dns: block, a dependency that stops linking statically, a checker
+    # regression — reds this check by name and can never hide behind the
+    # FreeBSD job's result. `release` needs both jobs: the packages this
+    # job builds are release assets next to the FreeBSD one, after being run
+    # on pfSense Plus 26.03.1 and 26.07 (see packaging/pfsense/README.md),
+    # so a pfSense failure holds the release the way a FreeBSD failure
+    # does. On every other ref the artifact is kept 30 days for anyone to
+    # test.
     #
-    # This VM is FreeBSD 15.1, so the package it produces is FreeBSD:15:amd64
-    # (pfSense CE 2.8.1). CE 2.9 and Plus 26.x are FreeBSD 16 and need a
-    # FreeBSD 16 host this workflow does not have. No aarch64 package is built
+    # This VM is FreeBSD 15.1. One build yields static FreeBSD 15 binaries,
+    # packaged twice: as FreeBSD:15:amd64 for pfSense CE 2.8.1, and relabelled
+    # as FreeBSD:16:amd64 for CE 2.9 and Plus 26.x on Intel. Older binaries on
+    # a newer kernel is the direction FreeBSD's binary compatibility supports;
+    # the relabelled package has been run on Plus 26.03.1 and 26.07 (see
+    # packaging/pfsense/README.md). No aarch64 package is built
     # here or published anywhere: rustup ships no toolchain for
     # aarch64-unknown-freebsd, so such a build cannot honour the
     # rust-toolchain.toml pin every published artifact is built with. ARM is
@@ -259,6 +262,16 @@ jobs:
 
       - name: Set SOURCE_DATE_EPOCH from git
         run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: Lint the install smoke test
+        # Same arrangement as package-openwrt.yml's install-nak.sh lint: the
+        # script does not ship in the package, so the guards for shipped sh
+        # scripts do not apply. It is plain sh because pfSense has no bash.
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --shell=sh testing/pfsense-install-smoke.sh
 
       - name: Build and check the pfSense package in a FreeBSD VM
         uses: vmactions/freebsd-vm@f0552d3b69211736abd97f02ff3d4674c56b73b1 # v1
@@ -285,14 +298,29 @@ jobs:
             # them; on a FreeBSD 15.1 VM this yields the FreeBSD:15:amd64
             # package for pfSense CE 2.8.1.
             packaging/pfsense/build-pkg.sh --version "$FREEBSD_PACKAGE_VERSION"
+            PKG15=$(ls deploy/fips-*-pfsense-ce2.8-amd64.pkg)
 
-            PKG=$(ls deploy/fips-*-pfsense-*.pkg)
-            testing/check-pfsense-pkg.sh "$PKG"
+            # The same binaries again, labelled for FreeBSD 16 (pfSense CE 2.9
+            # and Plus 26.x on Intel). No FreeBSD 16 host is needed for that:
+            # static binaries from 15.1 run on a 16 kernel, the direction
+            # FreeBSD supports, and pkg only checks the label.
+            packaging/pfsense/build-pkg.sh --no-build --abi FreeBSD:16:amd64 \
+                --version "$FREEBSD_PACKAGE_VERSION"
+            PKG16=$(ls deploy/fips-*-pfsense-ce2.9-plus26-amd64.pkg)
+
+            for PKG in "$PKG15" "$PKG16"; do
+              testing/check-pfsense-pkg.sh "$PKG"
+              ( cd deploy && sha256 -q "$(basename "$PKG")" \
+                  | { read -r h; printf '%s  %s\n' "$h" "$(basename "$PKG")"; } \
+                  > "$(basename "$PKG").sha256" )
+            done
             php -l packaging/pfsense/fips-unbound-custom.php
-
-            ( cd deploy && sha256 -q "$(basename "$PKG")" \
-                | { read -r h; printf '%s  %s\n' "$h" "$(basename "$PKG")"; } \
-                > "$(basename "$PKG").sha256" )
+            # Install the FreeBSD 15 package and run the daemon through the
+            # boot script's life on this FreeBSD 15 kernel; see the script
+            # header for what that does and does not prove about pfSense
+            # itself. pkg refuses the FreeBSD 16 package on this host (ABI
+            # major mismatch); its binaries are the same bytes.
+            testing/pfsense-install-smoke.sh "$PKG15"
 
             rm -rf target
 
@@ -303,27 +331,33 @@ jobs:
           : ${GITHUB_OUTPUT:=/tmp/github_output}
           set -euo pipefail
           VER="${{ needs.determine-versioning.outputs.freebsd_pkg_file_version }}"
-          PKG=$(ls deploy/fips-${VER}-pfsense-*.pkg)
-          if [[ ! -f "$PKG" ]]; then
-            echo "No pfSense package was produced" >&2
-            ls -la deploy >&2 || true
-            exit 1
-          fi
-          echo "pkg=$PKG" >> "$GITHUB_OUTPUT"
+          PKG15="deploy/fips-${VER}-pfsense-ce2.8-amd64.pkg"
+          PKG16="deploy/fips-${VER}-pfsense-ce2.9-plus26-amd64.pkg"
+          for p in "$PKG15" "$PKG16"; do
+            if [[ ! -f "$p" || ! -f "$p.sha256" ]]; then
+              echo "pfSense package or its checksum is missing: $p" >&2
+              ls -la deploy >&2 || true
+              exit 1
+            fi
+          done
+          echo "pkg15=$PKG15" >> "$GITHUB_OUTPUT"
+          echo "pkg16=$PKG16" >> "$GITHUB_OUTPUT"
 
       - name: Upload pfSense artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: fips_${{ needs.determine-versioning.outputs.freebsd_package_version }}_x86_64_pfsense
           path: |
-            ${{ steps.pfsense-asset.outputs.pkg }}
-            ${{ steps.pfsense-asset.outputs.pkg }}.sha256
+            ${{ steps.pfsense-asset.outputs.pkg15 }}
+            ${{ steps.pfsense-asset.outputs.pkg15 }}.sha256
+            ${{ steps.pfsense-asset.outputs.pkg16 }}
+            ${{ steps.pfsense-asset.outputs.pkg16 }}.sha256
           retention-days: 30
 
   release:
     name: Publish FreeBSD assets to GitHub Release
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, pfsense]
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
@@ -332,11 +366,17 @@ jobs:
       - name: Download FreeBSD artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          # Only the FreeBSD artifact. Without a pattern this action downloads
-          # every artifact in the run — including the pfSense package from the
-          # `pfsense` job, which is a workflow artifact by design and must never
-          # reach a release. `needs` only orders jobs; it does not scope this.
+          # One named pattern per job: without a pattern this action downloads
+          # every artifact in the run, and `needs` only orders jobs; it does
+          # not scope this.
           pattern: fips_*_x86_64_freebsd
+          path: dist
+          merge-multiple: true
+
+      - name: Download pfSense artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: fips_*_x86_64_pfsense
           path: dist
           merge-multiple: true
 
@@ -346,14 +386,16 @@ jobs:
           set -euo pipefail
           cd dist
 
-          # The pfSense package is never a release asset (see the `pfsense`
-          # job). The download step is scoped to the FreeBSD artifact; this
-          # keeps the rule if that artifact is ever renamed or a new one added.
-          if compgen -G '*-pfsense-*' >/dev/null; then
-            echo "FAIL: a pfSense package reached the release stage; it must stay a workflow artifact:" >&2
-            ls -la ./*-pfsense-* >&2 || true
-            exit 1
-          fi
+          # Three packages are expected: the FreeBSD one and the two pfSense
+          # ones (each job wrote the sidecars inside its own VM). Missing one
+          # is a failure, not a smaller release.
+          for want in '*-freebsd-*.pkg' '*-pfsense-ce2.8-amd64.pkg' '*-pfsense-ce2.9-plus26-amd64.pkg'; do
+            if ! compgen -G "$want" >/dev/null; then
+              echo "FAIL: no package matching $want was downloaded" >&2
+              ls -la . >&2 || true
+              exit 1
+            fi
+          done
 
           pkgs=$(find . -maxdepth 1 -type f -name '*.pkg' | LC_ALL=C sort)
           if [[ -z "$pkgs" ]]; then

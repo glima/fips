@@ -172,8 +172,12 @@ fi
 # appliance does not export, install cleanly, and then refuse to start.
 #
 # Linking statically removes the negotiation entirely — there is no
-# libc.so.7 to disagree with. What is left is the kernel syscall ABI,
-# which is stable within a FreeBSD major.
+# libc.so.7 to disagree with. What is left is the kernel's binary
+# compatibility, which FreeBSD promises in one direction only: binaries
+# from an older release run on a newer kernel. So build on a base no
+# newer than the appliance's, never on a snapshot ahead of it. That is
+# why the FreeBSD 16 package is the 15.1 build relabelled (--no-build
+# --abi FreeBSD:16:amd64) rather than a build on a 16.0-CURRENT host.
 #
 # Verified viable on this codebase: no dlopen/libloading anywhere, and
 # FreeBSD builds files+dns resolution into libc, so a static binary

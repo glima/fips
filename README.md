@@ -179,6 +179,14 @@ and a ❌ there means the platform ships none. Windows is the odd one:
 its ZIP is an archive you unpack yourself rather than a package an
 installer consumes, and there is no MSI.
 
+pfSense has no column of its own: it is the FreeBSD package with
+pfSense's boot script and DNS Resolver integration, under
+[`packaging/pfsense/`](packaging/pfsense/). CI builds it for CE 2.8.1
+(FreeBSD 15) and for CE 2.9.0 and Plus 26.x on x86_64 (FreeBSD 16, the
+same static binaries relabelled) and attaches both to each release next
+to the FreeBSD package; ARM is build-it-yourself. What each package has
+been run on is in that directory's README.
+
 Five of these columns are Linux: Debian/Ubuntu, Arch, NixOS, OpenWrt
 and Android. Linux is not one target. Debian, Ubuntu, Arch and NixOS
 are the same glibc build, and what

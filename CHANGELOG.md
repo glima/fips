@@ -263,12 +263,19 @@ with v0.5.x or earlier peers.
   fault at `posix_spawn`. Mechanics shared with the FreeBSD builder live
   in `packaging/common/pkg-lib.sh`, which both source; the FreeBSD
   package is byte-identical before and after. The pfSense package is
-  built and checked in its own CI job and published as a workflow
-  artifact, not attached to a release, until it has been installed on a
-  real pfSense box; CI produces the CE 2.8.1 (`FreeBSD:15:amd64`)
-  package, while CE 2.9 and Plus 26.x on Intel need a FreeBSD 16 build
-  host the CI does not have, and ARM stays build-it-yourself because
-  rustup ships no toolchain for it. See `packaging/pfsense/README.md`.
+  built and checked in its own CI job, then installed in the same VM and
+  run through the boot script's start, re-entrant start, a forced
+  `newsyslog` rotation, restart, stop and `pkg delete`
+  (`testing/pfsense-install-smoke.sh`, also the first thing to run on a
+  real box), and attached to each release next to the FreeBSD package,
+  after being run on pfSense Plus 26.03.1 and 26.07 with mesh traffic
+  between them. CI produces both Intel packages from that one FreeBSD 15.1 build:
+  the CE 2.8.1 (`FreeBSD:15:amd64`) package, and the CE 2.9 / Plus 26.x
+  (`FreeBSD:16:amd64`) package as the same static binaries relabelled,
+  which is the direction FreeBSD's binary compatibility supports and has
+  been run on pfSense Plus 26.03.1 and 26.07. ARM stays
+  build-it-yourself because rustup ships no toolchain for it. See
+  `packaging/pfsense/README.md`.
 
 ### Changed
 
