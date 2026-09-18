@@ -55,6 +55,7 @@ fn main() {
 
 /// Microseconds since `started`, saturating, for the timing fields on debug
 /// lines.
+#[cfg(target_os = "linux")]
 fn elapsed_us(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
