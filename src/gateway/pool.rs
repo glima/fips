@@ -10,6 +10,18 @@ use std::net::Ipv6Addr;
 use std::time::Instant;
 use tracing::{debug, info};
 
+/// Most live mappings the pool holds before it refuses new names.
+///
+/// Every mapping adds rules to the NAT table, which is rebuilt whole on each
+/// change, and work to every tick and to shutdown, so this bounds all three.
+pub const MAPPING_CEILING: usize = 1000;
+
+/// New mappings the pool admits in a burst, when idle long enough to refill.
+pub const MAPPING_BURST: u32 = 50;
+
+/// New mappings per second the pool admits once a burst is spent.
+pub const MAPPING_RATE: u32 = 10;
+
 /// Errors from pool operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
@@ -19,6 +31,10 @@ pub enum PoolError {
     Exhausted(usize),
     #[error("prefix length must be between 1 and 128")]
     InvalidPrefix,
+    #[error("live-mapping ceiling reached ({0} mappings)")]
+    AtCeiling(usize),
+    #[error("new-mapping rate limit reached")]
+    RateLimited,
 }
 
 /// State of a virtual IP mapping.
@@ -217,6 +233,67 @@ impl ConntrackReadLog {
     }
 }
 
+/// Token bucket for new mappings.
+///
+/// The level is kept in token-nanoseconds so refill is exact integer
+/// arithmetic: one token is `NANOS` units, and each elapsed nanosecond adds
+/// `rate` units.
+#[derive(Debug)]
+struct Bucket {
+    /// Current level, in units of `1 / NANOS` token.
+    level: u128,
+    /// Level when full.
+    capacity: u128,
+    /// Tokens added per second.
+    rate: u128,
+    /// When the level was last brought up to date; unset until first use.
+    last: Option<Instant>,
+}
+
+impl Bucket {
+    const NANOS: u128 = 1_000_000_000;
+
+    /// A full bucket of `capacity` tokens refilling at `rate` per second.
+    fn new(capacity: u32, rate: u32) -> Self {
+        let capacity = u128::from(capacity) * Self::NANOS;
+        Self {
+            level: capacity,
+            capacity,
+            rate: u128::from(rate),
+            last: None,
+        }
+    }
+
+    /// Add what has accrued since the last refill, up to capacity.
+    fn refill(&mut self, now: Instant) {
+        if let Some(last) = self.last {
+            let elapsed = now.saturating_duration_since(last).as_nanos();
+            self.level = self
+                .level
+                .saturating_add(elapsed.saturating_mul(self.rate))
+                .min(self.capacity);
+        }
+        // Never move backwards, so a stale `now` cannot credit time twice.
+        self.last = Some(self.last.map_or(now, |last| last.max(now)));
+    }
+
+    /// Whether at least one whole token is available.
+    fn has_token(&self) -> bool {
+        self.level >= Self::NANOS
+    }
+
+    /// Spend one token; the caller has checked `has_token`.
+    fn take(&mut self) {
+        self.level = self.level.saturating_sub(Self::NANOS);
+    }
+
+    /// Whole tokens available.
+    #[cfg(test)]
+    fn tokens(&self) -> u128 {
+        self.level / Self::NANOS
+    }
+}
+
 /// Virtual IP pool manager.
 pub struct VirtualIpPool {
     /// Available addresses (free pool).
@@ -231,11 +308,38 @@ pub struct VirtualIpPool {
     grace_secs: u64,
     /// Total pool size.
     total: usize,
+    /// Most live mappings admitted before new names are refused.
+    ceiling: usize,
+    /// Rate limit on new mappings.
+    bucket: Bucket,
 }
 
 impl VirtualIpPool {
-    /// Create a new pool from a CIDR string (e.g., `fd01::/112`).
+    /// Create a new pool from a CIDR string (e.g., `fd01::/112`), with the
+    /// compiled-in admission limits.
     pub fn new(cidr: &str, ttl_secs: u64, grace_secs: u64) -> Result<Self, PoolError> {
+        Self::with_limits(
+            cidr,
+            ttl_secs,
+            grace_secs,
+            MAPPING_CEILING,
+            MAPPING_BURST,
+            MAPPING_RATE,
+        )
+    }
+
+    /// Create a pool with explicit admission limits.
+    ///
+    /// Production uses `new`; this exists so tests can set limits small
+    /// enough to reach without allocating the compiled-in counts.
+    pub fn with_limits(
+        cidr: &str,
+        ttl_secs: u64,
+        grace_secs: u64,
+        ceiling: usize,
+        burst: u32,
+        rate: u32,
+    ) -> Result<Self, PoolError> {
         let (base, prefix_len) = parse_ipv6_cidr(cidr)?;
         if prefix_len == 0 || prefix_len > 128 {
             return Err(PoolError::InvalidPrefix);
@@ -267,6 +371,8 @@ impl VirtualIpPool {
             ttl_secs,
             grace_secs,
             total,
+            ceiling,
+            bucket: Bucket::new(burst, rate),
         })
     }
 
@@ -293,6 +399,21 @@ impl VirtualIpPool {
         mesh_addr: Ipv6Addr,
         dns_name: &str,
     ) -> Result<(Ipv6Addr, bool), PoolError> {
+        self.allocate_at(node_addr, mesh_addr, dns_name, Instant::now())
+    }
+
+    /// `allocate` at a given instant, which drives the rate limit's refill
+    /// and stamps a new mapping.
+    ///
+    /// An existing mapping is returned before either limit is consulted, so a
+    /// name already in use keeps resolving when new names are refused.
+    pub fn allocate_at(
+        &mut self,
+        node_addr: NodeAddr,
+        mesh_addr: Ipv6Addr,
+        dns_name: &str,
+        now: Instant,
+    ) -> Result<(Ipv6Addr, bool), PoolError> {
         // Idempotent: return existing mapping, refreshed.
         if self.refresh_if_present(node_addr)
             && let Some(mapping) = self.mappings.get(&node_addr)
@@ -300,12 +421,21 @@ impl VirtualIpPool {
             return Ok((mapping.virtual_ip, false));
         }
 
+        // Ceiling first, so a refusal there costs no token and names the
+        // ceiling whatever the bucket holds.
+        if self.mappings.len() >= self.ceiling {
+            return Err(PoolError::AtCeiling(self.mappings.len()));
+        }
+        self.bucket.refill(now);
+        if !self.bucket.has_token() {
+            return Err(PoolError::RateLimited);
+        }
         let virtual_ip = self
             .available
             .pop_front()
             .ok_or(PoolError::Exhausted(self.mappings.len()))?;
+        self.bucket.take();
 
-        let now = Instant::now();
         let mapping = VirtualIpMapping {
             node_addr,
             virtual_ip,
@@ -490,6 +620,7 @@ fn parse_ipv6_cidr(cidr: &str) -> Result<(Ipv6Addr, u32), PoolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// Session counts a test sets directly, handed to `tick` as the snapshot
     /// the tick task would have read from conntrack.
@@ -586,6 +717,102 @@ mod tests {
         assert!(
             pool.allocate(make_node_addr(4), make_mesh_addr(4), "test.fips")
                 .is_err()
+        );
+    }
+
+    /// A `/120` pool with the given limits, TTL and grace of 60 s.
+    fn limited_pool(ceiling: usize, burst: u32, rate: u32) -> VirtualIpPool {
+        VirtualIpPool::with_limits("fd01::/120", 60, 60, ceiling, burst, rate).unwrap()
+    }
+
+    /// Allocate node `i` at `now`.
+    fn alloc(pool: &mut VirtualIpPool, i: u8, now: Instant) -> Result<(Ipv6Addr, bool), PoolError> {
+        pool.allocate_at(make_node_addr(i), make_mesh_addr(i), "test.fips", now)
+    }
+
+    #[test]
+    fn ceiling_refuses_a_new_name_without_a_token_and_keeps_existing_names() {
+        let t0 = Instant::now();
+        let mut pool = limited_pool(3, 10, 1);
+        let mut vips = Vec::new();
+        for i in 1..=3u8 {
+            vips.push(alloc(&mut pool, i, t0).unwrap().0);
+        }
+        assert_eq!(pool.bucket.tokens(), 7);
+
+        assert!(
+            matches!(alloc(&mut pool, 4, t0), Err(PoolError::AtCeiling(3))),
+            "a fourth new name must be refused at a ceiling of 3"
+        );
+        assert_eq!(
+            pool.bucket.tokens(),
+            7,
+            "a ceiling refusal must not take a token"
+        );
+        assert_eq!(
+            alloc(&mut pool, 2, t0).unwrap(),
+            (vips[1], false),
+            "a name that already has a mapping must still resolve at the ceiling"
+        );
+    }
+
+    #[test]
+    fn ceiling_is_checked_before_the_rate_limit() {
+        let t0 = Instant::now();
+        // The bucket empties exactly as the ceiling is reached.
+        let mut pool = limited_pool(3, 3, 1);
+        for i in 1..=3u8 {
+            alloc(&mut pool, i, t0).unwrap();
+        }
+        assert_eq!(pool.bucket.tokens(), 0);
+        assert!(
+            matches!(alloc(&mut pool, 4, t0), Err(PoolError::AtCeiling(3))),
+            "a name refused at the ceiling must report the ceiling, not the rate"
+        );
+    }
+
+    #[test]
+    fn rate_limit_refuses_a_burst_keeps_existing_names_and_refills() {
+        let t0 = Instant::now();
+        let mut pool = limited_pool(100, 2, 1);
+        let (vip1, _) = alloc(&mut pool, 1, t0).unwrap();
+        alloc(&mut pool, 2, t0).unwrap();
+        assert!(
+            matches!(alloc(&mut pool, 3, t0), Err(PoolError::RateLimited)),
+            "a third new name at the same instant must be refused by a burst of 2"
+        );
+
+        assert_eq!(
+            alloc(&mut pool, 1, t0).unwrap(),
+            (vip1, false),
+            "an existing name must resolve with the bucket empty"
+        );
+        assert_eq!(pool.bucket.tokens(), 0);
+        assert!(
+            matches!(alloc(&mut pool, 3, t0), Err(PoolError::RateLimited)),
+            "resolving an existing name must not have freed a token"
+        );
+
+        let (_, is_new) = alloc(&mut pool, 3, t0 + Duration::from_secs(1)).unwrap();
+        assert!(is_new, "one refill interval later a new name must allocate");
+    }
+
+    #[test]
+    fn exhausted_pool_takes_no_token() {
+        let t0 = Instant::now();
+        // /126 = 3 usable addresses.
+        let mut pool = VirtualIpPool::with_limits("fd01::/126", 60, 60, 100, 10, 1).unwrap();
+        for i in 1..=3u8 {
+            alloc(&mut pool, i, t0).unwrap();
+        }
+        assert!(matches!(
+            alloc(&mut pool, 4, t0),
+            Err(PoolError::Exhausted(3))
+        ));
+        assert_eq!(
+            pool.bucket.tokens(),
+            7,
+            "a refusal for an exhausted pool must not take a token"
         );
     }
 

@@ -4,7 +4,10 @@
 //! for translating between virtual IPs and FIPS mesh addresses.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::Ipv6Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::Instant;
 use tracing::{debug, info};
 
 use rustables::expr::{
@@ -23,6 +26,73 @@ const POSTROUTING_CHAIN: &str = "postrouting";
 const DSTNAT_PRIORITY: i32 = -100;
 const SRCNAT_PRIORITY: i32 = 100;
 
+/// Largest value the kernel accepts for `SO_SNDBUFFORCE`.
+///
+/// The kernel clamps the requested value to `i32::MAX / 2` and then doubles
+/// it, so the socket's send buffer never exceeds `2 * MAX_SNDBUF`.
+const MAX_SNDBUF: libc::c_int = libc::c_int::MAX / 2;
+
+/// Headroom added to half the batch length when sizing the send buffer.
+const SNDBUF_HEADROOM: u64 = 64 * 1024;
+
+/// The kernel refuses a netlink message longer than the send buffer less
+/// this many bytes.
+const SNDBUF_OVERHEAD: u64 = 32;
+
+/// How long the rebuild waits for the kernel's acknowledgement. The rebuild
+/// runs inside the gateway's event loop, so this bounds the stall there.
+const ACK_TIMEOUT_SECS: libc::time_t = 5;
+
+/// Length of a `struct nlmsghdr`.
+const NLMSG_HDRLEN: usize = 16;
+
+/// An errno value, displayed by name and number, e.g. `EMSGSIZE (90)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Errno(pub i32);
+
+impl Errno {
+    /// The errno of the last failed libc call on this thread.
+    fn last() -> Self {
+        Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
+
+    /// The symbolic name of the errno, for the values netlink can return.
+    fn name(self) -> &'static str {
+        match self.0 {
+            libc::EPERM => "EPERM",
+            libc::ENOENT => "ENOENT",
+            libc::EINTR => "EINTR",
+            libc::EBADF => "EBADF",
+            libc::EAGAIN => "EAGAIN",
+            libc::ENOMEM => "ENOMEM",
+            libc::EACCES => "EACCES",
+            libc::EFAULT => "EFAULT",
+            libc::EBUSY => "EBUSY",
+            libc::EEXIST => "EEXIST",
+            libc::ENODEV => "ENODEV",
+            libc::EINVAL => "EINVAL",
+            libc::ENFILE => "ENFILE",
+            libc::EMFILE => "EMFILE",
+            libc::ENOSPC => "ENOSPC",
+            libc::ERANGE => "ERANGE",
+            libc::ELOOP => "ELOOP",
+            libc::EMSGSIZE => "EMSGSIZE",
+            libc::EPROTONOSUPPORT => "EPROTONOSUPPORT",
+            libc::EOPNOTSUPP => "EOPNOTSUPP",
+            libc::EAFNOSUPPORT => "EAFNOSUPPORT",
+            libc::ENOBUFS => "ENOBUFS",
+            libc::ETIMEDOUT => "ETIMEDOUT",
+            _ => "errno",
+        }
+    }
+}
+
+impl fmt::Display for Errno {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.name(), self.0)
+    }
+}
+
 /// Errors from NAT operations.
 #[derive(Debug, thiserror::Error)]
 pub enum NatError {
@@ -30,6 +100,18 @@ pub enum NatError {
     Nftables(String),
     #[error("rule not found for virtual IP {0}")]
     RuleNotFound(Ipv6Addr),
+    /// The kernel rejected a message of the NAT batch; the batch was aborted.
+    #[error("kernel rejected netlink message {seq} of the NAT batch: {errno}")]
+    Kernel { errno: Errno, seq: u32 },
+    /// A netlink socket call failed.
+    #[error("netlink socket {op} failed: {errno}")]
+    Socket { op: &'static str, errno: Errno },
+    /// The batch is larger than any netlink send buffer the kernel allows.
+    #[error(
+        "NAT batch of {bytes} bytes exceeds the kernel's netlink limit of {} bytes",
+        admissible_limit()
+    )]
+    BatchTooLarge { bytes: usize },
 }
 
 impl From<rustables::error::QueryError> for NatError {
@@ -54,8 +136,8 @@ struct NatMapping {
 /// One object a NAT rebuild sends, named rather than built.
 ///
 /// `rebuild_batches` decides what a rebuild sends and in what order;
-/// `send_batches` turns that decision into rustables objects and hands each
-/// batch to the kernel. The split is what lets a test see the delete and the
+/// `encode_batch` turns that decision into netlink bytes and `send_batch`
+/// hands them to the kernel. The split is what lets a test see the delete and the
 /// recreate share one transaction without a netlink socket, which is the
 /// property that keeps the table in the packet path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,14 +243,26 @@ impl NatManager {
                 mesh_addr,
             },
         );
-        self.rebuild()?;
-
-        debug!(
-            virtual_ip = %virtual_ip,
-            mesh_addr = %mesh_addr,
-            "Added DNAT/SNAT rules"
-        );
-        Ok(())
+        let (result, elapsed_us) = self.timed_rebuild();
+        let mappings = self.mappings.len();
+        match &result {
+            Ok(()) => debug!(
+                virtual_ip = %virtual_ip,
+                mesh_addr = %mesh_addr,
+                mappings,
+                elapsed_us,
+                "Added DNAT/SNAT rules"
+            ),
+            Err(e) => debug!(
+                virtual_ip = %virtual_ip,
+                mesh_addr = %mesh_addr,
+                mappings,
+                elapsed_us,
+                error = %e,
+                "Added DNAT/SNAT rules"
+            ),
+        }
+        result
     }
 
     /// Remove DNAT and SNAT rules for a virtual IP mapping.
@@ -176,10 +270,24 @@ impl NatManager {
         if self.mappings.remove(&virtual_ip).is_none() {
             return Err(NatError::RuleNotFound(virtual_ip));
         }
-        self.rebuild()?;
-
-        debug!(virtual_ip = %virtual_ip, "Removed DNAT/SNAT rules");
-        Ok(())
+        let (result, elapsed_us) = self.timed_rebuild();
+        let mappings = self.mappings.len();
+        match &result {
+            Ok(()) => debug!(
+                virtual_ip = %virtual_ip,
+                mappings,
+                elapsed_us,
+                "Removed DNAT/SNAT rules"
+            ),
+            Err(e) => debug!(
+                virtual_ip = %virtual_ip,
+                mappings,
+                elapsed_us,
+                error = %e,
+                "Removed DNAT/SNAT rules"
+            ),
+        }
+        result
     }
 
     /// Flush all rules and delete the nftables table.
@@ -188,7 +296,7 @@ impl NatManager {
         batch.add(&self.table, MsgType::Del);
         batch
             .send()
-            .map_err(|e| NatError::Nftables(e.to_string()))?;
+            .map_err(|e| NatError::Nftables(error_chain(&e)))?;
 
         info!("Deleted nftables table '{TABLE_NAME}'");
         Ok(())
@@ -238,133 +346,137 @@ impl NatManager {
         vec![ops]
     }
 
-    /// Build each op into its rustables object and send the batches in order.
-    fn send_batches(&self, batches: &[Vec<NatOp>]) -> Result<(), NatError> {
-        for ops in batches {
-            let mut batch = Batch::new();
-            for op in ops {
-                match *op {
-                    NatOp::Table(msg_type) => batch.add(&self.table, msg_type),
-                    NatOp::PreChain => batch.add(&self.pre_chain, MsgType::Add),
-                    NatOp::PostChain => batch.add(&self.post_chain, MsgType::Add),
-                    NatOp::FipsMasquerade => {
-                        // Rewrite the source address of traffic leaving fips0.
-                        // Without this, LAN clients' source addresses (e.g.
-                        // fd02::20) are not routable on the mesh, so return
-                        // traffic would be black-holed.
-                        let rule = Rule::new(&self.post_chain)?
-                            .with_expr(Meta::new(MetaType::OifName))
-                            .with_expr(Cmp::new(CmpOp::Eq, b"fips0\0".to_vec()))
-                            .with_expr(Masquerade::default());
-                        batch.add(&rule, MsgType::Add);
-                    }
-                    NatOp::Dnat(virtual_ip) => {
-                        let mapping = self.mapping(virtual_ip)?;
-                        let rule = Rule::new(&self.pre_chain)?
-                            .with_expr(Meta::new(MetaType::NfProto))
-                            .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
-                            .with_expr(
-                                HighLevelPayload::Network(NetworkHeaderField::IPv6(
-                                    IPv6HeaderField::Daddr,
-                                ))
-                                .build(),
-                            )
-                            .with_expr(Cmp::new(CmpOp::Eq, mapping.virtual_ip.octets()))
-                            .with_expr(Immediate::new_data(
-                                mapping.mesh_addr.octets().to_vec(),
-                                Register::Reg1,
+    /// Build each op into its rustables object and encode the batch.
+    ///
+    /// Only the last object before the batch end requests an
+    /// acknowledgement. rustables sets `NLM_F_ACK` on every message, and one
+    /// ack per message overflows the socket's receive buffer from about a
+    /// hundred mappings, after the kernel has already committed the batch.
+    /// The kernel reports a failing message whatever its flags, so errors
+    /// stay attributable.
+    fn encode_batch(&self, ops: &[NatOp]) -> Result<Vec<u8>, NatError> {
+        let mut batch = Batch::new();
+        for op in ops {
+            match *op {
+                NatOp::Table(msg_type) => batch.add(&self.table, msg_type),
+                NatOp::PreChain => batch.add(&self.pre_chain, MsgType::Add),
+                NatOp::PostChain => batch.add(&self.post_chain, MsgType::Add),
+                NatOp::FipsMasquerade => {
+                    // Rewrite the source address of traffic leaving fips0.
+                    // Without this, LAN clients' source addresses (e.g.
+                    // fd02::20) are not routable on the mesh, so return
+                    // traffic would be black-holed.
+                    let rule = Rule::new(&self.post_chain)?
+                        .with_expr(Meta::new(MetaType::OifName))
+                        .with_expr(Cmp::new(CmpOp::Eq, b"fips0\0".to_vec()))
+                        .with_expr(Masquerade::default());
+                    batch.add(&rule, MsgType::Add);
+                }
+                NatOp::Dnat(virtual_ip) => {
+                    let mapping = self.mapping(virtual_ip)?;
+                    let rule = Rule::new(&self.pre_chain)?
+                        .with_expr(Meta::new(MetaType::NfProto))
+                        .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
+                        .with_expr(
+                            HighLevelPayload::Network(NetworkHeaderField::IPv6(
+                                IPv6HeaderField::Daddr,
                             ))
-                            .with_expr(
-                                Nat::default()
-                                    .with_nat_type(NatType::DNat)
-                                    .with_family(ProtocolFamily::Ipv6)
-                                    .with_ip_register(Register::Reg1),
-                            );
-                        batch.add(&rule, MsgType::Add);
-                    }
-                    NatOp::Snat(virtual_ip) => {
-                        let mapping = self.mapping(virtual_ip)?;
-                        let rule = Rule::new(&self.post_chain)?
-                            .with_expr(Meta::new(MetaType::NfProto))
-                            .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
-                            .with_expr(
-                                HighLevelPayload::Network(NetworkHeaderField::IPv6(
-                                    IPv6HeaderField::Saddr,
-                                ))
-                                .build(),
-                            )
-                            .with_expr(Cmp::new(CmpOp::Eq, mapping.mesh_addr.octets()))
-                            .with_expr(Immediate::new_data(
-                                mapping.virtual_ip.octets().to_vec(),
-                                Register::Reg1,
-                            ))
-                            .with_expr(
-                                Nat::default()
-                                    .with_nat_type(NatType::SNat)
-                                    .with_family(ProtocolFamily::Ipv6)
-                                    .with_ip_register(Register::Reg1),
-                            );
-                        batch.add(&rule, MsgType::Add);
-                    }
-                    NatOp::PortForward(index) => {
-                        let pf = self.port_forwards.get(index).expect(
-                            "rebuild_batches only emits indices it read from port_forwards",
+                            .build(),
+                        )
+                        .with_expr(Cmp::new(CmpOp::Eq, mapping.virtual_ip.octets()))
+                        .with_expr(Immediate::new_data(
+                            mapping.mesh_addr.octets().to_vec(),
+                            Register::Reg1,
+                        ))
+                        .with_expr(
+                            Nat::default()
+                                .with_nat_type(NatType::DNat)
+                                .with_family(ProtocolFamily::Ipv6)
+                                .with_ip_register(Register::Reg1),
                         );
-                        let l4proto: u8 = match pf.proto {
-                            Proto::Tcp => libc::IPPROTO_TCP as u8,
-                            Proto::Udp => libc::IPPROTO_UDP as u8,
-                        };
-                        let dport_field = match pf.proto {
-                            Proto::Tcp => TransportHeaderField::Tcp(TCPHeaderField::Dport),
-                            Proto::Udp => TransportHeaderField::Udp(UDPHeaderField::Dport),
-                        };
-                        let target_ip = *pf.target.ip();
-                        let target_port_be = pf.target.port().to_be_bytes();
-
-                        let rule = Rule::new(&self.pre_chain)?
-                            .with_expr(Meta::new(MetaType::IifName))
-                            .with_expr(Cmp::new(CmpOp::Eq, b"fips0\0".to_vec()))
-                            .with_expr(Meta::new(MetaType::NfProto))
-                            .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
-                            .with_expr(Meta::new(MetaType::L4Proto))
-                            .with_expr(Cmp::new(CmpOp::Eq, [l4proto]))
-                            .with_expr(HighLevelPayload::Transport(dport_field).build())
-                            .with_expr(Cmp::new(CmpOp::Eq, pf.listen_port.to_be_bytes().to_vec()))
-                            .with_expr(Immediate::new_data(
-                                target_ip.octets().to_vec(),
-                                Register::Reg1,
+                    batch.add(&rule, MsgType::Add);
+                }
+                NatOp::Snat(virtual_ip) => {
+                    let mapping = self.mapping(virtual_ip)?;
+                    let rule = Rule::new(&self.post_chain)?
+                        .with_expr(Meta::new(MetaType::NfProto))
+                        .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
+                        .with_expr(
+                            HighLevelPayload::Network(NetworkHeaderField::IPv6(
+                                IPv6HeaderField::Saddr,
                             ))
-                            .with_expr(Immediate::new_data(target_port_be.to_vec(), Register::Reg2))
-                            .with_expr(
-                                Nat::default()
-                                    .with_nat_type(NatType::DNat)
-                                    .with_family(ProtocolFamily::Ipv6)
-                                    .with_ip_register(Register::Reg1)
-                                    .with_port_register(Register::Reg2),
-                            );
-                        batch.add(&rule, MsgType::Add);
-                    }
-                    NatOp::LanMasquerade => {
-                        let mut lan_iface = self.lan_interface.clone().into_bytes();
-                        lan_iface.push(0);
-                        let rule = Rule::new(&self.post_chain)?
-                            .with_expr(Meta::new(MetaType::IifName))
-                            .with_expr(Cmp::new(CmpOp::Eq, b"fips0\0".to_vec()))
-                            .with_expr(Meta::new(MetaType::OifName))
-                            .with_expr(Cmp::new(CmpOp::Eq, lan_iface))
-                            .with_expr(Meta::new(MetaType::NfProto))
-                            .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
-                            .with_expr(Masquerade::default());
-                        batch.add(&rule, MsgType::Add);
-                    }
+                            .build(),
+                        )
+                        .with_expr(Cmp::new(CmpOp::Eq, mapping.mesh_addr.octets()))
+                        .with_expr(Immediate::new_data(
+                            mapping.virtual_ip.octets().to_vec(),
+                            Register::Reg1,
+                        ))
+                        .with_expr(
+                            Nat::default()
+                                .with_nat_type(NatType::SNat)
+                                .with_family(ProtocolFamily::Ipv6)
+                                .with_ip_register(Register::Reg1),
+                        );
+                    batch.add(&rule, MsgType::Add);
+                }
+                NatOp::PortForward(index) => {
+                    let pf = self
+                        .port_forwards
+                        .get(index)
+                        .expect("rebuild_batches only emits indices it read from port_forwards");
+                    let l4proto: u8 = match pf.proto {
+                        Proto::Tcp => libc::IPPROTO_TCP as u8,
+                        Proto::Udp => libc::IPPROTO_UDP as u8,
+                    };
+                    let dport_field = match pf.proto {
+                        Proto::Tcp => TransportHeaderField::Tcp(TCPHeaderField::Dport),
+                        Proto::Udp => TransportHeaderField::Udp(UDPHeaderField::Dport),
+                    };
+                    let target_ip = *pf.target.ip();
+                    let target_port_be = pf.target.port().to_be_bytes();
+
+                    let rule = Rule::new(&self.pre_chain)?
+                        .with_expr(Meta::new(MetaType::IifName))
+                        .with_expr(Cmp::new(CmpOp::Eq, b"fips0\0".to_vec()))
+                        .with_expr(Meta::new(MetaType::NfProto))
+                        .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
+                        .with_expr(Meta::new(MetaType::L4Proto))
+                        .with_expr(Cmp::new(CmpOp::Eq, [l4proto]))
+                        .with_expr(HighLevelPayload::Transport(dport_field).build())
+                        .with_expr(Cmp::new(CmpOp::Eq, pf.listen_port.to_be_bytes().to_vec()))
+                        .with_expr(Immediate::new_data(
+                            target_ip.octets().to_vec(),
+                            Register::Reg1,
+                        ))
+                        .with_expr(Immediate::new_data(target_port_be.to_vec(), Register::Reg2))
+                        .with_expr(
+                            Nat::default()
+                                .with_nat_type(NatType::DNat)
+                                .with_family(ProtocolFamily::Ipv6)
+                                .with_ip_register(Register::Reg1)
+                                .with_port_register(Register::Reg2),
+                        );
+                    batch.add(&rule, MsgType::Add);
+                }
+                NatOp::LanMasquerade => {
+                    let mut lan_iface = self.lan_interface.clone().into_bytes();
+                    lan_iface.push(0);
+                    let rule = Rule::new(&self.post_chain)?
+                        .with_expr(Meta::new(MetaType::IifName))
+                        .with_expr(Cmp::new(CmpOp::Eq, b"fips0\0".to_vec()))
+                        .with_expr(Meta::new(MetaType::OifName))
+                        .with_expr(Cmp::new(CmpOp::Eq, lan_iface))
+                        .with_expr(Meta::new(MetaType::NfProto))
+                        .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
+                        .with_expr(Masquerade::default());
+                    batch.add(&rule, MsgType::Add);
                 }
             }
-
-            batch
-                .send()
-                .map_err(|e| NatError::Nftables(e.to_string()))?;
         }
-        Ok(())
+        let mut bytes = batch.finalize();
+        keep_last_ack(&mut bytes)?;
+        Ok(bytes)
     }
 
     /// The mapping an op names, or the error a caller can report.
@@ -377,10 +489,372 @@ impl NatManager {
     /// Rebuild the entire nftables table with all current rules, in one
     /// netlink transaction.
     fn rebuild(&self) -> Result<(), NatError> {
-        self.send_batches(&self.rebuild_batches())
+        for ops in self.rebuild_batches() {
+            send_batch(&self.encode_batch(&ops)?)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild, returning the outcome with the time the rebuild took in
+    /// microseconds, so a mapping change can log its cost on either path.
+    fn timed_rebuild(&self) -> (Result<(), NatError>, u64) {
+        let started = Instant::now();
+        let result = self.rebuild();
+        let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        (result, elapsed_us)
     }
 }
 
+/// Largest batch, in bytes, that the kernel can admit in one send.
+fn admissible_limit() -> u64 {
+    2 * MAX_SNDBUF as u64 - SNDBUF_OVERHEAD
+}
+
+/// The `SO_SNDBUFFORCE` value that lets a batch of `len` bytes through.
+///
+/// The kernel doubles the value it is given and refuses a message longer
+/// than the result less 32 bytes, so half the length plus headroom is
+/// enough. Saturates at the kernel's own clamp rather than wrapping.
+fn sndbuf_for(len: usize) -> libc::c_int {
+    let want = (u64::try_from(len).unwrap_or(u64::MAX) / 2).saturating_add(SNDBUF_HEADROOM);
+    libc::c_int::try_from(want.min(MAX_SNDBUF as u64)).unwrap_or(MAX_SNDBUF)
+}
+
+/// Refuse a batch the kernel could not accept at any send-buffer size.
+fn check_admissible(len: usize) -> Result<(), NatError> {
+    if u64::try_from(len).unwrap_or(u64::MAX) > admissible_limit() {
+        return Err(NatError::BatchTooLarge { bytes: len });
+    }
+    Ok(())
+}
+
+/// The fields of one `struct nlmsghdr` that the NAT batch code reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NlHeader {
+    /// Offset of the header within the buffer.
+    offset: usize,
+    /// `nlmsg_len`: header plus payload, without alignment padding.
+    len: usize,
+    kind: u16,
+    flags: u16,
+    seq: u32,
+}
+
+impl NlHeader {
+    /// The message's payload, after the header.
+    fn payload<'a>(&self, buf: &'a [u8]) -> &'a [u8] {
+        &buf[self.offset + NLMSG_HDRLEN..self.offset + self.len]
+    }
+}
+
+/// Walk every netlink message header in `buf`.
+///
+/// Fails on a header shorter than `struct nlmsghdr` or a length that runs
+/// past the end of the buffer.
+fn nl_headers(buf: &[u8]) -> Result<Vec<NlHeader>, NatError> {
+    let mut headers = Vec::new();
+    let mut offset = 0;
+    while offset < buf.len() {
+        let rest = &buf[offset..];
+        if rest.len() < NLMSG_HDRLEN {
+            return Err(NatError::Nftables(format!(
+                "malformed netlink message at offset {offset}: {} bytes left, header needs {NLMSG_HDRLEN}",
+                rest.len()
+            )));
+        }
+        let field = |at: usize, width: usize| &rest[at..at + width];
+        let len = u32::from_ne_bytes(field(0, 4).try_into().expect("4-byte slice")) as usize;
+        if len < NLMSG_HDRLEN || len > rest.len() {
+            return Err(NatError::Nftables(format!(
+                "malformed netlink message at offset {offset}: length {len} with {} bytes left",
+                rest.len()
+            )));
+        }
+        headers.push(NlHeader {
+            offset,
+            len,
+            kind: u16::from_ne_bytes(field(4, 2).try_into().expect("2-byte slice")),
+            flags: u16::from_ne_bytes(field(6, 2).try_into().expect("2-byte slice")),
+            seq: u32::from_ne_bytes(field(8, 4).try_into().expect("4-byte slice")),
+        });
+        // Netlink messages are 4-byte aligned.
+        offset += (len + 3) & !3;
+    }
+    Ok(headers)
+}
+
+/// The finalized batch's objects: every message between the batch begin
+/// and the batch end.
+fn batch_objects(headers: &[NlHeader]) -> Result<&[NlHeader], NatError> {
+    match headers {
+        [_begin, objects @ .., _end] if !objects.is_empty() => Ok(objects),
+        _ => Err(NatError::Nftables(format!(
+            "NAT batch holds {} messages; it needs a begin, an object and an end",
+            headers.len()
+        ))),
+    }
+}
+
+/// Clear `NLM_F_ACK` on every message of a finalized batch except the last
+/// object before the batch end.
+fn keep_last_ack(buf: &mut [u8]) -> Result<(), NatError> {
+    let headers = nl_headers(buf)?;
+    let last = batch_objects(&headers)?
+        .last()
+        .expect("batch_objects returns a non-empty slice")
+        .offset;
+    let ack = libc::NLM_F_ACK as u16;
+    for header in &headers {
+        let flags = if header.offset == last {
+            header.flags | ack
+        } else {
+            header.flags & !ack
+        };
+        buf[header.offset + 6..header.offset + 8].copy_from_slice(&flags.to_ne_bytes());
+    }
+    Ok(())
+}
+
+/// What the kernel's replies to a NAT batch have shown so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckState {
+    /// No verdict yet; read another datagram.
+    Pending,
+    /// The acknowledgement of the batch's last object arrived with no error
+    /// before it.
+    Done,
+}
+
+/// Reads the kernel's replies to a NAT batch, one datagram at a time.
+///
+/// The kernel aborts the whole batch when any message fails, yet it still
+/// acknowledges the last message after the error. So the last ack alone does
+/// not prove success: any error that arrives before it fails the batch.
+struct AckReader {
+    /// Sequence number of the one message that requested an ack.
+    last_seq: u32,
+}
+
+impl AckReader {
+    /// Consume one received datagram, which may carry several messages.
+    fn feed(&self, datagram: &[u8]) -> Result<AckState, NatError> {
+        for header in nl_headers(datagram)? {
+            if i32::from(header.kind) != libc::NLMSG_ERROR {
+                continue;
+            }
+            let payload = header.payload(datagram);
+            if payload.len() < 4 {
+                return Err(NatError::Nftables(format!(
+                    "malformed netlink error message: {} payload bytes, error field needs 4",
+                    payload.len()
+                )));
+            }
+            let error = i32::from_ne_bytes(payload[..4].try_into().expect("4-byte slice"));
+            if error != 0 {
+                return Err(NatError::Kernel {
+                    errno: Errno(error.saturating_neg()),
+                    seq: header.seq,
+                });
+            }
+            if header.seq == self.last_seq {
+                return Ok(AckState::Done);
+            }
+        }
+        Ok(AckState::Pending)
+    }
+}
+
+/// Render an error with every source beneath it, so a wrapped errno is kept.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(inner) = source {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        source = inner.source();
+    }
+    text
+}
+
+/// Set an integer socket option.
+fn set_int_opt(
+    sock: &OwnedFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> Result<(), Errno> {
+    // SAFETY: the descriptor is open for the life of `sock`, and the pointer
+    // and length describe `value`, a c_int.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            level,
+            name,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 { Err(Errno::last()) } else { Ok(()) }
+}
+
+/// Size of the buffer each reply datagram is read into.
+///
+/// The largest message nftables sends back, as rustables computes it
+/// (`nft_nlmsg_maxsize`, which it does not export), and at least 64 KiB.
+fn recv_buffer_len() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (usize::from(u16::MAX) + usize::try_from(page).unwrap_or(0)).max(64 * 1024)
+}
+
+/// Open a netfilter netlink socket sized for a batch of `len` bytes.
+fn open_batch_socket(len: usize) -> Result<OwnedFd, NatError> {
+    let socket_err = |op| move |errno| NatError::Socket { op, errno };
+
+    // SAFETY: socket has no memory preconditions.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_NETFILTER,
+        )
+    };
+    if fd < 0 {
+        return Err(socket_err("open")(Errno::last()));
+    }
+    // SAFETY: socket returned a new descriptor that nothing else owns.
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    // SAFETY: an all-zero sockaddr_nl is valid; the family is set below.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: the pointer and length describe `addr`, a sockaddr_nl.
+    let rc = unsafe {
+        libc::bind(
+            sock.as_raw_fd(),
+            (&addr as *const libc::sockaddr_nl).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(socket_err("bind")(Errno::last()));
+    }
+
+    // Without CAP_NET_ADMIN the forced size is refused; the plain option is
+    // then capped by wmem_max, and an oversized batch fails with EMSGSIZE.
+    let sndbuf = sndbuf_for(len);
+    match set_int_opt(&sock, libc::SOL_SOCKET, libc::SO_SNDBUFFORCE, sndbuf) {
+        Err(Errno(libc::EPERM)) => {
+            set_int_opt(&sock, libc::SOL_SOCKET, libc::SO_SNDBUF, sndbuf)
+                .map_err(socket_err("setsockopt SO_SNDBUF"))?;
+        }
+        other => other.map_err(socket_err("setsockopt SO_SNDBUFFORCE"))?,
+    }
+    // An error ack then carries only the failing header, not the message.
+    set_int_opt(&sock, libc::SOL_NETLINK, libc::NETLINK_CAP_ACK, 1)
+        .map_err(socket_err("setsockopt NETLINK_CAP_ACK"))?;
+
+    let timeout = libc::timeval {
+        tv_sec: ACK_TIMEOUT_SECS,
+        tv_usec: 0,
+    };
+    // SAFETY: the pointer and length describe `timeout`, a timeval.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&timeout as *const libc::timeval).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(socket_err("setsockopt SO_RCVTIMEO")(Errno::last()));
+    }
+    Ok(sock)
+}
+
+/// Send one encoded NAT batch and wait for the kernel's verdict.
+///
+/// The batch goes out in a single send, so the kernel applies it as one
+/// transaction. The send buffer is sized to the batch, because the default
+/// one refuses a message past about 208 KiB, which is about 313 mappings.
+fn send_batch(bytes: &[u8]) -> Result<(), NatError> {
+    check_admissible(bytes.len())?;
+    let headers = nl_headers(bytes)?;
+    let reader = AckReader {
+        last_seq: batch_objects(&headers)?
+            .last()
+            .expect("batch_objects returns a non-empty slice")
+            .seq,
+    };
+    let sock = open_batch_socket(bytes.len())?;
+
+    let sent = loop {
+        // SAFETY: the pointer and length describe `bytes`.
+        let rc = unsafe { libc::send(sock.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0) };
+        if rc >= 0 {
+            break rc as usize;
+        }
+        let errno = Errno::last();
+        if errno.0 != libc::EINTR {
+            return Err(NatError::Socket { op: "send", errno });
+        }
+    };
+    if sent != bytes.len() {
+        return Err(NatError::Nftables(format!(
+            "netlink send took {sent} of {} bytes",
+            bytes.len()
+        )));
+    }
+
+    let mut buf = vec![0u8; recv_buffer_len()];
+    loop {
+        // MSG_TRUNC makes a netlink recv return the datagram's full length,
+        // so a reply larger than the buffer is detected rather than cut.
+        // SAFETY: the pointer and length describe `buf`.
+        let rc = unsafe {
+            libc::recv(
+                sock.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_TRUNC,
+            )
+        };
+        if rc < 0 {
+            let errno = Errno::last();
+            if errno.0 == libc::EINTR {
+                continue;
+            }
+            // EAGAIN is the receive timeout. ENOBUFS means error acks
+            // overflowed the receive buffer, since only one ack is requested.
+            return Err(NatError::Socket { op: "recv", errno });
+        }
+        let got = rc as usize;
+        if got == 0 {
+            return Err(NatError::Nftables(
+                "netlink socket returned no reply".into(),
+            ));
+        }
+        if got > buf.len() {
+            return Err(NatError::Nftables(format!(
+                "netlink reply of {got} bytes truncated to {}",
+                buf.len()
+            )));
+        }
+        if reader.feed(&buf[..got])? == AckState::Done {
+            return Ok(());
+        }
+    }
+}
+
+// Coverage gap. These tests run unprivileged and open no netlink socket, so
+// three failure paths in `open_socket` and `send_batch` go unexercised here.
+// The receive timeout firing and a reply longer than the buffer (seen through
+// `MSG_TRUNC`) need a kernel fault to provoke, so nothing runs them. The
+// `SO_SNDBUF` fallback after `SO_SNDBUFFORCE` returns `EPERM` needs a process
+// without CAP_NET_ADMIN, and the gateway suite's container is privileged, so
+// nothing runs that either. The gateway suite covers only the success path.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,5 +970,177 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// The encoded rebuild of a manager holding `count` mappings.
+    fn encoded_rebuild(count: u16) -> Vec<u8> {
+        let mgr = manager_with_mappings(count);
+        let ops = mgr.rebuild_batches().remove(0);
+        mgr.encode_batch(&ops).expect("the rebuild encodes")
+    }
+
+    /// One netlink message, padded to 4 bytes.
+    fn nlmsg(kind: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let len = (NLMSG_HDRLEN + payload.len()) as u32;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&len.to_ne_bytes());
+        msg.extend_from_slice(&kind.to_ne_bytes());
+        msg.extend_from_slice(&0u16.to_ne_bytes());
+        msg.extend_from_slice(&seq.to_ne_bytes());
+        msg.extend_from_slice(&0u32.to_ne_bytes());
+        msg.extend_from_slice(payload);
+        msg.resize(msg.len().div_ceil(4) * 4, 0);
+        msg
+    }
+
+    /// The kernel's `NLMSG_ERROR` reply to message `seq`, as it sends it on a
+    /// socket with `NETLINK_CAP_ACK`: the error, then the request's header.
+    fn ack(seq: u32, error: i32) -> Vec<u8> {
+        let mut payload = error.to_ne_bytes().to_vec();
+        payload.extend_from_slice(&nlmsg(0x0a00, seq, &[])[..NLMSG_HDRLEN]);
+        nlmsg(libc::NLMSG_ERROR as u16, seq, &payload)
+    }
+
+    /// The largest batch the kernel admits: twice its send-buffer clamp,
+    /// less the 32 bytes netlink reserves.
+    const KERNEL_BATCH_LIMIT: usize = 2_147_483_614;
+
+    #[test]
+    fn rebuild_for_2000_mappings_requests_exactly_one_ack_on_the_last_message() {
+        let encoded = encoded_rebuild(2000);
+        assert!(
+            encoded.len() > 212_960,
+            "the 2000-mapping batch ({} bytes) must be past the default \
+             netlink send limit for this test to cover the large case",
+            encoded.len()
+        );
+
+        let headers = nl_headers(&encoded).expect("the batch parses");
+        assert_eq!(
+            headers.first().map(|h| h.kind),
+            Some(libc::NFNL_MSG_BATCH_BEGIN as u16)
+        );
+        assert_eq!(
+            headers.last().map(|h| h.kind),
+            Some(libc::NFNL_MSG_BATCH_END as u16)
+        );
+        let acked: Vec<usize> = headers
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.flags & libc::NLM_F_ACK as u16 != 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            acked,
+            vec![headers.len() - 2],
+            "only the last object before the batch end may request an ack; \
+             one ack per message overflows the receive buffer after the \
+             kernel has committed the batch"
+        );
+    }
+
+    #[test]
+    fn sndbuf_for_admits_the_2000_mapping_batch_and_small_batches_after_kernel_doubling() {
+        let large = encoded_rebuild(2000).len();
+        for len in [large, 0, 1, 212_961] {
+            let sndbuf = sndbuf_for(len);
+            assert!(
+                2 * sndbuf as u64 - 32 >= len as u64,
+                "a send buffer of {sndbuf}, doubled by the kernel, refuses a \
+                 {len}-byte batch"
+            );
+        }
+    }
+
+    #[test]
+    fn sndbuf_for_saturates_at_the_kernel_clamp_for_huge_batches() {
+        for len in [2 * MAX_SNDBUF as usize, usize::MAX] {
+            assert_eq!(sndbuf_for(len), i32::MAX / 2, "sndbuf_for({len})");
+        }
+    }
+
+    #[test]
+    fn check_admissible_refuses_a_batch_larger_than_the_kernel_can_accept() {
+        assert!(check_admissible(KERNEL_BATCH_LIMIT).is_ok());
+        for len in [KERNEL_BATCH_LIMIT + 1, usize::MAX] {
+            match check_admissible(len) {
+                Err(e @ NatError::BatchTooLarge { bytes }) => {
+                    assert_eq!(bytes, len);
+                    assert!(
+                        e.to_string().contains(&len.to_string()),
+                        "the error names the batch size: {e}"
+                    );
+                }
+                other => panic!("a {len}-byte batch was admitted: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ack_reader_fails_on_an_error_that_precedes_the_last_ack() {
+        // The kernel aborts the batch on a failing rule mid-batch, reports
+        // that rule's error, and still acknowledges the last message.
+        let reader = AckReader { last_seq: 4000 };
+        let error = ack(1234, -libc::ENOENT);
+        let last = ack(4000, 0);
+
+        let expect_error = |result: Result<AckState, NatError>| match result {
+            Err(NatError::Kernel { errno, seq }) => {
+                assert_eq!(errno, Errno(libc::ENOENT));
+                assert_eq!(seq, 1234);
+            }
+            other => panic!("the aborted batch was not reported: {other:?}"),
+        };
+
+        expect_error(reader.feed(&error));
+        expect_error(reader.feed(&[error.clone(), last.clone()].concat()));
+    }
+
+    #[test]
+    fn ack_reader_is_done_only_on_the_last_sequence_ack() {
+        let reader = AckReader { last_seq: 10 };
+
+        assert_eq!(reader.feed(&ack(10, 0)).expect("parses"), AckState::Done);
+        assert_eq!(reader.feed(&ack(5, 0)).expect("parses"), AckState::Pending);
+        assert_eq!(
+            reader
+                .feed(&nlmsg(libc::NLMSG_NOOP as u16, 10, &[]))
+                .expect("parses"),
+            AckState::Pending
+        );
+        assert_eq!(
+            reader
+                .feed(&[ack(5, 0), ack(10, 0)].concat())
+                .expect("parses"),
+            AckState::Done
+        );
+
+        let whole = ack(10, 0);
+        assert!(
+            reader.feed(&whole[..8]).is_err(),
+            "a header shorter than 16 bytes"
+        );
+        let mut overlong = whole.clone();
+        overlong[..4].copy_from_slice(&((whole.len() + 4) as u32).to_ne_bytes());
+        assert!(
+            reader.feed(&overlong).is_err(),
+            "a length past the end of the datagram"
+        );
+        let short = nlmsg(libc::NLMSG_ERROR as u16, 10, &[0, 0]);
+        assert!(
+            reader.feed(&short[..NLMSG_HDRLEN + 2]).is_err(),
+            "an NLMSG_ERROR payload shorter than its error field"
+        );
+    }
+
+    #[test]
+    fn kernel_error_display_names_the_errno() {
+        let text = NatError::Kernel {
+            errno: Errno(libc::EMSGSIZE),
+            seq: 7,
+        }
+        .to_string();
+        assert!(text.contains("EMSGSIZE"), "{text}");
+        assert!(text.contains(&format!("({})", libc::EMSGSIZE)), "{text}");
     }
 }

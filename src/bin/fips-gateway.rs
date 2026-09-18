@@ -53,6 +53,12 @@ fn main() {
     std::process::exit(1);
 }
 
+/// Microseconds since `started`, saturating, for the timing fields on debug
+/// lines.
+fn elapsed_us(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 /// Take a conntrack snapshot off the runtime thread.
 ///
 /// A failed read yields an empty snapshot, so every mapping reads zero
@@ -446,14 +452,19 @@ async fn main() {
                     // the pool lock: the runtime is current-thread, so a
                     // blocking read here would stall the DNS resolver, and the
                     // read must not happen under the lock the resolver needs.
+                    let read_started = Instant::now();
                     let conntrack = read_conntrack(&mut conntrack_log).await;
+                    let read_us = elapsed_us(read_started);
                     let mut pool_guard = tick_pool.lock().await;
+                    let tick_started = Instant::now();
                     let events = pool_guard.tick(now, &conntrack);
+                    let tick_us = elapsed_us(tick_started);
 
                     // Build snapshot for control socket
                     let pool_status = pool_guard.status();
                     let mappings = pool_guard.mapping_info(now);
                     drop(pool_guard);
+                    debug!(mappings = mappings.len(), read_us, tick_us, "Pool tick");
 
                     let snapshot = control::build_snapshot(
                         pool_status,

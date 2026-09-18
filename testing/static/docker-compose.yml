@@ -423,7 +423,9 @@ services:
     # attached after container start) and manage nftables NAT rules.
     privileged: true
     environment:
-      - RUST_LOG=info
+      # Debug for the NAT rebuild and pool tick timing lines only; the
+      # gateway's --log-level is ignored while RUST_LOG is set.
+      - RUST_LOG=info,fips::gateway::nat=debug,fips_gateway=debug
       - FIPS_TEST_MODE=gateway
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0

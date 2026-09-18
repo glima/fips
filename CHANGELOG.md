@@ -861,6 +861,28 @@ with v0.5.x or earlier peers.
   now share a single batch, which the kernel applies as one transaction, so a
   refused rebuild leaves the previous table in the packet path. The rules sent
   are unchanged.
+- The gateway's NAT rebuild no longer fails once the table holds more than
+  about 105 mappings. Each rebuild is one netlink batch. From about 105
+  mappings the default socket buffers could not hold its acknowledgements, so
+  rebuilds were logged as failed although they had taken effect. Past about
+  313 mappings the buffers could not hold the batch itself, and new `.fips`
+  names past that count got a virtual IP with no translation. In releases with
+  the gateway through 0.5.1, a rebuild past about 313 mappings also deleted the
+  whole `fips_gateway` table, which stopped every mapping, the `fips0`
+  masquerade and the port forwards. The rebuild now sizes its send buffer to
+  the batch and requests one acknowledgement per batch, and NAT errors now
+  name the kernel errno. A rebuild that still fails is logged, and the next
+  successful rebuild installs the mapping.
+- The gateway's virtual-IP pool now limits how many mappings it holds and how
+  fast it creates them. Any host that can reach the LAN resolver could ask for
+  one new `.fips` name after another, and each got a mapping until the 65,535
+  addresses ran out, while every mapping made each NAT rebuild, each pool tick
+  and shutdown slower. The pool now refuses a new name once it holds 1000 live
+  mappings, and admits new names at 10 per second after a burst of 50. A
+  refused query gets SERVFAIL, and the gateway's "Pool allocation failed"
+  warning says which limit refused it. A name that already has a mapping is
+  answered before either limit is consulted, so names in use keep resolving
+  when the pool is full. The limits are compiled in, not configured.
 - A new OpenWrt install no longer enables and starts `fips-gateway`. The
   generated postinst turned it on unconditionally, contradicting the init
   script's own header, the package README and the deployment tutorial, all of
