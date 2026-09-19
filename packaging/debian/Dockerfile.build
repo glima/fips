@@ -8,6 +8,10 @@
 # This image carries the toolchain and the build dependencies only. It never
 # carries the source: the source is mounted at run time, so editing a file does
 # not invalidate the image and a warm rebuild costs seconds rather than minutes.
+#
+# A build from a git worktree carries no source revision: the worktree's .git is
+# a file pointing outside the mounted tree, so git cannot read it here. Release
+# and CI builds use full checkouts and carry one.
 ARG BASE=ubuntu:22.04
 FROM ${BASE}
 
@@ -24,9 +28,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang \
         binutils \
         dpkg-dev \
+        git \
         curl \
         ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# build.rs asks git for the revision it embeds in the binaries. The source is
+# mounted at /src owned by the host user, while the build runs as root, and git
+# refuses a repository owned by someone else: without this entry the revision is
+# silently empty, exactly as it was when the image had no git at all.
+# The dirty flag can be stale in a local container build. build.rs reruns only
+# when .git/HEAD or .git/refs change, and the target directory is a persistent
+# volume, so an uncommitted edit alone does not refresh it; git here also runs
+# without the host user's global excludes, so a file only those ignore reads as
+# dirty. Release and CI builds start from a committed, fresh tree.
+RUN git config --system --add safe.directory /src
 
 # The toolchain version is passed in, read from rust-toolchain.toml by the
 # calling script, and the image tag carries it -- so the image cannot drift from

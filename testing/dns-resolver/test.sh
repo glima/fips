@@ -8,20 +8,23 @@
 # script, verifies the detected backend and generated config, runs
 # teardown, and verifies cleanup.
 #
-# The end-to-end scenario additionally builds fips in a Debian 12
-# builder image (cached between runs) so the binary is glibc-compatible
-# across all target distros. It then starts the daemon, configures DNS
-# via the script, and confirms `dig @127.0.0.53 AAAA <npub>.fips`
-# returns a non-empty AAAA answer.
+# The end-to-end scenarios take fips and fips-gateway from the Debian
+# package, which is built in the pinned floor container and so runs on
+# every target distro. Each starts the daemon, configures DNS via the
+# script, and confirms `dig @127.0.0.53 AAAA <npub>.fips` returns a
+# non-empty AAAA answer.
 #
-# Usage: ./test.sh [scenario ...]
-#   No args = run all scenarios.
-#   Named args = run only those (e.g., ./test.sh debian12-resolved e2e-debian12)
+# Usage: ./test.sh [--deb PATH] [scenario ...]
+#   --deb PATH = take the binaries from this package. Without it the
+#                e2e scenarios build the package through
+#                packaging/debian/build-deb-container.sh.
+#   No scenarios = run all scenarios.
+#   Named scenarios = run only those (e.g., ./test.sh debian12-resolved e2e-debian12)
 #
 # Requirements: Docker able to grant SYS_ADMIN and NET_ADMIN and an
 # unconfined AppArmor profile (the containers are not privileged; see
-# testing/lib/systemd-container.sh). The e2e scenario also needs
-# /dev/net/tun on the host (standard).
+# testing/lib/systemd-container.sh). The e2e scenarios also need
+# /dev/net/tun on the host (standard) and dpkg-deb to read the package.
 
 set -uo pipefail
 
@@ -34,6 +37,11 @@ TEARDOWN_SCRIPT="$REPO_ROOT/packaging/common/fips-dns-teardown"
 CACHE_DIR="$SCRIPT_DIR/.cache"
 FIPS_BIN_CACHE="$CACHE_DIR/fips"
 FIPS_GATEWAY_BIN_CACHE="$CACHE_DIR/fips-gateway"
+
+# Set by --deb. BINARIES_READY keeps the package unpack to a single
+# operation however many e2e scenarios run in one process.
+SUPPLIED_DEB=""
+BINARIES_READY=0
 
 # Timeout for systemd boot inside container
 BOOT_TIMEOUT=30
@@ -312,99 +320,89 @@ verify_resolved_backend() {
 }
 
 # ─────────────────────────────────────────────────────────────────────
-# Build the fips binary once in a Debian 12 builder image so it's
-# glibc-compatible with every target distro (Debian 12/13, Ubuntu 22/24).
-# Cached at testing/dns-resolver/.cache/fips between runs; rebuild if
-# any source file is newer than the cached binary.
+# Take fips and fips-gateway from the Debian package rather than
+# compiling them here. The package is built in the pinned floor
+# container (packaging/build-floor.env), whose glibc is the lowest of
+# every target distro, so its binaries run in all five e2e images. The
+# suite used to compile its own copy in a Debian 12 image with whatever
+# Rust was current, which was a second, uncached release build per run
+# and was not the toolchain or the build that ships.
+#
+# With --deb the caller's package is used, which is how CI runs it:
+# one package build serves this suite and the install suite. Without
+# it, the package is built through the same container script the
+# release uses. Done once per process however many e2e scenarios run.
 # ─────────────────────────────────────────────────────────────────────
 
-build_fips_for_e2e() {
-    mkdir -p "$CACHE_DIR"
-
-    if [ -f "$FIPS_BIN_CACHE" ] && [ -f "$FIPS_GATEWAY_BIN_CACHE" ]; then
-        local newest_src
-        newest_src=$(find "$REPO_ROOT/src" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" \
-            -type f -printf '%T@\n' 2>/dev/null | sort -nr | head -1)
-        local cached_age
-        cached_age=$(stat -c '%Y' "$FIPS_BIN_CACHE" 2>/dev/null || echo 0)
-        local cached_gateway_age
-        cached_gateway_age=$(stat -c '%Y' "$FIPS_GATEWAY_BIN_CACHE" 2>/dev/null || echo 0)
-        local oldest_cached=$((cached_age < cached_gateway_age ? cached_age : cached_gateway_age))
-        if awk "BEGIN { exit !($oldest_cached >= $newest_src) }"; then
-            log "Using cached fips + fips-gateway binaries at $CACHE_DIR"
-            return 0
-        fi
-        log "Cached binaries are stale, rebuilding"
-    else
-        log "No cached binaries, building"
+prepare_binaries() {
+    if [ "$BINARIES_READY" -eq 1 ]; then
+        return 0
     fi
 
-    local builder_tag="fips-dns-test:builder"
-    log "Building Debian 12 builder image (this may take a few minutes on first run)"
-    docker build -t "$builder_tag" -f - "$REPO_ROOT" <<'DOCKERFILE' >/dev/null
-FROM debian:12
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential pkg-config libdbus-1-dev curl ca-certificates \
-    libclang-dev clang && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain stable --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
-WORKDIR /src
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY src ./src
-RUN cargo build --release --bin fips --bin fips-gateway
-DOCKERFILE
-
-    if [ ! "$(docker images -q "$builder_tag" 2>/dev/null)" ]; then
-        echo "  ERROR: builder image build failed"
+    if ! command -v dpkg-deb >/dev/null 2>&1; then
+        echo "  ERROR: dpkg-deb is required to read the package and was not found" >&2
         return 1
     fi
 
-    log "Extracting fips + fips-gateway binaries from builder image"
-    # Drop the previous run's binaries before extracting. Without this, a failed
-    # extraction below leaves them in place, they satisfy the caller's -x check,
-    # and the e2e scenarios silently exercise the previous commit's code.
+    mkdir -p "$CACHE_DIR"
+    local deb
+    if [ -n "$SUPPLIED_DEB" ]; then
+        deb="$SUPPLIED_DEB"
+        log "Using the supplied package $(basename "$deb")"
+    else
+        # The cache holds one package at a time, and the package used is
+        # the one the build names on the last line of its stdout, never one
+        # found by listing the directory (as in deb-install/test.sh).
+        log "Building the .deb in the pinned build container (slow on first run)"
+        mkdir -p "$CACHE_DIR/deb"
+        rm -f "$CACHE_DIR"/deb/*.deb
+        local build_out
+        if ! build_out=$(bash "$REPO_ROOT/packaging/debian/build-deb-container.sh" \
+                --output-dir "$CACHE_DIR/deb"); then
+            echo "  ERROR: container build failed" >&2
+            return 1
+        fi
+        deb=$(printf '%s\n' "$build_out" | tail -n 1)
+        if [ -z "$deb" ] || [ ! -f "$deb" ]; then
+            echo "  ERROR: the container build did not report a package path: '$deb'" >&2
+            return 1
+        fi
+    fi
+
+    # Drop the previous run's binaries before extracting. Without this, a
+    # failed extraction below leaves them in place and the e2e scenarios
+    # silently exercise the previous commit's code.
     rm -f "$FIPS_BIN_CACHE" "$FIPS_GATEWAY_BIN_CACHE"
 
-    # stderr goes to its own file rather than into $cid: docker prints
-    # warnings (a platform mismatch, say) on success too, and folding them
-    # into the id would leave every later reference pointing at nothing.
-    local cid err errfile
-    errfile=$(mktemp)
-    if ! cid=$(docker create "$builder_tag" 2>"$errfile"); then
-        echo "  ERROR: docker create failed: $(cat "$errfile")"
-        rm -f "$errfile"
+    local tmp err
+    tmp=$(mktemp -d)
+    if ! err=$(dpkg-deb -x "$deb" "$tmp" 2>&1); then
+        echo "  ERROR: dpkg-deb could not unpack $deb: $err" >&2
+        rm -rf "$tmp"
         return 1
     fi
-    rm -f "$errfile"
 
-    local rc=0 spec bin dest
+    local spec bin dest
     for spec in "fips:$FIPS_BIN_CACHE" "fips-gateway:$FIPS_GATEWAY_BIN_CACHE"; do
         bin="${spec%%:*}"
         dest="${spec#*:}"
-        if ! err=$(docker cp "$cid:/src/target/release/$bin" "$dest" 2>&1); then
-            echo "  ERROR: extracting $bin from the builder image failed: $err"
-            rc=1
+        if [ ! -f "$tmp/usr/bin/$bin" ] || [ ! -s "$tmp/usr/bin/$bin" ]; then
+            echo "  ERROR: $(basename "$deb") has no usable /usr/bin/$bin" >&2
+            rm -rf "$tmp"
+            return 1
         fi
-    done
-    docker rm "$cid" >/dev/null
-    [ "$rc" -eq 0 ] || return 1
-
-    if ! chmod +x "$FIPS_BIN_CACHE" "$FIPS_GATEWAY_BIN_CACHE"; then
-        echo "  ERROR: chmod +x failed on the extracted binaries"
-        return 1
-    fi
-
-    for dest in "$FIPS_BIN_CACHE" "$FIPS_GATEWAY_BIN_CACHE"; do
-        if [ ! -s "$dest" ] || [ ! -x "$dest" ]; then
-            echo "  ERROR: extracted binary missing, empty or not executable: $dest"
+        if ! install -m 0755 "$tmp/usr/bin/$bin" "$dest"; then
+            echo "  ERROR: could not install $bin to $dest" >&2
+            rm -rf "$tmp"
             return 1
         fi
     done
+    rm -rf "$tmp"
 
-    log "Cached fips ($(stat -c %s "$FIPS_BIN_CACHE") bytes) + fips-gateway ($(stat -c %s "$FIPS_GATEWAY_BIN_CACHE") bytes)"
+    for dest in "$FIPS_BIN_CACHE" "$FIPS_GATEWAY_BIN_CACHE"; do
+        log "$(basename "$dest"): $(stat -c %s "$dest") bytes, sha256 $(sha256sum "$dest" | cut -d' ' -f1)"
+    done
+    BINARIES_READY=1
     return 0
 }
 
@@ -726,9 +724,8 @@ DOCKERFILE
 # DNS via the script, dig through systemd-resolved.
 #
 # Parameterized across Debian 12/13 and Ubuntu 22/24/26. The fips
-# and fips-gateway binaries are built once in a Debian 12 builder
-# image (lowest glibc target → forward-compatible with all newer
-# distros) and copied into each per-distro runtime image.
+# and fips-gateway binaries come from the package once per run (see
+# prepare_binaries) and are copied into each per-distro runtime image.
 # ─────────────────────────────────────────────────────────────────────
 
 # Args: <distro_label> <docker_base_image> <apt_packages>
@@ -748,7 +745,7 @@ _run_e2e_scenario() {
     local image="fips-dns-test:e2e-${distro_label}"
     log "End-to-end: ${base_image} + systemd-resolved + real fips + fips-gateway + dig"
 
-    build_fips_for_e2e || { fail "fips build failed"; return; }
+    prepare_binaries || { fail "could not prepare the fips binaries"; return; }
 
     if [ ! -x "$FIPS_BIN_CACHE" ] || [ ! -x "$FIPS_GATEWAY_BIN_CACHE" ]; then
         fail "binaries not available at $CACHE_DIR"
@@ -979,6 +976,36 @@ test_e2e_ubuntu26() { _run_e2e_scenario ubuntu26 ubuntu:26.04    "$_pkgs_with_re
 # ─────────────────────────────────────────────────────────────────────
 
 ALL_SCENARIOS="debian12-resolved debian13-resolved ubuntu22-resolved ubuntu24-resolved ubuntu26-resolved dnsmasq nm-dnsmasq no-resolver e2e-debian12 e2e-debian13 e2e-ubuntu22 e2e-ubuntu24 e2e-ubuntu26"
+
+# A missing package is refused here, before any scenario runs, rather
+# than surfacing as a failure of the first e2e scenario.
+_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --deb)
+            SUPPLIED_DEB="${2:?--deb requires a path}"
+            if [ ! -f "$SUPPLIED_DEB" ]; then
+                echo "--deb $SUPPLIED_DEB does not exist" >&2
+                exit 2
+            fi
+            shift 2
+            ;;
+        -h|--help)
+            echo "usage: test.sh [--deb PATH] [scenario ...]"
+            echo "scenarios: $ALL_SCENARIOS"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            _args+=("$1")
+            shift
+            ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
 
 if [ $# -eq 0 ]; then
     scenarios="$ALL_SCENARIOS"

@@ -411,10 +411,14 @@ Once the path has acknowledged in both directions:
 After the attempt completes (success or failure):
 
 1. Close the relay subscription used for signaling.
-2. Optionally publish a NIP-09 deletion event referencing any
-   signaling events the peer published. Because the wraps were
-   ephemeral kinds with NIP-40 expiration tags, well-behaved relays
-   will discard them automatically without explicit deletion.
+2. Do not publish a NIP-09 deletion request for the signaling
+   events. Under NIP-59 a relay deletes a gift wrap only at the
+   request of its p-tagged recipient, so the request would be signed
+   by the recipient's long-term key and would name the traversal's
+   events, linking that key to them. The wraps are ephemeral kinds
+   with NIP-40 expiration tags: well-behaved relays discard them
+   without being asked, and a relay that stores them keeps them until
+   they expire.
 3. Discard the per-attempt punch socket if the attempt failed; a
    retry must allocate a new socket and a fresh reflexive address.
 
@@ -532,7 +536,7 @@ own.
 | Symmetric NAT (one side) | Punch timeout | Retry with port-prediction heuristics; otherwise fall back to an application-level relay |
 | Symmetric NAT (both sides) | Punch timeout | Application-level relay required |
 | Relay latency > 60 s | Stale reflexive address | Use low-latency relays; consider self-hosted relay |
-| Relay does not support ephemeral kinds | Signaling events persist | Use NIP-40 expiration + NIP-09 deletion as fallback |
+| Relay does not support ephemeral kinds | Signaling events persist | NIP-40 expiration bounds how long; no deletion request is sent (see Phase 6) |
 | Responder offline | No answer received | Initiator times out after configurable period |
 | Stale advert (responder no longer up) | Offer reaches no listener | Application-level failure suppression (see below) |
 | STUN server unreachable | No reflexive address | Fall back to alternate STUN server; fail if none reachable |

@@ -196,8 +196,10 @@ below. **Only the `.deb` is exercised by an install test**, by the
 `deb-install` suite across debian12, debian13, ubuntu22, ubuntu24 and
 ubuntu26; neither the AUR package nor the flake is. That suite runs on
 every push and pull request, on x86_64, against a `.deb` built by the same
-pinned container as the released one. It does not run at a tag, and the
-arm64 package is install-tested by nothing: no workflow installs a published
+pinned container as the released one. The arm64 package, built the same way
+on an arm64 runner, is installed and its daemon started on ubuntu22 on every
+push and pull request as well; its upgrade, purge and conffile paths are not
+exercised. The suite does not run at a tag: no workflow installs a published
 artifact, so the released packages are checked by
 hand. OpenWrt is a musl
 target rather than glibc, and it takes an `.ipk` on 24.x and earlier or

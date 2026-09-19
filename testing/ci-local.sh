@@ -130,11 +130,18 @@
 #                    unreliable on GitHub-hosted runners.
 #   tor-directory  — same; live Tor dependency.
 #
+# Deliberate GitHub-only (NOT in this local run), with reason:
+#   deb-install ubuntu22 on arm64 — this host is x86_64 and cannot run an
+#                    arm64 package. The guard compares it by distro only and
+#                    does not let it stand in for the amd64 ubuntu22 leg.
+#
 # The two runners express the same work in different matrix shapes, and the
 # guard compares through that shape rather than around it: chaos legs are
 # compared per scenario (and per flag), deb-install legs per distro. The one
 # leg still compared at leg granularity is dns-resolver — a single suite on
-# both sides that runs all of its scenarios internally.
+# both sides that runs all of its scenarios internally. On GitHub it is a job
+# of its own, because it runs the package's binaries and so waits for the
+# package build.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -1202,9 +1209,16 @@ run_medium_change() {
 }
 
 # Run dns-resolver harness (multi-distro + e2e scenarios)
+#
+# Its e2e scenarios run the fips binaries from the package build_ci_deb
+# produces, the same package deb-install installs, as the GitHub job does.
 run_dns_resolver() {
-    info "[dns-resolver] Running multi-distro test (slow — builds per-distro images)"
-    if bash testing/dns-resolver/test.sh 2>&1; then
+    if ! build_ci_deb dns-resolver; then
+        record "dns-resolver" "$CI_DEB_RC"
+        return
+    fi
+    info "[dns-resolver] Running multi-distro test against $CI_DEB_PATH (slow — builds per-distro images)"
+    if bash testing/dns-resolver/test.sh --deb "$CI_DEB_PATH" 2>&1; then
         record "dns-resolver" 0
     else
         record "dns-resolver" 1
@@ -1225,14 +1239,29 @@ run_dns_resolver() {
 # ate into it would shrink theirs. Neither phase is left unbounded, which is
 # the property this exists for.
 DEB_INSTALL_TIMEOUT=${DEB_INSTALL_TIMEOUT:-2400}
-run_deb_install() {
-    # Build once through the shared container script, then install that one
-    # artifact into every distro. The harness would build its own package if
-    # handed none, and that fallback goes through the same script -- but the
-    # GitHub job builds explicitly and passes `--deb`, so doing it explicitly
-    # here too makes the two systems read as the same work rather than leaving
-    # a reader to discover that a fallback happens to match.
-    info "[deb-install] Building the package in the pinned container"
+
+# Build the package once per process through the shared container script, for
+# every suite that consumes it: deb-install installs it and dns-resolver runs
+# its binaries. The GitHub workflow builds it once in its own job and hands the
+# artifact to both, so doing the same here keeps the two systems the same work.
+# The first caller builds; later callers get the stored result, a failure
+# included, so a failed build is not retried and reported twice as two builds.
+# Sets CI_DEB_PATH on success and CI_DEB_RC (the value to record) on failure.
+CI_DEB_DONE=0
+CI_DEB_PATH=""
+CI_DEB_RC=0
+build_ci_deb() {
+    local suite="$1"
+    if [[ $CI_DEB_DONE -eq 1 ]]; then
+        if [[ $CI_DEB_RC -ne 0 ]]; then
+            echo "  ERROR: the package build this suite shares failed earlier in the run (exit $CI_DEB_RC)." >&2
+            return 1
+        fi
+        info "[$suite] Reusing the package built earlier in this run: $CI_DEB_PATH"
+        return 0
+    fi
+    CI_DEB_DONE=1
+    info "[$suite] Building the package in the pinned container"
     local build_log deb rc=0
     build_log=$(mktemp "/tmp/ci-deb-install-build.XXXXXX")
     # stdout carries the package path on its last line, so it is captured;
@@ -1244,23 +1273,37 @@ run_deb_install() {
             echo "  ERROR: the container build exceeded ${DEB_INSTALL_TIMEOUT}s and was killed;" >&2
             echo "         no package was produced, so this is not an assertion failure." >&2
         else
-            echo "  ERROR: the container build failed (exit $rc); no package to install." >&2
+            echo "  ERROR: the container build failed (exit $rc); no package for $suite." >&2
         fi
         rm -f "$build_log"
-        record "deb-install" "$rc"
-        return
+        CI_DEB_RC=$rc
+        return 1
     fi
     deb=$(tail -n 1 "$build_log")
     rm -f "$build_log"
     if [[ -z "$deb" || ! -f "$deb" ]]; then
         echo "  ERROR: the container build reported success but its last line of stdout" >&2
         echo "         was not a package path: '${deb}'" >&2
-        record "deb-install" 1
+        CI_DEB_RC=1
+        return 1
+    fi
+    CI_DEB_PATH="$deb"
+    return 0
+}
+
+run_deb_install() {
+    # Install the one package build_ci_deb built into every distro. The harness
+    # would build its own package if handed none, and that fallback goes through
+    # the same script -- but the GitHub job builds explicitly and passes
+    # `--deb`, so doing it explicitly here too makes the two systems read as the
+    # same work rather than leaving a reader to discover that a fallback happens
+    # to match. The build is shared with dns-resolver.
+    if ! build_ci_deb deb-install; then
+        record "deb-install" "$CI_DEB_RC"
         return
     fi
-
+    local deb="$CI_DEB_PATH" rc=0
     info "[deb-install] Running multi-distro install test against $deb"
-    rc=0
     timeout "$DEB_INSTALL_TIMEOUT" bash testing/deb-install/test.sh --deb "$deb" 2>&1 || rc=$?
     if [[ $rc -eq 124 ]]; then
         # Say so explicitly. A bare red here reads as a failed assertion, and

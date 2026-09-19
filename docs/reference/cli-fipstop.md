@@ -28,7 +28,7 @@ a confirmation prompt — see [Keybindings](#keybindings)). For
 | `-s`, `--socket` | `PATH` | (auto) | Daemon control-socket path / port. Same default as `fipsctl`. |
 | `--gateway-socket` | `PATH` | (auto) | `fips-gateway` control-socket path / port. Default: `/run/fips/gateway.sock` (Unix), TCP port `21211` (Windows). |
 | `-r`, `--refresh` | `SECONDS` | `2` | Poll interval. |
-| `-V` | — | — | Print the short version, `<version> (rev <git-hash>)`. |
+| `-V` | — | — | Print the short version, `<version> (rev <git-hash>)`. The `rev` part is omitted when the build could not read a git revision, as in a package built from a git worktree. |
 | `--version` | — | — | Print the long version: short version plus build target triple. |
 | `-h`, `--help` | — | — | Print usage and exit. |
 

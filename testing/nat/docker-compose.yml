@@ -34,8 +34,27 @@ services:
     build:
       context: ../..
       dockerfile: examples/sidecar-nostr-relay/Dockerfile.app
+      args:
+        # Pinned so the relay build does not move underneath the harness.
+        # Upstream publishes only `latest`; this is its multi-arch index
+        # digest as of 2026-09-19 (amd64 and arm64 manifests built
+        # 2026-09-04). Bump it deliberately, reading the new digest with
+        # `docker buildx imagetools inspect ghcr.io/hoytech/strfry:latest`.
+        STRFRY_IMAGE: ghcr.io/hoytech/strfry@sha256:36f1886d185a88ca57c66ebe52e6e9e8428dac2486eea0a5d50ff934f18b60c3
     container_name: fips-nat-relay${FIPS_CI_NAME_SUFFIX:-}
-    restart: "no"
+    # A third-party relay abort should not fail a whole run, so the relay comes
+    # back on its own; relay_verdict still reports the restart and the fault
+    # lines. Bounded so a relay that aborts repeatedly ends up exited, and the
+    # verdict says so, rather than a crash loop hiding it.
+    #
+    # `init` is here so the restart can be tested, not for the restart itself.
+    # It makes docker's init PID 1, with strfry as its child, where strfry was
+    # PID 1 before. A test SIGABRT sent with `docker kill` to strfry as PID 1
+    # ran its handler and left the container running, so it never exercised
+    # the restart. With an init, strfry signalled from inside the container
+    # exits it non-zero, as the relay aborts seen in the lab did.
+    restart: on-failure:3
+    init: true
     volumes:
       - relay-data:/usr/src/app/strfry-db
       - ./relay/strfry.conf:/usr/src/app/strfry.conf:ro

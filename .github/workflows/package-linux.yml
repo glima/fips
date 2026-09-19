@@ -79,6 +79,37 @@ jobs:
       - name: Install host packaging tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends llvm
 
+      # The builder image travels between runners through the Actions cache,
+      # shared with ci.yml's package job (same script, same key), rather than
+      # being assembled from apt, rustup and a cargo-deb compile on every leg.
+      # It is keyed on the image tag the script computes, so any change that
+      # would rebuild the image locally (base image, toolchain,
+      # Dockerfile.build) also misses here and cannot pick up a stale image. Every run restores;
+      # only a push to maint, master or next saves, because the cache is
+      # scoped per ref and an entry saved by a pull request or a topic branch
+      # could be read by nothing else while it pushed the cargo caches toward
+      # the repository's size limit. Topic branches and pull requests read the
+      # default branch's entry. What this gives up: an image restored from the
+      # cache is not rebuilt, so, as on a developer's machine, apt and the
+      # ubuntu:22.04 base are not refreshed until one of the tag's inputs
+      # changes. The image carries build tools only, and the glibc floor and
+      # Depends checks still run on every package.
+      - name: Resolve the builder image cache key
+        id: builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=$(bash packaging/debian/build-deb-container.sh --print-image-tag)
+          [ -n "$tag" ]
+          echo "key=deb-builder-${{ runner.arch }}-${tag//:/-}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the builder image
+        id: builder-restore
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/deb-builder-image.tar
+          key: ${{ steps.builder.outputs.key }}
+
       # Build in the pinned container rather than on the runner. The runner's
       # glibc is what put a GLIBC_2.39 requirement into every Linux artifact
       # from v0.3.0 onward, so the package installed cleanly and then could not
@@ -99,6 +130,7 @@ jobs:
           packaging/debian/build-deb-container.sh \
             --version "${{ needs.determine-versioning.outputs.linux_package_version }}" \
             --output-dir deploy \
+            --image-archive "$RUNNER_TEMP/deb-builder-image.tar" \
             | tee /tmp/build-deb-container.log
 
           # The script prints the package path as its last line of stdout.
@@ -122,6 +154,29 @@ jobs:
           # absolute path here would nest the package under directories the
           # release job's dist/*.deb glob does not look in.
           echo "deb=${DEB_FILE#"$PWD"/}" >> "$GITHUB_OUTPUT"
+
+      # On a cache miss the archive exists only if the script built the image
+      # and saved it, so its presence is what says there is something to save.
+      # A failed build skips this and the save, so no image is cached from a
+      # job that did not produce a package.
+      - name: Check for a new builder image archive
+        id: builder-archive
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/deb-builder-image.tar" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the builder image
+        if: >-
+          github.event_name == 'push'
+          && contains(fromJSON('["refs/heads/maint", "refs/heads/master", "refs/heads/next"]'), github.ref)
+          && steps.builder-restore.outputs.cache-hit != 'true'
+          && steps.builder-archive.outputs.present == 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/deb-builder-image.tar
+          key: ${{ steps.builder.outputs.key }}
 
       # The container writes its target directory to a Docker volume, so the
       # runner's target/release is empty. Recover the four binaries from the

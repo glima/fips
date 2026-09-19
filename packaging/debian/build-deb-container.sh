@@ -10,11 +10,19 @@
 # releases it did not.
 #
 # Usage: build-deb-container.sh [--output-dir DIR] [--version V] [--features LIST]
-#                               [--rebuild-image]
+#                               [--rebuild-image] [--image-archive PATH]
+#        build-deb-container.sh --print-image-tag
 #
-# Requires docker. The image is cached between runs and rebuilt only when the
-# Dockerfile or the floor changes; the source is mounted rather than copied, so
-# editing code does not invalidate it.
+# Requires docker, except for --print-image-tag. The image is cached between
+# runs under a tag made of the floor image, the Rust toolchain and a hash of
+# Dockerfile.build, so a change to any of the three builds a new image; the
+# source is mounted rather than copied, so editing code does not invalidate it.
+#
+# --print-image-tag prints that tag and exits. --image-archive carries the image
+# between hosts that do not share a docker daemon, such as fresh CI runners:
+# when the image is absent and PATH exists it is loaded from there, and when
+# this run builds the image it is saved there. A bad archive is warned about and
+# the image rebuilt; it never fails the build.
 
 set -euo pipefail
 
@@ -28,6 +36,8 @@ DEST_DIR="$REPO_ROOT/deploy"
 VERSION=""
 FEATURES=""
 REBUILD_IMAGE=0
+PRINT_TAG=0
+IMAGE_ARCHIVE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,27 +45,75 @@ while [[ $# -gt 0 ]]; do
         --version)       VERSION="${2:?missing value for --version}"; shift 2 ;;
         --features)      FEATURES="${2:?missing value for --features}"; shift 2 ;;
         --rebuild-image) REBUILD_IMAGE=1; shift ;;
-        -h|--help)       sed -n '2,17p' "$0"; exit 0 ;;
+        --print-image-tag) PRINT_TAG=1; shift ;;
+        --image-archive) IMAGE_ARCHIVE="${2:?missing value for --image-archive}"; shift 2 ;;
+        -h|--help)       sed -n '2,25p' "$0"; exit 0 ;;
         *)               echo "Unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
-command -v docker >/dev/null 2>&1 || {
-    echo "build-deb-container: docker is required and was not found." >&2
-    exit 2
-}
-
 # Read the toolchain from the pin rather than choosing one here, and put it in
 # the tag so a bump rebuilds the image instead of silently reusing a stale one.
+# The Dockerfile's content goes in the tag for the same reason: without it a
+# host that has the image cached keeps using it after the Dockerfile changes.
 RUST_TOOLCHAIN=$(awk -F'"' '/^channel *=/{print $2; exit}' "$REPO_ROOT/rust-toolchain.toml")
 [ -n "$RUST_TOOLCHAIN" ] || {
     echo "build-deb-container: could not read channel from rust-toolchain.toml" >&2
     exit 2
 }
 
-IMAGE_TAG="fips-deb-builder:${FIPS_BUILD_IMAGE//[:\/]/-}-rust${RUST_TOOLCHAIN}"
+DOCKERFILE_HASH=$(sha256sum "$SCRIPT_DIR/Dockerfile.build" | cut -c1-12) || DOCKERFILE_HASH=""
+[[ "$DOCKERFILE_HASH" =~ ^[0-9a-f]{12}$ ]] || {
+    echo "build-deb-container: could not hash $SCRIPT_DIR/Dockerfile.build" >&2
+    exit 2
+}
 
-if [ "$REBUILD_IMAGE" -eq 1 ] || ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+IMAGE_TAG="fips-deb-builder:${FIPS_BUILD_IMAGE//[:\/]/-}-rust${RUST_TOOLCHAIN}-${DOCKERFILE_HASH}"
+
+# Before the docker check, so a workflow can key a cache on the tag without
+# docker being involved.
+if [ "$PRINT_TAG" -eq 1 ]; then
+    printf '%s\n' "$IMAGE_TAG"
+    exit 0
+fi
+
+command -v docker >/dev/null 2>&1 || {
+    echo "build-deb-container: docker is required and was not found." >&2
+    exit 2
+}
+
+# A problem with the image archive is a warning, not a failure: the archive only
+# saves time, and failing a release over a bad cache entry would hold the tag
+# until someone removed the entry by hand. The ::warning:: line puts it on the
+# GitHub run summary; the plain line is for everywhere else.
+archive_warning() {
+    echo "::warning::build-deb-container: $*"
+    echo "build-deb-container: warning: $*" >&2
+}
+
+# Stays unset when the image was found or loaded, so only an image this run
+# built is saved: saving a loaded one would only rewrite the archive it came from.
+BUILT_IMAGE=0
+if [ "$REBUILD_IMAGE" -eq 1 ]; then
+    BUILT_IMAGE=1
+elif docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+    echo "=== Using cached $IMAGE_TAG ===" >&2
+elif [ -n "$IMAGE_ARCHIVE" ] && [ -f "$IMAGE_ARCHIVE" ]; then
+    echo "=== Loading $IMAGE_TAG from $IMAGE_ARCHIVE ===" >&2
+    if ! docker load -i "$IMAGE_ARCHIVE" >&2; then
+        archive_warning "could not load $IMAGE_ARCHIVE; building $IMAGE_TAG instead"
+        BUILT_IMAGE=1
+    elif ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+        archive_warning "$IMAGE_ARCHIVE does not hold $IMAGE_TAG; building it instead"
+        BUILT_IMAGE=1
+    else
+        echo "=== Using $IMAGE_TAG loaded from $IMAGE_ARCHIVE ===" >&2
+    fi
+else
+    BUILT_IMAGE=1
+fi
+
+if [ "$BUILT_IMAGE" -eq 1 ]; then
     echo "=== Building $IMAGE_TAG from $FIPS_BUILD_IMAGE with Rust $RUST_TOOLCHAIN ===" >&2
     docker build \
         --build-arg "BASE=$FIPS_BUILD_IMAGE" \
@@ -63,14 +121,25 @@ if [ "$REBUILD_IMAGE" -eq 1 ] || ! docker image inspect "$IMAGE_TAG" >/dev/null 
         -t "$IMAGE_TAG" \
         -f "$SCRIPT_DIR/Dockerfile.build" \
         "$SCRIPT_DIR"
-else
-    echo "=== Using cached $IMAGE_TAG ===" >&2
+
+    # Written to a temporary name and renamed, so a failed or interrupted save
+    # never leaves a truncated archive where a cache step would pick it up.
+    if [ -n "$IMAGE_ARCHIVE" ]; then
+        ARCHIVE_TMP="$IMAGE_ARCHIVE.tmp.$$"
+        if docker save "$IMAGE_TAG" -o "$ARCHIVE_TMP" >&2 \
+                && mv -f "$ARCHIVE_TMP" "$IMAGE_ARCHIVE"; then
+            echo "=== Saved $IMAGE_TAG to $IMAGE_ARCHIVE ===" >&2
+        else
+            rm -f "$ARCHIVE_TMP"
+            archive_warning "could not save $IMAGE_TAG to $IMAGE_ARCHIVE; the next run will build it again"
+        fi
+    fi
 fi
 
-# Derive the version and the timestamp on the host, where git works, and pass
-# both in. The container then never runs git, which matters for two reasons: a
-# worktree's .git is a file pointing outside the mount and would not resolve,
-# and a bind-mounted repository trips git's dubious-ownership check.
+# Derive the version and the timestamp on the host and pass both in, because a
+# worktree's .git is a file pointing outside the mount and does not resolve in
+# the container. The image's git is there only for build.rs's revision, which is
+# empty for a worktree build for the same reason.
 if [ -z "$VERSION" ]; then
     CRATE_VERSION=$(awk -F'"' '/^version = /{print $2; exit}' "$REPO_ROOT/Cargo.toml")
     if [[ "$CRATE_VERSION" == *-dev ]]; then
@@ -100,7 +169,8 @@ if [ -n "$FEATURES" ]; then
     # it is also what marks the version so a feature package is distinguishable
     # from the default build of the same commit. It refuses --features with
     # --no-build for that reason, so the two cases cannot share one command.
-    # The version still comes from the host, because the image has no git.
+    # The version still comes from the host, because a worktree's .git does
+    # not resolve inside the mount.
     BUILD_CMD="packaging/debian/build-deb.sh --features '$FEATURES' --version '$VERSION' --output-dir /out --name-file /name/deb"
 else
     BUILD_CMD="cargo build --release --locked
@@ -152,8 +222,18 @@ DEB="$DEST_ABS/$DEB_NAME"
 
 # Check the artifact here rather than in one workflow, so every producer is
 # gated: the release, the CI job, a local run and packaging/Makefile all reach
-# the check through this script.
+# both checks through this script. The glibc floor is read from the binaries
+# and runs on the host. The Depends check runs in the build image, because it
+# compares against dpkg-shlibdeps and has to read the same symbols files and C
+# library that cargo-deb's "$auto" read; a host of another distribution could
+# produce a difference of its own.
 "$REPO_ROOT/testing/check-glibc-floor.sh" "$DEB" >&2
+docker run --rm \
+    -v "$REPO_ROOT":/src:ro \
+    -v "$DEST_ABS":/out:ro \
+    -w /src \
+    "$IMAGE_TAG" \
+    testing/check-deb-depends.sh "/out/$DEB_NAME" >&2
 
 echo "=== Built $DEB ===" >&2
 printf '%s\n' "$DEB"

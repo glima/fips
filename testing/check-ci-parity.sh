@@ -11,6 +11,11 @@
 #                    unreliable on GitHub-hosted runners.
 #   tor-directory  — same; live Tor dependency.
 #
+# Deliberate GitHub-only (NOT in the local run), with reason:
+#   deb-install ubuntu22 on arm64 — the local host is x86_64 and cannot run an
+#                    arm64 package. The GitHub leg installs the arm64 package
+#                    and starts the daemon on an arm runner.
+#
 # What is compared, and at what granularity:
 #   chaos          — per scenario, plus its flags. GitHub fans each scenario
 #                    into its own matrix leg carrying `scenario:` (and
@@ -21,12 +26,18 @@
 #   deb-install    — per distro. GitHub splits into per-distro legs carrying
 #                    `scenario:`, in a job of their own; local runs the same
 #                    distro set in one suite, enumerated by ALL_SCENARIOS in
-#                    deb-install/test.sh.
+#                    deb-install/test.sh. A leg's `arch:` defaults to amd64,
+#                    and only amd64 legs are compared with the local set, so
+#                    an arm64 leg cannot stand in for a missing amd64 leg of
+#                    the same distro. An arm64 leg must name a distro the
+#                    local suite knows; any other arch is unidentifiable.
 #   everything else — per suite name.
 #
 #   dns-resolver is the one leg still compared at leg granularity rather than
 #   per scenario: it is a single leg and a single suite on both sides, and it
 #   runs all of its scenarios internally. Its scenario list is NOT cross-checked.
+#   On GitHub it is the one leg of a job of its own (it waits for the package
+#   build), which the sweep across every job below finds like any other leg.
 #
 # The local suite set is discovered by sweeping ci-local.sh for *_SUITES arrays
 # rather than from a hardcoded list of variable names, and every run_suite
@@ -151,6 +162,10 @@ if not include:
           f"{ci_yml_path}; cannot verify CI parity", file=sys.stderr)
     sys.exit(2)
 github_chaos, github_deb, github = {}, set(), set()
+# Deliberate GitHub-only install legs on another architecture, by distro. Kept
+# out of github_deb: were they in it, deleting the amd64 leg of a distro that
+# also has an arm64 leg would leave the distro in the set and pass.
+github_deb_extra = {}
 malformed = []
 for leg in include:
     if "suite" not in leg and "scenario" not in leg:
@@ -164,8 +179,15 @@ for leg in include:
             continue
         if kind == "chaos":
             github_chaos[str(leg["scenario"])] = str(leg.get("chaos_flags", ""))
-        else:
+            continue
+        arch = str(leg.get("arch", "amd64"))
+        if arch == "amd64":
             github_deb.add(str(leg["scenario"]))
+        elif arch == "arm64":
+            github_deb_extra.setdefault(arch, set()).add(str(leg["scenario"]))
+        else:
+            malformed.append(f"deb-install leg {leg['scenario']} has arch "
+                             f"{arch}, which is neither amd64 nor arm64")
     elif "suite" in leg:
         github.add(str(leg["suite"]))
     else:
@@ -231,6 +253,12 @@ chaos_flag_drift = sorted(
 )
 deb_local_only = sorted(local_deb - github_deb)
 deb_github_only = sorted(github_deb - local_deb)
+# An extra-arch leg for a distro the local suite does not know is still drift.
+deb_github_only += sorted(
+    f"{d} ({arch})"
+    for arch, distros in github_deb_extra.items()
+    for d in distros - local_deb
+)
 
 problems = (local_only or github_only or chaos_local_only or chaos_github_only
             or chaos_flag_drift or deb_local_only or deb_github_only
@@ -288,5 +316,9 @@ print("CI parity OK: both runners cover the same work "
 print(f"  {len(github)} suites, {len(github_chaos)} chaos scenarios "
       f"(flags compared), {len(github_deb)} deb-install distros "
       f"— {total} legs on each side.")
+for arch, distros in sorted(github_deb_extra.items()):
+    legs = "leg" if len(distros) == 1 else "legs"
+    print(f"  plus {len(distros)} GitHub-only {arch} install {legs} "
+          f"({', '.join(sorted(distros))}).")
 sys.exit(0)
 PY

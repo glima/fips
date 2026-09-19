@@ -88,8 +88,13 @@ priority = "optional"
 # then could not start. Deriving it also picks up a libdbus floor the hand
 # written list lacked, and re-derives per architecture, which matters because
 # arm64 links libdbus in all four binaries where amd64 links it in one.
+# libgcc-s1 is written by hand beside "$auto" because cargo-deb removes every
+# libgcc entry from what it derives, on the grounds that every system has one.
+# testing/check-deb-depends.sh runs dpkg-shlibdeps on every build and fails if
+# this floor differs from the derived one, so it cannot fall behind or run
+# ahead of what the binaries need.
 # systemd stays by hand: nothing links it, so nothing can derive it.
-depends = "$auto, systemd"
+depends = "$auto, libgcc-s1 (>= 4.2), systemd"
 recommends = "bluez"
 extended-description = """\
 FIPS is a distributed, decentralized network routing protocol for mesh \

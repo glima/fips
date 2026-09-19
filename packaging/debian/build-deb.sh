@@ -145,8 +145,8 @@ elif [[ -n "${FEATURES}" ]]; then
     # An explicit version needs the same marker for the same reason, and it is
     # the only way a caller that cannot derive the version here can get one.
     # The container build is that caller: it derives the version on the host
-    # because the image has no git, and the source is mounted read-only from a
-    # worktree whose .git is a file pointing outside the mount.
+    # because the source may be mounted read-only from a worktree whose .git is
+    # a file pointing outside the mount, which git in the container cannot read.
     if [[ "${VERSION_OVERRIDE}" == *"+$(printf '%s' "${FEATURES}" | tr -c 'a-zA-Z0-9.' '.')"* ]]; then
         : # already marked by the caller
     elif [[ "${VERSION_OVERRIDE}" == *-* ]]; then

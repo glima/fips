@@ -850,7 +850,6 @@ impl NostrRendezvous {
                         {
                             let _ = tx.send(SignalEnvelope {
                                 payload: answer,
-                                event_id: event.id,
                                 sender_npub: sender_npub.clone(),
                             });
                         }
@@ -1301,10 +1300,6 @@ impl NostrRendezvous {
             "traversal: initiator punch succeeded"
         );
 
-        let _ = self
-            .publish_delete(&relays, [offer_event.id, answer.event_id])
-            .await;
-
         self.failure_state
             .record_success(&peer_config.npub, now_ms());
 
@@ -1471,7 +1466,6 @@ impl NostrRendezvous {
             "traversal: answer sent"
         );
         if !accepted {
-            let _ = self.publish_delete(&relays, [answer_event.id]).await;
             return Ok(());
         }
 
@@ -1521,8 +1515,6 @@ impl NostrRendezvous {
                 );
             }
         }
-
-        let _ = self.publish_delete(&relays, [answer_event.id]).await;
         Ok(())
     }
 

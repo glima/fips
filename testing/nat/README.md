@@ -73,7 +73,8 @@ Run one scenario:
 - `stun/`
   - minimal STUN binding responder
 - `relay/`
-  - local `strfry` config
+  - local `strfry` config. The relay image's strfry build is pinned by digest
+    in `docker-compose.yml` (`STRFRY_IMAGE`); bump it there deliberately.
 - `scripts/generate-configs.sh`
   - derives ephemeral identities and writes per-scenario FIPS configs
 - `scripts/setup-topology.sh`

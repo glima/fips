@@ -28,7 +28,7 @@ controlled through the standard service control manager.
 | Flag | Argument | Description |
 | ---- | -------- | ----------- |
 | `-c`, `--config` | `FILE` | Use `FILE` as the configuration. Skips the default search paths. |
-| `-V` | — | Print the short version, `<version> (rev <git-hash>)`. |
+| `-V` | — | Print the short version, `<version> (rev <git-hash>)`. The `rev` part is omitted when the build could not read a git revision, as in a package built from a git worktree. |
 | `--version` | — | Print the long version: short version plus build target triple. |
 | `-h`, `--help` | — | Print usage and exit. |
 | `--install-service` | — | (Windows only) Install `fips` as a Windows service. Requires Administrator. |

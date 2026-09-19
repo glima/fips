@@ -272,9 +272,16 @@ from the far side records the working remote address and completes the
 attempt.
 
 On timeout (`attempt_timeout_secs` as overall bound,
-`punch_duration_ms` as probe window), both sides issue NIP-9 deletes
-for their offer and answer events and report failure up to the
-discovery runtime's `BootstrapEvent::Failed` channel.
+`punch_duration_ms` as probe window), the attempt reports failure up
+to the discovery runtime's `BootstrapEvent::Failed` channel.
+
+Neither side publishes a NIP-9 deletion request for the offer or
+answer, on success or failure. A relay honouring NIP-59 deletes a gift
+wrap only at the request of its p-tagged recipient, so such a request
+would have to be signed by the node's routing key and would name the
+traversal's events, tying that key to them on every relay it reached.
+The wraps are ephemeral kinds carrying a NIP-40 expiration tag, so
+relays that store them at all keep them until they expire.
 
 ### Phase 5 — Adoption
 

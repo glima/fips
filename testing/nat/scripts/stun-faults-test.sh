@@ -29,6 +29,7 @@ NAT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT_DIR="$(cd "$NAT_DIR/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/testing/scripts/build.sh"
 GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
+RELAY_LIB="$ROOT_DIR/testing/lib/relay-verdict.sh"
 
 PROFILE="stun-faults"
 SCENARIO="$PROFILE"
@@ -53,6 +54,9 @@ NODE="fips-nat-stun-fault-node${FIPS_CI_NAME_SUFFIX:-}"
 PEER="fips-nat-stun-fault-peer${FIPS_CI_NAME_SUFFIX:-}"
 SHIM="fips-nat-stun-fault-shim${FIPS_CI_NAME_SUFFIX:-}"
 STUN_CONTAINER="fips-nat-stun${FIPS_CI_NAME_SUFFIX:-}"
+# The node and peer find each other through this relay's adverts, so a relay
+# that died takes the pre-flight down with it; the dump states it first.
+RELAY_CONTAINER="fips-nat-relay${FIPS_CI_NAME_SUFFIX:-}"
 # Claimed per run by ci-local.sh; unset renders the lab's historical address.
 STUN_HOST="${NAT_LAN_PREFIX:-172.31.10}.40"
 STUN_PORT=3478
@@ -66,6 +70,9 @@ cleanup() {
     "${COMPOSE[@]}" --profile "$PROFILE" down -v --remove-orphans \
         >/dev/null 2>&1 || true
 }
+
+# shellcheck disable=SC1090
+source "$RELAY_LIB"
 
 trap 'echo ""; echo "stun-faults-test interrupted"; cleanup; exit 130' INT TERM
 
@@ -96,8 +103,11 @@ require_test_image() {
 
 dump_diagnostics() {
     echo ""
+    echo "=== relay verdict ==="
+    relay_verdict "$RELAY_CONTAINER" || true
+    echo ""
     echo "=== stun-faults diagnostics ==="
-    for c in "$NODE" "$PEER" "$SHIM" "$STUN_CONTAINER"; do
+    for c in "$NODE" "$PEER" "$SHIM" "$STUN_CONTAINER" "$RELAY_CONTAINER"; do
         echo ""
         echo "--- $c: logs (last 80) ---"
         docker logs "$c" 2>&1 | tail -80 || true
@@ -363,6 +373,12 @@ run_test() {
         dump_diagnostics
         return 1
     }
+
+    # A relay that faulted while the phases still passed is a finding about
+    # the relay, not about this run, so it is reported and not made a failure.
+    if relay_verdict "$RELAY_CONTAINER"; then
+        echo "NOTE: the assertions above passed despite that." >&2
+    fi
 
     cleanup
     if [ ${#SKIPPED_PHASES[@]} -eq 0 ]; then

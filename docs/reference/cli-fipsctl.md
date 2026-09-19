@@ -29,7 +29,7 @@ that defines the socket location, see
 | Flag | Argument | Description |
 | ---- | -------- | ----------- |
 | `-s`, `--socket` | `PATH` | Override the control-socket path (Linux/macOS) or TCP port (Windows). |
-| `-V` | — | Print the short version, `<version> (rev <git-hash>)`. |
+| `-V` | — | Print the short version, `<version> (rev <git-hash>)`. The `rev` part is omitted when the build could not read a git revision, as in a package built from a git worktree. |
 | `--version` | — | Print the long version: short version plus build target triple. |
 | `-h`, `--help` | — | Print usage and exit. Per-subcommand help via `fipsctl <subcommand> --help`. |
 

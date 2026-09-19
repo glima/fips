@@ -5,7 +5,11 @@
 # the final stage.  Copying the strfry binary into a glibc-based image such as
 # debian:bookworm-slim causes "not found" at exec time because the musl dynamic
 # linker (/lib/ld-musl-*.so.1) and its shared libraries are absent there.
-FROM ghcr.io/hoytech/strfry:latest AS strfry
+#
+# STRFRY_IMAGE lets a caller pin the strfry build. The default follows the
+# upstream `latest` tag; the NAT test lab passes a digest.
+ARG STRFRY_IMAGE=ghcr.io/hoytech/strfry:latest
+FROM ${STRFRY_IMAGE} AS strfry
 
 FROM alpine:3.18
 
