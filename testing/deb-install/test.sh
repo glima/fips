@@ -1,10 +1,10 @@
 #!/bin/bash
 # Test the fips Debian package install path across target distros.
 #
-# Each scenario builds (or reuses) the .deb in a cached Debian 12
-# cargo-deb image, boots a systemd container with TUN access for the
-# target distro, installs the .deb via `apt
-# install ./fips_*.deb`, waits for fips.service + fips-dns.service
+# Each scenario takes the .deb from --deb, or builds (or reuses) it
+# through packaging/debian/build-deb-container.sh, boots a systemd
+# container with TUN access for the target distro, installs the .deb
+# via `apt install ./fips_*.deb`, waits for fips.service + fips-dns.service
 # to come up, and verifies that `dig @127.0.0.53 AAAA <npub>.fips`
 # returns a non-empty AAAA answer through the resolver backend that
 # fips-dns-setup configured. Then exercises fips-gateway against the
@@ -31,6 +31,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/systemd-container.sh
 source "$SCRIPT_DIR/../lib/systemd-container.sh"
+# shellcheck source=SCRIPTDIR/../lib/image-build.sh
+source "$SCRIPT_DIR/../lib/image-build.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CACHE_DIR="$SCRIPT_DIR/.cache"
 DEB_CACHE_DIR="$CACHE_DIR/deb"
@@ -77,10 +79,13 @@ cleanup_container() {
     docker rm -f "$name" >/dev/null 2>&1 || true
 }
 
+# Build an image from an inline Dockerfile.
 build_image() {
     local tag="$1"
     shift
-    echo "$@" | docker build -t "$tag" -f - "$REPO_ROOT" >/dev/null 2>&1
+    local dockerfile="$*"
+    retry_build "docker build -t $tag" build_inline "$tag" "$dockerfile" "$REPO_ROOT" || return
+    return 0
 }
 
 # Start the scenario's systemd container. Not privileged: see
@@ -94,7 +99,8 @@ build_image() {
 start_systemd_container_with_tun() {
     local name="$1" image="$2"
     cleanup_container "$name"
-    docker run -d --name "$name" \
+    run_quiet "docker run $name (with tun)" \
+        docker run -d --name "$name" \
         --label com.corganlabs.fips-ci=1 \
         "${SYSTEMD_CAPS[@]}" \
         --cgroupns=host \
@@ -102,7 +108,7 @@ start_systemd_container_with_tun() {
         --sysctl net.ipv6.conf.all.forwarding=1 \
         -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
         --tmpfs /run --tmpfs /run/lock \
-        "$image" >/dev/null 2>&1 || return
+        "$image" || return
     check_isolation "$name"
     return
 }

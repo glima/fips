@@ -22,6 +22,7 @@ BUILD_SCRIPT="$ROOT_DIR/testing/scripts/build.sh"
 GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
 WAIT_LIB="$ROOT_DIR/testing/lib/wait-converge.sh"
 RELAY_LIB="$ROOT_DIR/testing/lib/relay-verdict.sh"
+IMAGE_LIB="$ROOT_DIR/testing/lib/image-build.sh"
 # Must track generate-configs.sh's OUTPUT_DIR and the compose bind-mounts.
 CONFIG_DIR="$NAT_DIR/generated-configs${FIPS_CI_NAME_SUFFIX:-}"
 
@@ -55,6 +56,8 @@ RELAY_CONTAINER="fips-nat-relay${FIPS_CI_NAME_SUFFIX:-}"
 source "$WAIT_LIB"
 # shellcheck disable=SC1090
 source "$RELAY_LIB"
+# shellcheck disable=SC1090
+source "$IMAGE_LIB"
 
 cleanup() {
     "${COMPOSE[@]}" --profile "$PROFILE" down -v --remove-orphans \
@@ -430,7 +433,10 @@ run_test() {
     cleanup
     "$GENERATE_SCRIPT" "$SCENARIO"
 
-    "${COMPOSE[@]}" --profile "$PROFILE" up -d --build --force-recreate
+    # Build first, with retries, because the build pulls from registries that
+    # time out now and then; the start is not retried, since it is the test.
+    retry_build "compose build ($PROFILE)" "${COMPOSE[@]}" --profile "$PROFILE" build
+    "${COMPOSE[@]}" --profile "$PROFILE" up -d --no-build --force-recreate
 
     # Phase 1 + Phase 2 together: each side publishes its own advert,
     # subscribes for the other's, then dials. Bidirectional success

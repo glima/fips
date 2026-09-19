@@ -49,12 +49,19 @@ RUN git config --system --add safe.directory /src
 # the compiler the rest of CI uses, and bumping the pin rebuilds the image. The
 # builder this replaces installed `stable` and never copied rust-toolchain.toml,
 # so it compiled with a different compiler from the release and nothing said so.
+#
+# CARGO_NET_RETRY raises cargo's own retry count for crate downloads, both for
+# cargo install below and for the package build that runs in this image; the
+# registry is fetched cold on every CI runner and has failed mid-download.
+# CARGO_HTTP_MULTIPLEXING is left at its default: turn it off only if HTTP/2
+# framing errors from the registry still occur with the higher retry count.
 ARG RUST_TOOLCHAIN
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
+    CARGO_NET_RETRY=10 \
     PATH=/usr/local/cargo/bin:$PATH
 RUN test -n "${RUST_TOOLCHAIN}" \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    && curl --retry 3 --retry-connrefused --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 

@@ -30,6 +30,7 @@ ROOT_DIR="$(cd "$NAT_DIR/../.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/testing/scripts/build.sh"
 GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
 RELAY_LIB="$ROOT_DIR/testing/lib/relay-verdict.sh"
+IMAGE_LIB="$ROOT_DIR/testing/lib/image-build.sh"
 
 PROFILE="stun-faults"
 SCENARIO="$PROFILE"
@@ -73,6 +74,8 @@ cleanup() {
 
 # shellcheck disable=SC1090
 source "$RELAY_LIB"
+# shellcheck disable=SC1090
+source "$IMAGE_LIB"
 
 trap 'echo ""; echo "stun-faults-test interrupted"; cleanup; exit 130' INT TERM
 
@@ -269,7 +272,10 @@ run_test() {
     echo "=== stun-faults-test: setup ==="
     cleanup
     "$GENERATE_SCRIPT" "$SCENARIO"
-    "${COMPOSE[@]}" --profile "$PROFILE" up -d --build --force-recreate
+    # Build first, with retries, because the build pulls from registries that
+    # time out now and then; the start is not retried, since it is the test.
+    retry_build "compose build ($PROFILE)" "${COMPOSE[@]}" --profile "$PROFILE" build
+    "${COMPOSE[@]}" --profile "$PROFILE" up -d --no-build --force-recreate
 
     # Give the daemons time to come up. Both fault-node and fault-peer
     # need to start, publish their adverts to the relay, and discover

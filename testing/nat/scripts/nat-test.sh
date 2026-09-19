@@ -10,6 +10,7 @@ GENERATE_SCRIPT="$SCRIPT_DIR/generate-configs.sh"
 TOPOLOGY_SCRIPT="$SCRIPT_DIR/setup-topology.sh"
 WAIT_LIB="$ROOT_DIR/testing/lib/wait-converge.sh"
 RELAY_LIB="$ROOT_DIR/testing/lib/relay-verdict.sh"
+IMAGE_LIB="$ROOT_DIR/testing/lib/image-build.sh"
 # Must track generate-configs.sh's OUTPUT_DIR and the compose bind-mounts: the
 # npubs are read back here after the containers are up, so reading a different
 # directory than the one the generator wrote pings an npub no node owns.
@@ -45,6 +46,8 @@ fi
 source "$WAIT_LIB"
 # shellcheck disable=SC1090
 source "$RELAY_LIB"
+# shellcheck disable=SC1090
+source "$IMAGE_LIB"
 
 RELAY_CONTAINER="fips-nat-relay${FIPS_CI_NAME_SUFFIX:-}"
 
@@ -500,7 +503,10 @@ run_cone() {
     echo "=== NAT lab: cone ==="
     cleanup
     "$GENERATE_SCRIPT" cone
-    "${COMPOSE[@]}" --profile cone up -d --build --force-recreate
+    # Build first, with retries, because the build pulls from registries that
+    # time out now and then; the start is not retried, since it is the test.
+    retry_build "compose build (cone)" "${COMPOSE[@]}" --profile cone build
+    "${COMPOSE[@]}" --profile cone up -d --no-build --force-recreate
     "$TOPOLOGY_SCRIPT" cone
     wait_for_peers fips-nat-cone-a${FIPS_CI_NAME_SUFFIX:-} 1 45 || {
         dump_cone_diagnostics
@@ -548,7 +554,10 @@ run_symmetric() {
     echo "=== NAT lab: symmetric fallback ==="
     cleanup
     NAT_MODE_A=symmetric NAT_MODE_B=symmetric "$GENERATE_SCRIPT" symmetric
-    NAT_MODE_A=symmetric NAT_MODE_B=symmetric "${COMPOSE[@]}" --profile symmetric up -d --build --force-recreate
+    # Build first, with retries, because the build pulls from registries that
+    # time out now and then; the start is not retried, since it is the test.
+    NAT_MODE_A=symmetric NAT_MODE_B=symmetric retry_build "compose build (symmetric)" "${COMPOSE[@]}" --profile symmetric build
+    NAT_MODE_A=symmetric NAT_MODE_B=symmetric "${COMPOSE[@]}" --profile symmetric up -d --no-build --force-recreate
     "$TOPOLOGY_SCRIPT" symmetric
     wait_for_peers fips-nat-symmetric-a${FIPS_CI_NAME_SUFFIX:-} 1 60 || {
         dump_symmetric_diagnostics
@@ -598,7 +607,10 @@ run_lan() {
     echo "=== NAT lab: lan preference ==="
     cleanup
     "$GENERATE_SCRIPT" lan
-    "${COMPOSE[@]}" --profile lan up -d --build --force-recreate
+    # Build first, with retries, because the build pulls from registries that
+    # time out now and then; the start is not retried, since it is the test.
+    retry_build "compose build (lan)" "${COMPOSE[@]}" --profile lan build
+    "${COMPOSE[@]}" --profile lan up -d --no-build --force-recreate
     wait_for_peers fips-nat-lan-a${FIPS_CI_NAME_SUFFIX:-} 1 45 || {
         dump_lan_diagnostics
         return 1

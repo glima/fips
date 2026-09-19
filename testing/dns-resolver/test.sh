@@ -31,6 +31,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=SCRIPTDIR/../lib/systemd-container.sh
 source "$SCRIPT_DIR/../lib/systemd-container.sh"
+# shellcheck source=SCRIPTDIR/../lib/image-build.sh
+source "$SCRIPT_DIR/../lib/image-build.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SETUP_SCRIPT="$REPO_ROOT/packaging/common/fips-dns-setup"
 TEARDOWN_SCRIPT="$REPO_ROOT/packaging/common/fips-dns-teardown"
@@ -67,42 +69,13 @@ cleanup_container() {
     docker rm -f "$name" >/dev/null 2>&1 || true
 }
 
-# Emit a captured output file to stderr, delimited and labelled with the
-# command it came from. Callers use this only on failure: a command that
-# succeeds leaves no trace, so the suite stays quiet when it is green.
-dump_output() {
-    local label="$1" file="$2"
-    {
-        echo "  --- $label failed; captured output follows ---"
-        if [ -s "$file" ]; then
-            cat "$file"
-        else
-            echo "  (no output)"
-        fi
-        echo "  --- end captured output ---"
-    } >&2
-}
-
-# Run a command with both streams captured. Discard the capture on success;
-# on failure emit it, so the reason a build or a container start died is not
-# thrown away. Stdin is inherited, so a caller may pipe into it.
-run_quiet() {
-    local label="$1"
-    shift
-    local out rc=0
-    out=$(mktemp)
-    "$@" >"$out" 2>&1 || rc=$?
-    [ "$rc" -eq 0 ] || dump_output "$label" "$out"
-    rm -f "$out"
-    return "$rc"
-}
-
 # Build an image from an inline Dockerfile.
 build_image() {
     local tag="$1"
     shift
-    echo "$@" | run_quiet "docker build -t $tag" \
-        docker build -t "$tag" -f - "$REPO_ROOT"
+    local dockerfile="$*"
+    retry_build "docker build -t $tag" build_inline "$tag" "$dockerfile" "$REPO_ROOT" || return
+    return 0
 }
 
 # Start a systemd container in the background. Not privileged: see

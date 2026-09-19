@@ -31,6 +31,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # shellcheck source=../build-floor.env
 . "$REPO_ROOT/packaging/build-floor.env"
+# shellcheck source=SCRIPTDIR/../../testing/lib/image-build.sh
+. "$REPO_ROOT/testing/lib/image-build.sh"
 
 DEST_DIR="$REPO_ROOT/deploy"
 VERSION=""
@@ -115,7 +117,9 @@ fi
 
 if [ "$BUILT_IMAGE" -eq 1 ]; then
     echo "=== Building $IMAGE_TAG from $FIPS_BUILD_IMAGE with Rust $RUST_TOOLCHAIN ===" >&2
-    docker build \
+    # Retried because the build pulls the floor image and fetches apt packages,
+    # rustup and crates, any of which can fail for a few seconds at a time.
+    retry_build "docker build $IMAGE_TAG" docker build \
         --build-arg "BASE=$FIPS_BUILD_IMAGE" \
         --build-arg "RUST_TOOLCHAIN=$RUST_TOOLCHAIN" \
         -t "$IMAGE_TAG" \

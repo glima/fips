@@ -763,8 +763,10 @@ jobs:
           chmod +x _bin/native-echo _bin/native-surface
           cp _bin/native-echo testing/docker/native-echo
           cp _bin/native-surface testing/docker/native-surface
-          docker build -t fips-test:latest testing/docker
-          docker build -t fips-test-app:latest -f testing/docker/Dockerfile.app testing/docker
+          # Retried: both builds pull from Docker Hub and the Debian mirrors.
+          source testing/lib/image-build.sh
+          retry_build "docker build fips-test" docker build -t fips-test:latest testing/docker
+          retry_build "docker build fips-test-app" docker build -t fips-test-app:latest -f testing/docker/Dockerfile.app testing/docker
 
       # ── Static topology ────────────────────────────────────────────────────
       - name: Generate configs (static)
@@ -830,8 +832,12 @@ jobs:
         if: matrix.type == 'chaos'
         run: pip3 install --quiet pyyaml jinja2
 
+      # With FIPS_TEST_IMAGE set, the chaos runner uses the image the job built
+      # above instead of building fips-test:latest again (testing/chaos/sim/runner.py).
       - name: Run chaos scenario
         if: matrix.type == 'chaos'
+        env:
+          FIPS_TEST_IMAGE: fips-test:latest
         run: bash testing/chaos/scripts/chaos.sh ${{ matrix.scenario }} ${{ matrix.chaos_flags }}
 
       - name: Upload sim results on failure (chaos)
