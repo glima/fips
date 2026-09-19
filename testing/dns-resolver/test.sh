@@ -221,6 +221,22 @@ file_contains() {
     docker exec "$name" grep -qF "$needle" "$path" 2>/dev/null
 }
 
+# Pass only when the file is confirmed absent after teardown. Negating
+# file_exists fails open: `docker exec` exits non-zero for a container
+# that is gone just as `test -f` does for a missing file, so a teardown
+# that took the container down would read as clean. When the check
+# cannot run, name the unreachable container rather than the file.
+check_removed() {
+    local name="$1" path="$2" okmsg="$3" badmsg="$4"
+    if docker exec "$name" test ! -f "$path" 2>/dev/null; then
+        pass "$okmsg"
+    elif [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != true ]; then
+        fail "could not check $path after teardown: container $name is not running"
+    else
+        fail "$badmsg"
+    fi
+}
+
 # Get the major systemd version inside a container.
 container_systemd_version() {
     local name="$1"
@@ -287,16 +303,12 @@ verify_resolved_backend() {
     fi
 
     run_teardown "$name" >/dev/null 2>&1
-    if ! file_exists "$name" "$expected_path"; then
-        pass "teardown removed config file"
-    else
-        fail "config file still exists after teardown"
-    fi
-    if ! file_exists "$name" /run/fips/dns-backend; then
-        pass "teardown cleaned state file"
-    else
-        fail "state file still exists after teardown"
-    fi
+    check_removed "$name" "$expected_path" \
+        "teardown removed config file" \
+        "config file still exists after teardown"
+    check_removed "$name" /run/fips/dns-backend \
+        "teardown cleaned state file" \
+        "state file still exists after teardown"
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -594,16 +606,12 @@ DOCKERFILE
 
     # Teardown
     run_teardown "$name" >/dev/null 2>&1
-    if ! file_exists "$name" /etc/dnsmasq.d/fips.conf; then
-        pass "teardown removed dnsmasq config"
-    else
-        fail "dnsmasq config still exists after teardown"
-    fi
-    if ! file_exists "$name" /run/fips/dns-backend; then
-        pass "teardown cleaned state file"
-    else
-        fail "state file still exists after teardown"
-    fi
+    check_removed "$name" /etc/dnsmasq.d/fips.conf \
+        "teardown removed dnsmasq config" \
+        "dnsmasq config still exists after teardown"
+    check_removed "$name" /run/fips/dns-backend \
+        "teardown cleaned state file" \
+        "state file still exists after teardown"
 
     cleanup_container "$name"
 }
@@ -657,16 +665,12 @@ DOCKERFILE
 
     # Teardown
     run_teardown "$name" >/dev/null 2>&1
-    if ! file_exists "$name" /etc/NetworkManager/dnsmasq.d/fips.conf; then
-        pass "teardown removed NM dnsmasq config"
-    else
-        fail "NM dnsmasq config still exists after teardown"
-    fi
-    if ! file_exists "$name" /run/fips/dns-backend; then
-        pass "teardown cleaned state file"
-    else
-        fail "state file still exists after teardown"
-    fi
+    check_removed "$name" /etc/NetworkManager/dnsmasq.d/fips.conf \
+        "teardown removed NM dnsmasq config" \
+        "NM dnsmasq config still exists after teardown"
+    check_removed "$name" /run/fips/dns-backend \
+        "teardown cleaned state file" \
+        "state file still exists after teardown"
 
     cleanup_container "$name"
 }
@@ -710,11 +714,9 @@ DOCKERFILE
     fi
 
     run_teardown "$name" >/dev/null 2>&1
-    if ! file_exists "$name" /run/fips/dns-backend; then
-        pass "teardown cleaned state file"
-    else
-        fail "state file still exists after teardown"
-    fi
+    check_removed "$name" /run/fips/dns-backend \
+        "teardown cleaned state file" \
+        "state file still exists after teardown"
 
     cleanup_container "$name"
 }
@@ -955,11 +957,9 @@ EOF'
         teardown_path="/etc/systemd/resolved.conf.d/fips.conf"
     fi
     run_teardown "$name" >/dev/null 2>&1
-    if ! file_exists "$name" "$teardown_path"; then
-        pass "teardown removed $expected_backend config at $teardown_path"
-    else
-        fail "$expected_backend config still present after teardown at $teardown_path"
-    fi
+    check_removed "$name" "$teardown_path" \
+        "teardown removed $expected_backend config at $teardown_path" \
+        "$expected_backend config still present after teardown at $teardown_path"
 
     cleanup_container "$name"
 }

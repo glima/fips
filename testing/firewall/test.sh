@@ -195,10 +195,12 @@ docker compose -f "$COMPOSE_FILE" down >/dev/null 2>&1 || true
 # has already built the image this compose file names, and rebuilding it here
 # would overwrite that image from whatever the shared build context happens to
 # hold — which is how a suite ends up certifying binaries it was never given.
+# With --skip-build a missing image is an error: compose may neither build it
+# from the build: context nor pull a same-named image from a registry.
 if [ "$SKIP_BUILD" = false ]; then
     docker compose -f "$COMPOSE_FILE" up -d --build
 else
-    docker compose -f "$COMPOSE_FILE" up -d
+    docker compose -f "$COMPOSE_FILE" up -d --no-build --pull never
 fi
 
 log "Waiting for fips0 on both nodes"

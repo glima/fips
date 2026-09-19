@@ -74,8 +74,11 @@ Run the suite:
 ```
 
 `test.sh` regenerates fixtures automatically before starting Docker.
-Use `--skip-build` to reuse the existing release binaries. Use
-`--keep-up` to leave the containers running for inspection.
+Use `--skip-build` to reuse the existing release binaries and the
+existing test image: the suite then neither builds nor pulls the image
+named by `FIPS_TEST_IMAGE` (default `fips-test:latest`), so that image
+must already exist. Use `--keep-up` to leave the containers running for
+inspection.
 
 ## Expected output shape
 
