@@ -154,6 +154,12 @@ trap 'echo ""; echo "Test interrupted"; exit 130' INT
 # wait early-exits on PASS, so successful reps are unaffected by the
 # extra headroom.
 BASELINE_CONVERGENCE_TIMEOUT=65
+# A mesh that has held within the gate's slack (two pairs) for this long when
+# BASELINE_CONVERGENCE_TIMEOUT falls is handed to the strict all-pairs
+# assertion instead of failing the gate. The strict assertion still decides.
+# 10s accepts a straggler that held for most of the window and refuses a
+# pair that only fell into the hold in the last few seconds.
+BASELINE_NEAR_CONVERGED_ACCEPT=10
 REKEY_SETTLE=12        # > DRAIN_WINDOW_SECS (10) so post-rekey samples are off the old session
 # First FMP rekey should follow shortly after the 35s interval once the mesh is
 # fully converged. Keep this bounded to preserve a meaningful scheduling check
@@ -421,7 +427,13 @@ echo ""
 # it no longer false-times-out under concurrent CI load. The strict
 # ping_all below is the actual assertion, run only after convergence.
 echo "Phase 1: Pre-rekey connectivity (waiting for convergence)"
-if wait_until_connected _baseline_ping "$BASELINE_CONVERGENCE_TIMEOUT" 20; then
+if wait_until_connected _baseline_ping "$BASELINE_CONVERGENCE_TIMEOUT" 20 1 2 \
+    "$BASELINE_NEAR_CONVERGED_ACCEPT"; then
+    if [ "$CONVERGE_OUTCOME" = "near_converged" ]; then
+        echo "  Gate accepted a near-converged mesh" \
+            "($CONVERGE_REACHED/$((CONVERGE_REACHED + CONVERGE_PENDING)) reachable);" \
+            "the strict assertion below decides"
+    fi
     ping_all "" "$TIMEOUT" "$MAX_PING_ATTEMPTS"
     phase_result "Pre-rekey baseline (all 20 pairs)"
     if [ "$FAILED" -ne 0 ]; then

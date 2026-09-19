@@ -898,9 +898,19 @@ impl Node {
             }
         };
 
-        // Build SessionSetup with coordinates
+        // Build SessionSetup with coordinates. The wire needs non-empty
+        // destination coordinates, and on a cache miss our own would be filed
+        // under the destination's address by every node on the path. A miss
+        // here means a direct peer, since we got past `find_next_hop`, and
+        // routing never refreshes a direct peer's cache entry, so fall back
+        // to the coordinates the peer announced to us. Only a peer that has
+        // not announced yet still gets ours, and that frame goes one hop, to
+        // the destination itself.
         let our_coords = self.tree_state.my_coords().clone();
-        let dest_coords = self.get_dest_coords(dest_addr);
+        let dest_coords = self
+            .cached_dest_coords(dest_addr)
+            .or_else(|| self.tree_state.peer_coords(dest_addr).cloned())
+            .unwrap_or_else(|| our_coords.clone());
         let setup = SessionSetup::new(our_coords, dest_coords).with_handshake(msg1);
         let setup_payload = setup.encode();
 

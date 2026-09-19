@@ -61,6 +61,11 @@ libc = "0.2"
 rtnetlink = "0.21.0"
 rustables = "0.8.7"
 procfs = { version = "0.18", default-features = false }
+# Conntrack dump for kernels without /proc/net/nf_conntrack. 0.3 is the
+# release on netlink-packet-core 0.8, the version rtnetlink 0.21 uses.
+netlink-packet-netfilter = "0.3"
+netlink-packet-core = "0.8"
+netlink-sys = "0.8"
 
 # bluer/BlueZ needs glibc — see build.rs `bluer_available` cfg gate.
 [target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]

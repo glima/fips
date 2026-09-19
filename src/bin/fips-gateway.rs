@@ -65,14 +65,14 @@ fn elapsed_us(started: Instant) -> u64 {
 /// A failed read yields an empty snapshot, so every mapping reads zero
 /// sessions, which is what the pool did with an unreadable source before. The
 /// alternative, treating "unknown" as "in use", would pin every mapping forever
-/// on a kernel with no conntrack proc file and turn a read error into a pool
-/// that never reclaims. The cost is the opposite error: a mapping carrying live
-/// traffic can be reclaimed early while the source is unreadable.
+/// on a kernel with no readable conntrack source and turn a read error into a
+/// pool that never reclaims. The cost is the opposite error: a mapping carrying
+/// live traffic can be reclaimed early while the source is unreadable.
 #[cfg(target_os = "linux")]
 async fn read_conntrack(log: &mut pool::ConntrackReadLog) -> pool::ConntrackSnapshot {
     use fips::gateway::pool::ConntrackQuerier;
 
-    match tokio::task::spawn_blocking(|| pool::ProcConntrack.snapshot()).await {
+    match tokio::task::spawn_blocking(|| pool::SystemConntrack::default().snapshot()).await {
         Ok(Ok(snapshot)) => {
             log.observe(None);
             snapshot
@@ -104,6 +104,42 @@ fn report_unreadable_conntrack(
             error,
             "Conntrack still unreadable; every mapping reads zero sessions"
         ),
+    }
+}
+
+/// Check once at startup which conntrack source the tick will read, and say so.
+///
+/// Without this, an operator on a kernel with no readable source learns that
+/// session pinning is off only from a warning at the first failed tick.
+#[cfg(target_os = "linux")]
+async fn report_conntrack_source() {
+    let probe =
+        tokio::task::spawn_blocking(|| pool::probe_conntrack(&pool::SystemConntrack::default()))
+            .await
+            .unwrap_or_else(|e| {
+                pool::ConntrackProbe::Missing(pool::ConntrackUnreadable {
+                    proc: std::io::Error::other(e.to_string()),
+                    netlink: None,
+                })
+            });
+    match probe {
+        pool::ConntrackProbe::Found(pool::ConntrackSource::Proc) => {
+            info!("Conntrack source: proc; session pinning is on")
+        }
+        pool::ConntrackProbe::Found(pool::ConntrackSource::Netlink) => {
+            info!("Conntrack source: netlink; session pinning is on")
+        }
+        pool::ConntrackProbe::Missing(e) => match e.netlink {
+            Some(netlink) => warn!(
+                proc_error = %e.proc,
+                netlink_error = %netlink,
+                "No conntrack source is readable; session pinning is off"
+            ),
+            None => warn!(
+                proc_error = %e.proc,
+                "No conntrack source is readable; session pinning is off"
+            ),
+        },
     }
 }
 
@@ -370,6 +406,10 @@ async fn main() {
         let _ = nat_mgr.cleanup();
         std::process::exit(1);
     }
+
+    // The NAT table exists by now, so a kernel that provides the proc file
+    // has loaded nf_conntrack and the probe sees what the first tick will.
+    report_conntrack_source().await;
 
     // --- Channels ---
 

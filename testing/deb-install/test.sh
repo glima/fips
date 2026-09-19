@@ -58,6 +58,10 @@ SKIP=0
 # however many scenarios run in one process.
 SUPPLIED_DEB=""
 DEB_PREPARED=0
+# The package the scenarios install, set by build_deb() on every path that
+# succeeds. Scenarios use it rather than listing the cache directory, so which
+# file they install never depends on what else happens to be in there.
+DEB_PATH=""
 
 # ─────────────────────────────────────────────────────────────────────
 # Helpers
@@ -202,6 +206,7 @@ build_deb() {
         fi
         rm -f "$DEB_CACHE_DIR"/*.deb
         cp "$SUPPLIED_DEB" "$DEB_CACHE_DIR/"
+        DEB_PATH="$DEB_CACHE_DIR/$(basename "$SUPPLIED_DEB")"
         DEB_PREPARED=1
         log "Installing the supplied package $(basename "$SUPPLIED_DEB")"
         return 0
@@ -218,6 +223,7 @@ build_deb() {
         local cached_age
         cached_age=$(stat -c '%Y' "$cached_deb" 2>/dev/null || echo 0)
         if awk "BEGIN { exit !($cached_age >= $newest_src) }"; then
+            DEB_PATH="$cached_deb"
             log "Using cached .deb at $cached_deb"
             return 0
         fi
@@ -233,20 +239,60 @@ build_deb() {
     # not exhibit a defect that only the release environment produced. It stayed
     # green through five releases that could not start on two of the five
     # distributions in its own matrix.
+    #
+    # The cache holds one package at a time. Clearing it first is what keeps the
+    # reuse check above honest, since that check looks at whichever package it
+    # finds; and the package installed is the one the build names on the last
+    # line of its stdout, never one found by listing the directory.
     log "Building the .deb in the pinned build container (slow on first run)"
-    if ! bash "$REPO_ROOT/packaging/debian/build-deb-container.sh" \
-            --output-dir "$DEB_CACHE_DIR" >&2; then
+    rm -f "$DEB_CACHE_DIR"/*.deb
+    local build_out
+    if ! build_out=$(bash "$REPO_ROOT/packaging/debian/build-deb-container.sh" \
+            --output-dir "$DEB_CACHE_DIR"); then
         echo "  ERROR: container build failed" >&2
         return 1
     fi
 
-    cached_deb=$(ls "$DEB_CACHE_DIR"/fips_*_amd64.deb 2>/dev/null | head -1)
-    if [ -n "$cached_deb" ]; then
-        log "Cached at $cached_deb ($(stat -c %s "$cached_deb") bytes)"
-    else
-        echo "  ERROR: no .deb produced by the container build" >&2
+    cached_deb=$(printf '%s\n' "$build_out" | tail -n 1)
+    if [ -z "$cached_deb" ] || [ ! -f "$cached_deb" ]; then
+        echo "  ERROR: the container build did not report a package path: '$cached_deb'" >&2
         return 1
     fi
+    DEB_PATH="$cached_deb"
+    log "Cached at $cached_deb ($(stat -c %s "$cached_deb") bytes)"
+    return 0
+}
+
+# The packages a runtime image installs on top of the distro base image.
+# Ubuntu 22.04 bundles systemd-resolved into systemd; other distros require it
+# as a separate package.
+runtime_packages() {
+    local base_image="$1"
+    if [ "$base_image" = "ubuntu:22.04" ]; then
+        echo "systemd iproute2 dbus dnsutils procps"
+    else
+        echo "systemd systemd-resolved iproute2 dbus dnsutils procps"
+    fi
+    return 0
+}
+
+# Patch a minimal gateway config into the container's fips.yaml, since the
+# shipped one has the gateway disabled, and restart fips.service to load it.
+# The caller checks that the daemon came back.
+apply_gateway_config() {
+    local name="$1"
+    timeout "$CONFIG_RESTART_TIMEOUT" docker exec "$name" bash -c '
+        systemctl unmask fips-gateway.service 2>/dev/null
+        cp /etc/fips/fips.yaml /etc/fips/fips.yaml.orig
+        cat >> /etc/fips/fips.yaml <<EOF
+gateway:
+  enabled: true
+  pool: "fd01::/112"
+  lan_interface: "eth0"
+EOF
+        systemctl restart fips.service
+    ' >/dev/null 2>&1
+    return
 }
 
 # ─────────────────────────────────────────────────────────────────────
@@ -267,8 +313,7 @@ _run_deb_install_scenario() {
 
     build_deb || { fail ".deb build failed"; return; }
 
-    local cached_deb
-    cached_deb=$(ls "$DEB_CACHE_DIR"/fips_*_amd64.deb 2>/dev/null | head -1)
+    local cached_deb="$DEB_PATH"
     if [ -z "$cached_deb" ] || [ ! -f "$cached_deb" ]; then
         fail "no .deb available at $DEB_CACHE_DIR"
         return
@@ -276,13 +321,8 @@ _run_deb_install_scenario() {
     local deb_basename
     deb_basename=$(basename "$cached_deb")
 
-    # Ubuntu 22.04 bundles systemd-resolved into systemd; other
-    # distros require it as a separate package. Compose the apt
-    # package list accordingly.
-    local apt_packages="systemd iproute2 dbus dnsutils procps"
-    if [ "$base_image" != "ubuntu:22.04" ]; then
-        apt_packages="systemd systemd-resolved iproute2 dbus dnsutils procps"
-    fi
+    local apt_packages
+    apt_packages=$(runtime_packages "$base_image")
 
     log "Building ${base_image} runtime image"
     cp "$cached_deb" "$CACHE_DIR/deb-for-image"
@@ -515,19 +555,7 @@ DOCKERFILE
     # default preset) and ipv6 forwarding (gateway checks before
     # the DNS upstream check), which the container is started with;
     # see start_systemd_container_with_tun.
-    timeout "$CONFIG_RESTART_TIMEOUT" docker exec "$name" bash -c '
-        systemctl unmask fips-gateway.service 2>/dev/null
-        # Patch in a minimal gateway config since the shipped fips.yaml
-        # has gateway disabled by default.
-        cp /etc/fips/fips.yaml /etc/fips/fips.yaml.orig
-        cat >> /etc/fips/fips.yaml <<EOF
-gateway:
-  enabled: true
-  pool: "fd01::/112"
-  lan_interface: "eth0"
-EOF
-        systemctl restart fips.service
-    ' >/dev/null 2>&1
+    apply_gateway_config "$name"
 
     sleep 3
     if wait_for_service_active "$name" fips.service 5; then
@@ -570,8 +598,474 @@ EOF
     cleanup_container "$name"
 }
 
+# ─────────────────────────────────────────────────────────────────────
+# Upgrade scenario
+#
+# Upgrades an installed package to a newer one and checks what the
+# maintainer scripts do to the running services on the way. The newer
+# package is made from the one under test inside the container: unpacked,
+# given a higher Version and repacked, so the upgrade runs this tree's prerm
+# and postinst without a second build.
+#
+# Its runtime image holds no package. The install scenario's image does, but
+# under a tag every run shares and a file name every build of one version
+# shares, so another run could retag it in the minutes between the two
+# scenarios and this one would upgrade from that run's package. Instead the
+# package this run built is copied into each container, and its checksum is
+# compared there before anything is installed.
+# ─────────────────────────────────────────────────────────────────────
+
+# Every apt run here is bounded: an upgrade that blocks in postinst is one of
+# the defects this scenario exists to catch, and an unbounded one would hang
+# the suite instead of failing it.
+# The package's own worst case on a healthy daemon is its three bounded starts,
+# 60s + 60s + 90s, so an upgrade bound above that reports the package's
+# diagnosis rather than this one.
+UPGRADE_APT_TIMEOUT=300
+# The dead-daemon reinstall skips the units behind the daemon, so its worst
+# case is one 60s bound.
+DEAD_DAEMON_APT_TIMEOUT=150
+# postinst waits up to 60s for a unit that does not start. When the daemon
+# cannot start, apt has to return a failure well inside this.
+DEAD_DAEMON_LIMIT=120
+# Bound on a single short command inside a container.
+EXEC_TIMEOUT=60
+
+# Run a short command in a container under EXEC_TIMEOUT.
+cexec() {
+    local name="$1"
+    shift
+    timeout "$EXEC_TIMEOUT" docker exec "$name" "$@"
+    return
+}
+
+# Run apt-get in /opt/fips-deb inside the container, bounded by the given
+# number of seconds, keeping the existing configuration files. Sets APT_RC,
+# APT_SECS and APT_OUT rather than returning a status, because every caller
+# needs all three.
+run_apt() {
+    local name="$1" limit="$2"
+    shift 2
+    local start=$SECONDS
+    APT_RC=0
+    APT_OUT=$(timeout "$limit" docker exec -w /opt/fips-deb "$name" \
+        apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+        "$@" 2>&1) || APT_RC=$?
+    APT_SECS=$((SECONDS - start))
+    return 0
+}
+
+# Boot an upgrade container, copy this run's package into it and install it.
+# Returns 1, having recorded why, when any step fails.
+upgrade_boot() {
+    local name="$1" image="$2" deb="$3"
+    if ! start_systemd_container_with_tun "$name" "$image"; then
+        fail "$name: container did not start"
+        return 1
+    fi
+    if ! wait_for_systemd "$name"; then
+        fail "systemd did not boot in $name"
+        return 1
+    fi
+    # /opt rather than /tmp: systemd mounts a fresh /tmp during boot.
+    if ! timeout "$EXEC_TIMEOUT" docker cp "$DEB_PATH" "$name:/opt/fips-deb/$deb"; then
+        fail "$name: could not copy $deb into the container"
+        return 1
+    fi
+    local want have
+    want=$(sha256sum "$DEB_PATH" | cut -d' ' -f1)
+    have=$(cexec "$name" sha256sum "/opt/fips-deb/$deb" 2>/dev/null | cut -d' ' -f1)
+    if [ -z "$want" ] || [ "$want" != "$have" ]; then
+        fail "$name: the package in the container is not the one under test ('$have', want '$want')"
+        return 1
+    fi
+    local start=$SECONDS rc=0 out
+    out=$(timeout "$UPGRADE_APT_TIMEOUT" docker exec -w /opt/fips-deb "$name" bash -c "
+        apt-get update >/dev/null 2>&1
+        apt-get install -y --no-install-recommends ./${deb} 2>&1
+    ") || rc=$?
+    echo "  install took $((SECONDS - start))s"
+    if [ "$rc" -ne 0 ]; then
+        fail "$name: installing $deb exited $rc"
+        echo "$out" | tail -20
+        return 1
+    fi
+    return 0
+}
+
+# Make /opt/fips-deb/next.deb from the package under test, inside the
+# container so the host needs no dpkg tooling. Its Version is the original's
+# with "+upgrade1" appended, which must compare higher, and its fips.nft gains
+# a named counter inside the fips table, so a check can tell whether the
+# ruleset loaded after the upgrade is the new one. Any step failing is a
+# failure of the scenario, never a skip.
+make_next_package() {
+    local name="$1" deb="$2" out rc=0
+    # shellcheck disable=SC2016  # the script expands inside the container
+    out=$(timeout "$EXEC_TIMEOUT" docker exec -w /opt/fips-deb -e DEB="$deb" "$name" \
+        bash -euo pipefail -c '
+        rm -rf /root/next
+        dpkg-deb -R "./$DEB" /root/next
+        old=$(dpkg-deb -f "./$DEB" Version)
+        new="${old}+upgrade1"
+        sed -i "s/^Version: .*/Version: ${new}/" /root/next/DEBIAN/control
+        dpkg --compare-versions "$new" gt "$old"
+        nft_file=/root/next/etc/fips/fips.nft
+        grep -q "^table inet fips {\$" "$nft_file"
+        sed -i "/^table inet fips {\$/a\\    counter fips_upgrade_probe { packets 0 bytes 0 }" "$nft_file"
+        grep -q "counter fips_upgrade_probe" "$nft_file"
+        nft -c -f "$nft_file"
+        if grep -q "  etc/fips/fips.nft\$" /root/next/DEBIAN/md5sums 2>/dev/null; then
+            sum=$(md5sum "$nft_file" | cut -d" " -f1)
+            sed -i "s|^[0-9a-f]*  etc/fips/fips.nft\$|${sum}  etc/fips/fips.nft|" /root/next/DEBIAN/md5sums
+            grep -q "^${sum}  etc/fips/fips.nft\$" /root/next/DEBIAN/md5sums
+        fi
+        dpkg-deb -b /root/next /opt/fips-deb/next.deb >/dev/null
+        echo "made next.deb at Version $new"
+    ' 2>&1) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        fail "$name: could not make the newer package (exit $rc)"
+        echo "$out" | tail -20
+        return 1
+    fi
+    echo "  $out"
+    return 0
+}
+
+# Start fips.service and fips-dns.service the way the install scenario does
+# and require both to be active.
+start_daemon_units() {
+    local name="$1"
+    start_unit "$name" fips.service >/dev/null || true
+    start_unit_queued "$name" fips-dns.service >/dev/null || true
+    if wait_for_service_active "$name" fips.service &&
+        wait_for_service_active "$name" fips-dns.service; then
+        return 0
+    fi
+    cexec "$name" systemctl status --no-pager fips.service fips-dns.service 2>&1 | tail -20
+    return 1
+}
+
+# Pass or fail on whether a unit is active.
+check_active() {
+    local name="$1" unit="$2" what="$3"
+    if cexec "$name" systemctl is-active --quiet "$unit"; then
+        pass "$what: $unit active"
+    else
+        fail "$what: $unit not active"
+        cexec "$name" systemctl status --no-pager "$unit" 2>&1 | tail -15
+    fi
+    return 0
+}
+
+# Pass or fail on whether a unit the host never enabled is still neither
+# running nor enabled.
+check_left_off() {
+    local name="$1" unit="$2" what="$3" state
+    state=$(cexec "$name" systemctl is-enabled "$unit" 2>/dev/null || true)
+    if ! cexec "$name" systemctl is-active --quiet "$unit" && [ "$state" = "disabled" ]; then
+        pass "$what: $unit inactive and disabled"
+    else
+        fail "$what: $unit is $(cexec "$name" systemctl is-active "$unit" 2>/dev/null) and '$state' (want inactive and disabled)"
+    fi
+    return 0
+}
+
+# Start `nft monitor tables` in the background, writing to
+# /root/nft-monitor.log, and prove it is recording by adding and deleting a
+# table of its own. An empty log from a monitor that never ran would otherwise
+# read as a ruleset that was never removed. The probe table's name does not
+# begin with "fips", so it cannot match a check on the fips table.
+start_nft_monitor() {
+    local name="$1"
+    if ! timeout "$EXEC_TIMEOUT" docker exec -d "$name" \
+            sh -c 'exec nft monitor tables > /root/nft-monitor.log 2>&1'; then
+        return 1
+    fi
+    sleep 1
+    cexec "$name" sh -c 'nft add table inet monprobe && nft delete table inet monprobe' || return 1
+    local _i
+    for _i in 1 2 3 4 5; do
+        if cexec "$name" grep -Eq '^delete table inet monprobe( |$)' /root/nft-monitor.log; then
+            return 0
+        fi
+        sleep 1
+    done
+    cexec "$name" cat /root/nft-monitor.log 2>&1 | tail -10
+    return 1
+}
+
+# Apply the gateway config and start fips-gateway.service, bounded, requiring
+# it to be active. Leaves it enabled or not as the caller already set it.
+start_gateway() {
+    local name="$1"
+    apply_gateway_config "$name"
+    if ! wait_for_service_active "$name" fips.service 10; then
+        return 1
+    fi
+    start_unit "$name" fips-gateway.service "$GATEWAY_START_TIMEOUT" >/dev/null 2>&1 || true
+    if wait_for_service_active "$name" fips-gateway.service 10; then
+        return 0
+    fi
+    cexec "$name" systemctl status --no-pager fips-gateway.service 2>&1 | tail -15
+    return 1
+}
+
+# Print a unit's MainPID; 0 when it has no main process.
+main_pid() {
+    local name="$1" unit="$2"
+    cexec "$name" systemctl show -p MainPID --value "$unit" 2>/dev/null || echo 0
+    return 0
+}
+
+# Pass or fail on whether a unit runs a new process of the installed binary
+# after the upgrade: active, a MainPID other than the one before, and an
+# executable that is the installed file rather than one the upgrade replaced,
+# which the kernel reports with a " (deleted)" suffix.
+check_new_binary() {
+    local name="$1" unit="$2" binary="$3" before="$4" what="$5" pid exe
+    pid=$(main_pid "$name" "$unit")
+    exe=$(cexec "$name" readlink "/proc/$pid/exe" 2>/dev/null || true)
+    if cexec "$name" systemctl is-active --quiet "$unit" && [ "$pid" != 0 ] &&
+        [ "$pid" != "$before" ] && [ "$exe" = "$binary" ]; then
+        pass "$what: $unit runs the upgraded $binary"
+    else
+        fail "$what: $unit is $(cexec "$name" systemctl is-active "$unit" 2>/dev/null), MainPID $before -> $pid, exe '$exe' (want active, a new process, $binary)"
+    fi
+    return 0
+}
+
+# Host that opted in to the firewall and enabled the gateway: the upgrade must
+# apply the new ruleset in place, with no moment at which the fips table is
+# absent, and bring the gateway back on the new binary. Purging the package
+# must then leave no enablement behind for the gateway.
+_upgrade_opted_in() {
+    local name="$1" image="$2" deb="$3"
+    log "upgrade on a host that opted in ($name)"
+    upgrade_boot "$name" "$image" "$deb" || { cleanup_container "$name"; return 0; }
+    make_next_package "$name" "$deb" || { cleanup_container "$name"; return 0; }
+    if ! cexec "$name" systemctl enable --now fips-firewall.service >/dev/null 2>&1 ||
+        ! start_daemon_units "$name"; then
+        fail "opted in: the firewall, fips and fips-dns did not all start before the upgrade"
+        cexec "$name" systemctl status --no-pager fips-firewall.service 2>&1 | tail -15
+        cleanup_container "$name"
+        return 0
+    fi
+    cexec "$name" systemctl enable fips-gateway.service >/dev/null 2>&1
+    if ! start_gateway "$name"; then
+        fail "opted in: fips-gateway did not start before the upgrade"
+        cleanup_container "$name"
+        return 0
+    fi
+    if ! start_nft_monitor "$name"; then
+        fail "opted in: nft monitor is not observing table changes"
+        cleanup_container "$name"
+        return 0
+    fi
+    local fips_pid gw_pid
+    fips_pid=$(main_pid "$name" fips.service)
+    gw_pid=$(main_pid "$name" fips-gateway.service)
+
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" install -y ./next.deb
+    echo "  upgrade took ${APT_SECS}s"
+    if [ "$APT_RC" -eq 0 ]; then
+        pass "opted in: upgrade exits 0"
+    else
+        fail "opted in: upgrade exited $APT_RC"
+        echo "$APT_OUT" | tail -20
+    fi
+    check_active "$name" fips.service "opted in, after upgrade"
+    check_active "$name" fips-dns.service "opted in, after upgrade"
+    check_active "$name" fips-firewall.service "opted in, after upgrade"
+    if cexec "$name" nft list counter inet fips fips_upgrade_probe >/dev/null 2>&1; then
+        pass "opted in: the upgraded ruleset is loaded"
+    else
+        fail "opted in: the upgraded ruleset is not loaded (no fips_upgrade_probe counter)"
+    fi
+    if cexec "$name" grep -Eq '^delete table inet fips( |$)' /root/nft-monitor.log; then
+        fail "opted in: the fips table was deleted during the upgrade"
+        cexec "$name" cat /root/nft-monitor.log 2>&1 | tail -10
+    else
+        pass "opted in: the fips table was never deleted during the upgrade"
+    fi
+    check_new_binary "$name" fips.service /usr/bin/fips "$fips_pid" "opted in, after upgrade"
+    check_new_binary "$name" fips-gateway.service /usr/bin/fips-gateway "$gw_pid" "opted in, after upgrade"
+
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" purge -y fips
+    echo "  purge took ${APT_SECS}s"
+    if [ "$APT_RC" -ne 0 ]; then
+        fail "opted in: purge exited $APT_RC"
+        echo "$APT_OUT" | tail -20
+    fi
+    local link=/etc/systemd/system/multi-user.target.wants/fips-gateway.service state
+    state=$(cexec "$name" systemctl is-enabled fips-gateway.service 2>/dev/null || true)
+    if ! cexec "$name" test -e "$link" && ! cexec "$name" test -L "$link" &&
+        [ "$state" != "enabled" ]; then
+        pass "opted in, after purge: no fips-gateway enablement left behind"
+    else
+        fail "opted in, after purge: fips-gateway still enabled ('$state', $(cexec "$name" ls -l "$link" 2>&1))"
+    fi
+
+    cleanup_container "$name"
+    return 0
+}
+
+# Host that never opted in to the firewall and ran the gateway without enabling
+# it: the upgrade must leave neither running nor enabled. Then the package is
+# reinstalled three times: with the daemon masked, when apt must succeed and
+# start nothing; with an enabled gateway that cannot start, when apt must
+# succeed, say so, and leave the daemon running; and with a daemon that cannot
+# start, when apt must fail, promptly, naming the unit, rather than wait for
+# ever on a unit that requires a daemon which never comes up.
+_upgrade_not_opted_in() {
+    local name="$1" image="$2" deb="$3"
+    log "upgrade on a host that never opted in ($name)"
+    upgrade_boot "$name" "$image" "$deb" || { cleanup_container "$name"; return 0; }
+    make_next_package "$name" "$deb" || { cleanup_container "$name"; return 0; }
+    if ! start_daemon_units "$name" || ! start_gateway "$name"; then
+        fail "not opted in: fips, fips-dns and fips-gateway did not start before the upgrade"
+        cleanup_container "$name"
+        return 0
+    fi
+
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" install -y ./next.deb
+    echo "  upgrade took ${APT_SECS}s"
+    if [ "$APT_RC" -eq 0 ]; then
+        pass "not opted in: upgrade exits 0"
+    else
+        fail "not opted in: upgrade exited $APT_RC"
+        echo "$APT_OUT" | tail -20
+    fi
+    check_active "$name" fips.service "not opted in, after upgrade"
+    check_active "$name" fips-dns.service "not opted in, after upgrade"
+    check_left_off "$name" fips-firewall.service "not opted in, after upgrade"
+    check_left_off "$name" fips-gateway.service "not opted in, after upgrade"
+    if cexec "$name" nft list table inet fips >/dev/null 2>&1; then
+        fail "not opted in, after upgrade: the fips firewall table is loaded"
+    else
+        pass "not opted in, after upgrade: no fips firewall table"
+    fi
+
+    # A host that masked the daemon on purpose: the upgrade must skip it with a
+    # message, not fail. The package before this change printed nothing for a
+    # masked unit, so the message is what tells the two apart.
+    cexec "$name" bash -c 'systemctl stop fips-dns.service fips.service; systemctl mask fips.service' \
+        >/dev/null 2>&1
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" install --reinstall -y ./next.deb
+    echo "  reinstall with the daemon masked took ${APT_SECS}s (exit $APT_RC)"
+    if [ "$APT_RC" -eq 0 ] && grep -q "fips.service is masked" <<<"$APT_OUT" &&
+        ! cexec "$name" systemctl is-active --quiet fips.service &&
+        ! cexec "$name" systemctl is-active --quiet fips-dns.service; then
+        pass "masked daemon: apt succeeds, says the unit was skipped and starts nothing"
+    else
+        fail "masked daemon: apt exited $APT_RC (want 0, a message that fips.service is masked, and fips and fips-dns inactive)"
+        echo "$APT_OUT" | tail -20
+    fi
+    cexec "$name" bash -c 'systemctl unmask fips.service; systemctl daemon-reload' >/dev/null 2>&1
+    if ! start_daemon_units "$name"; then
+        fail "dead daemon: fips and fips-dns did not start again after unmasking"
+        cleanup_container "$name"
+        return 0
+    fi
+
+    # An enabled gateway that fails on start, behind a daemon that is healthy:
+    # the gateway is an opt-in addition, so apt must report it and succeed.
+    # Restart=no so it reaches failed at once rather than looping.
+    cexec "$name" bash -c '
+        mkdir -p /etc/systemd/system/fips-gateway.service.d
+        printf "[Service]\nExecStart=\nExecStart=/bin/false\nRestart=no\n" \
+            > /etc/systemd/system/fips-gateway.service.d/broken.conf
+        systemctl daemon-reload
+        systemctl enable fips-gateway.service
+    ' >/dev/null 2>&1
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" install --reinstall -y ./next.deb
+    echo "  reinstall with a broken gateway took ${APT_SECS}s (exit $APT_RC)"
+    if [ "$APT_RC" -eq 0 ] &&
+        grep -q "fips-gateway.service did not come back" <<<"$APT_OUT" &&
+        cexec "$name" systemctl is-active --quiet fips.service; then
+        pass "broken gateway: apt succeeds, reports the gateway and leaves the daemon running"
+    else
+        fail "broken gateway: apt exited $APT_RC (want 0, a message that fips-gateway.service did not come back, and fips active)"
+        echo "$APT_OUT" | tail -20
+    fi
+    cexec "$name" bash -c '
+        systemctl disable fips-gateway.service
+        rm -rf /etc/systemd/system/fips-gateway.service.d
+        systemctl daemon-reload
+        systemctl reset-failed fips-gateway.service
+    ' >/dev/null 2>&1
+
+    # A daemon that fails on every start: exit 1, so Restart=on-failure loops,
+    # and the start job of fips-dns, which requires it, is never dispatched.
+    cexec "$name" bash -c '
+        mkdir -p /etc/systemd/system/fips.service.d
+        printf "[Service]\nExecStart=\nExecStart=/bin/false\n" \
+            > /etc/systemd/system/fips.service.d/broken.conf
+        systemctl daemon-reload
+    '
+    run_apt "$name" "$DEAD_DAEMON_APT_TIMEOUT" install --reinstall -y ./next.deb
+    echo "  reinstall with a dead daemon took ${APT_SECS}s (exit $APT_RC)"
+    if [ "$APT_RC" -ne 0 ] && [ "$APT_RC" -ne 124 ] &&
+        [ "$APT_SECS" -lt "$DEAD_DAEMON_LIMIT" ] &&
+        grep -q "fips.service did not become active" <<<"$APT_OUT"; then
+        pass "dead daemon: apt fails in ${APT_SECS}s and names fips.service"
+    else
+        fail "dead daemon: apt exited $APT_RC after ${APT_SECS}s (want a failure under ${DEAD_DAEMON_LIMIT}s naming fips.service; 124 is the harness bound)"
+        echo "$APT_OUT" | tail -20
+    fi
+
+    cleanup_container "$name"
+    return 0
+}
+
+_run_deb_upgrade_scenario() {
+    local distro_label="$1"
+    local base_image="$2"
+    # Scoped to the run like the container names, although it holds no
+    # package, so concurrent runs never rebuild an image under each other.
+    local image="fips-deb-upgrade:${distro_label}${FIPS_CI_NAME_SUFFIX:-}"
+    log ".deb upgrade: ${base_image}"
+
+    if [ -z "$DEB_PATH" ] || [ ! -f "$DEB_PATH" ]; then
+        fail "no package to upgrade from"
+        return
+    fi
+    local deb
+    deb=$(basename "$DEB_PATH")
+
+    log "Building $image (runtime packages and nftables, no fips package)"
+    build_image "$image" "$(cat <<DOCKERFILE
+FROM ${base_image}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    $(runtime_packages "$base_image") nftables && \\
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \\
+    systemctl enable systemd-resolved && \\
+    mkdir -p /opt/fips-deb
+CMD ["/lib/systemd/systemd"]
+DOCKERFILE
+    )" || {
+        fail "upgrade image build failed"
+        return
+    }
+
+    # Named under the install scenario's prefix, so a CI step that collects
+    # that scenario's container logs on failure collects these too.
+    _upgrade_opted_in "fips-deb-test-${distro_label}-upg-a${FIPS_CI_NAME_SUFFIX:-}" "$image" "$deb"
+    _upgrade_not_opted_in "fips-deb-test-${distro_label}-upg-b${FIPS_CI_NAME_SUFFIX:-}" "$image" "$deb"
+    docker rmi "$image" >/dev/null 2>&1 || true
+    return 0
+}
+
 # Per-distro wrappers
-test_debian12() { _run_deb_install_scenario debian12 debian:12;     }
+# debian12 also runs the upgrade scenario. One distro keeps the suite's cost
+# down; this one because a oneshot start behind a daemon in its restart loop
+# waits for ever on its systemd (252), while on Ubuntu 22.04's (249) the start
+# returns with an error, so only here does the upgrade scenario see the hang.
+test_debian12() {
+    _run_deb_install_scenario debian12 debian:12
+    _run_deb_upgrade_scenario debian12 debian:12
+}
 test_debian13() { _run_deb_install_scenario debian13 debian:trixie; }
 test_ubuntu22() { _run_deb_install_scenario ubuntu22 ubuntu:22.04;  }
 test_ubuntu24() { _run_deb_install_scenario ubuntu24 ubuntu:24.04;  }

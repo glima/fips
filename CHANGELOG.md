@@ -781,6 +781,33 @@ with v0.5.x or earlier peers.
   costs the initiator the msg2 key agreement until the cycle ends; the msg1
   resend budget bounds that. The wire format is unchanged.
 
+#### Session rekey
+
+- A SessionAck that fails to read no longer ends a session rekey this node
+  started. The handler took the rekey handshake off the session before reading
+  the ack's msg2 and abandoned the rekey when the read failed, although nothing
+  authenticates the ack before that read and the only tie to the rekey is the
+  datagram's source address. The handshake now goes back rolled back to its
+  state before the read, so the peer's genuine ack still completes the rekey,
+  and the refusal is counted as `ack_handshake_failed`, as it already was for a
+  first-contact session. The wire format is unchanged.
+
+#### Session coordinates
+
+- A node with no coordinates cached for a session's destination no longer
+  sends its own coordinates in their place. The lookup that supplies them falls
+  back to the node's own coordinates, which a first-contact SessionSetup needs
+  because its destination field cannot be empty, but the established data path,
+  the standalone CoordsWarmup and the rekey SessionSetup used the same
+  fallback. Every receiver files the destination coordinates it is sent under
+  the destination's address, so a destination reached this way cached its own
+  address under the sender's coordinates. On a cache miss a data frame now goes
+  out without coordinates and leaves the warmup budget for the first frames
+  after the cache is refilled, a standalone CoordsWarmup is not sent, and a
+  rekey SessionSetup, which can only miss for a direct peer, carries the
+  coordinates that peer announced. First-contact setup is unchanged. The wire
+  format is unchanged.
+
 #### Control socket
 
 - `show_links` (`fipsctl show links`) now reports the traffic a link has
@@ -851,6 +878,16 @@ with v0.5.x or earlier peers.
   indistinguishable from an idle one. A kernel built without
   `CONFIG_NF_CONNTRACK_PROCFS` has no `/proc/net/nf_conntrack` at all and fails
   identically every tick, so a repeat is logged at debug rather than warn.
+- The gateway says at startup whether it can read conntrack sessions. It
+  reads the table once, as each tick does, and logs either the source it read
+  or that no source is readable and session pinning is off. An operator on a
+  kernel with no readable source learned this only from a warning at the first
+  failed tick.
+- The gateway counts sessions on a kernel without `/proc/net/nf_conntrack`.
+  When the file is absent it dumps the conntrack table over netlink, as
+  `conntrack -L` does, so a mapping carrying traffic is pinned instead of
+  being reclaimed on its TTL and grace period alone. Kernels built without
+  `CONFIG_NF_CONNTRACK_PROCFS`, such as Ubuntu's, had session pinning off.
 - The NAT table is rebuilt in one netlink transaction. A rebuild deleted the
   `fips_gateway` table in a batch of its own, discarded that batch's result,
   and only then sent the batch that recreated the table, the chains, the

@@ -153,6 +153,31 @@ if [ "$DNS_READY" != true ]; then
     echo "  WARNING: Gateway DNS did not respond within 30s, continuing anyway"
 fi
 
+# The gateway names its conntrack source once at startup, before the DNS
+# resolver starts, so by now the line is in the log. Ask the gateway's own
+# namespace which source it should have found: the proc file when it exists,
+# and otherwise the netlink dump, which the container's NET_ADMIN allows. A
+# failed `docker logs` reds the check rather than counting as zero lines.
+if docker exec "$GATEWAY" test -e /proc/net/nf_conntrack; then
+    EXPECT_SRC=proc
+else
+    EXPECT_SRC=netlink
+fi
+if GW_START_LOG=$(docker logs "$GATEWAY" 2>&1); then
+    SRC_PROC=$(grep -cF 'Conntrack source: proc; session pinning is on' <<< "$GW_START_LOG" || true)
+    SRC_NETLINK=$(grep -cF 'Conntrack source: netlink; session pinning is on' <<< "$GW_START_LOG" || true)
+    SRC_NONE=$(grep -cF 'No conntrack source is readable; session pinning is off' <<< "$GW_START_LOG" || true)
+    case "$EXPECT_SRC" in
+        proc) SRC_HIT=$SRC_PROC ;;
+        *) SRC_HIT=$SRC_NETLINK ;;
+    esac
+    SRC_ALL=$((SRC_PROC + SRC_NETLINK + SRC_NONE))
+    SRC_OK=$([ "$SRC_HIT" -eq 1 ] && [ "$SRC_ALL" -eq 1 ] && echo 0 || echo 1)
+    check "Conntrack source line at startup (expect $EXPECT_SRC; proc lines $SRC_PROC, netlink lines $SRC_NETLINK, none lines $SRC_NONE)" "$SRC_OK"
+else
+    check "Conntrack source line at startup (docker logs failed)" 1
+fi
+
 # Phase 3: Client network setup — route virtual IP pool via gateway
 echo ""
 echo "Phase 3: Client network setup"
@@ -276,6 +301,43 @@ if echo "$NFT_RULES" | grep -q "dnat"; then
     check "nftables DNAT rules present" 0
 else
     check "nftables DNAT rules" 1
+fi
+
+# Phase 5's GET left a TCP conntrack entry to the first virtual IP, which
+# stays in the table in TIME_WAIT well past two ticks. The gateway must count
+# it. Poll about once a second for 25 tries, which spans two 10s ticks, and
+# read the count with a parser that cannot turn a failed query into a number:
+# an error response has no `data`, and the parser exits non-zero on it.
+if [ -n "$VIRTUAL_IP" ]; then
+    VIP_SESSIONS=error
+    for _ in $(seq 1 25); do
+        VIP_SESSIONS=$(docker exec "$GATEWAY" bash -c \
+            'echo "{\"command\":\"show_mappings\"}" | nc -U -w1 /run/fips/gateway.sock 2>/dev/null' \
+            | VIP="$VIRTUAL_IP" python3 -c "
+import os, sys, json
+r = json.load(sys.stdin)
+data = r.get('data')
+if not isinstance(data, dict) or not isinstance(data.get('mappings'), list):
+    sys.exit(1)
+hits = [m for m in data['mappings'] if m.get('virtual_ip') == os.environ['VIP']]
+if len(hits) != 1 or not isinstance(hits[0].get('sessions'), int):
+    sys.exit(1)
+print(hits[0]['sessions'])
+" 2>/dev/null || echo "error")
+        if [ "$VIP_SESSIONS" != error ] && [ "$VIP_SESSIONS" -ge 1 ]; then
+            break
+        fi
+        sleep 1
+    done
+    if [ "$VIP_SESSIONS" != error ] && [ "$VIP_SESSIONS" -ge 1 ]; then
+        check "Gateway counts a session to $VIRTUAL_IP (sessions $VIP_SESSIONS, source $EXPECT_SRC)" 0
+    else
+        check "Gateway counts a session to $VIRTUAL_IP (sessions $VIP_SESSIONS, source $EXPECT_SRC)" 1
+        echo "  Kernel conntrack entries to $VIRTUAL_IP:"
+        docker exec "$GATEWAY" conntrack -L -f ipv6 -d "$VIRTUAL_IP" 2>&1 | sed 's/^/    /' || true
+    fi
+else
+    check "Gateway counts a session (skipped — no virtual IP)" 1
 fi
 
 # Phase 7: Inbound port forwarding — UDP and a second simultaneous TCP forward.

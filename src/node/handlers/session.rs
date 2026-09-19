@@ -915,7 +915,7 @@ impl Node {
         // never reaches for an entry holding a pending session; and
         // `set_pending_session` clears `rekey_state`, so a completed
         // initiator cycle leaves at most one of the two set. If that ever
-        // stops holding, these four sites become instances of the epoch
+        // stops holding, these three sites become instances of the epoch
         // discard the responder arm was fixed for.
         if entry.is_established() && entry.has_rekey_in_progress() && entry.is_rekey_initiator() {
             let mut handshake = match entry.take_rekey_state() {
@@ -926,13 +926,27 @@ impl Node {
                 }
             };
 
-            // Process XX msg2
-            if let Err(e) = handshake.read_message_2(&ack.handshake_payload) {
-                debug!(error = %e, "Failed to process rekey XX msg2");
-                entry.abandon_rekey();
+            // Process XX msg2, for the same reason and in the same way as the
+            // primary arm below. Nothing here has been authenticated: the
+            // only tie to our rekey is the datagram's source address, which
+            // the sender chooses. Abandoning would let anyone able to name
+            // the session end the cycle, so the handshake goes back, rolled
+            // back to its pre-read state so it can still read the genuine
+            // ack, and the refusal is counted. The rollback matters because
+            // `read_message_2` mixes the sender's ephemeral in before it
+            // authenticates.
+            if let Err(e) = handshake.try_read_message_2(&ack.handshake_payload) {
+                debug!(error = %e, "Failed to process rekey XX msg2, keeping the rekey");
+                entry.set_rekey_state(handshake, true);
                 self.sessions.insert(*src_addr, entry);
+                self.stats_mut()
+                    .record_reject(RejectReason::Session(SessionReject::AckHandshakeFailed));
                 return;
             }
+
+            // The three abandons below stay abandons. Each is a local
+            // failure after msg2 has read (writing msg3, sending it, or
+            // completing the session), not a refusal of the ack.
 
             // Generate XX msg3
             let msg3 = match handshake.write_message_3() {
@@ -2489,11 +2503,22 @@ impl Node {
         let inner_plaintext =
             fsp_prepend_inner_header(timestamp, msg_type, inner_flags, &port_payload);
 
+        // With no coordinates cached for the destination, send without CP
+        // and leave the warmup budget unspent: our own coordinates in the
+        // destination's slot would be filed under its address by every
+        // receiver, and the budget is better spent on the first frames after
+        // discovery refills the cache.
+        let cached_dst = if wants_coords {
+            self.cached_dest_coords(dest_addr)
+        } else {
+            None
+        };
+        let warming = cached_dst.is_some();
+
         // Determine whether coords fit within transport MTU.
         // If not, send standalone CoordsWarmup before the data packet.
-        let (include_coords, my_coords, dest_coords) = if wants_coords {
+        let (include_coords, my_coords, dest_coords) = if let Some(dst) = cached_dst {
             let src = self.tree_state.my_coords().clone();
-            let dst = self.get_dest_coords(dest_addr);
             let coords_size = coords_wire_size(&src) + coords_wire_size(&dst);
             let total_wire =
                 FIPS_OVERHEAD as usize + FSP_PORT_HEADER_SIZE + coords_size + payload.len();
@@ -2512,7 +2537,7 @@ impl Node {
         };
 
         // Decrement warmup counter if we sent coords (piggybacked or standalone)
-        if wants_coords && let Some(entry) = self.sessions.get_mut(dest_addr) {
+        if warming && let Some(entry) = self.sessions.get_mut(dest_addr) {
             entry.set_coords_warmup_remaining(entry.coords_warmup_remaining() - 1);
         }
 
@@ -3005,8 +3030,16 @@ impl Node {
     ) -> Result<(), NodeError> {
         let now_ms = Self::now_ms();
 
+        // A warmup's only content is the two coordinates; with none cached
+        // for the destination, ours would stand in for its own.
+        let Some(dest_coords) = self.cached_dest_coords(dest_addr) else {
+            trace!(
+                dest = %self.peer_display_name(dest_addr),
+                "No cached coordinates for destination, skipping CoordsWarmup"
+            );
+            return Ok(());
+        };
         let my_coords = self.tree_state.my_coords().clone();
-        let dest_coords = self.get_dest_coords(dest_addr);
 
         // Read session metadata
         let entry = self
@@ -3133,6 +3166,19 @@ impl Node {
         Ok(())
     }
 
+    /// Look up destination coordinates in the coordinate cache, with no
+    /// fallback.
+    ///
+    /// Use this wherever the coordinates go on the wire as the destination's
+    /// own: a miss must not be filled with ours, which every receiver would
+    /// file under the destination's address.
+    pub(in crate::node) fn cached_dest_coords(
+        &self,
+        dest: &NodeAddr,
+    ) -> Option<crate::proto::stp::TreeCoordinate> {
+        self.coord_cache.get(dest, Self::now_ms()).cloned()
+    }
+
     /// Look up destination coordinates from available caches.
     ///
     /// Returns our own coordinates as a fallback (the SessionSetup will
@@ -3142,9 +3188,8 @@ impl Node {
         &self,
         dest: &NodeAddr,
     ) -> crate::proto::stp::TreeCoordinate {
-        let now_ms = Self::now_ms();
-        if let Some(coords) = self.coord_cache.get(dest, now_ms) {
-            return coords.clone();
+        if let Some(coords) = self.cached_dest_coords(dest) {
+            return coords;
         }
         // Fallback: use our own coordinates. The SessionSetup dest_coords
         // field cannot be empty (wire format requires ≥1 entry). Using our

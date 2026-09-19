@@ -109,7 +109,10 @@ pub struct MappingInfo {
     pub last_ref_secs: u64,
 }
 
-/// Path the conntrack table is read from.
+/// Path the conntrack table is read from when the kernel provides it.
+///
+/// A kernel built without `CONFIG_NF_CONNTRACK_PROCFS` has no such file;
+/// `SystemConntrack` then dumps the table over netlink instead.
 const CONNTRACK_PROC_PATH: &str = "/proc/net/nf_conntrack";
 
 /// Active conntrack sessions counted by destination address.
@@ -156,6 +159,132 @@ impl ConntrackQuerier for ProcConntrack {
     fn snapshot(&self) -> Result<ConntrackSnapshot, std::io::Error> {
         let content = std::fs::read_to_string(CONNTRACK_PROC_PATH)?;
         Ok(ConntrackSnapshot::from_counts(parse_conntrack(&content)))
+    }
+}
+
+/// Where a conntrack snapshot was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConntrackSource {
+    /// `/proc/net/nf_conntrack`.
+    Proc,
+    /// A conntrack table dump over `NETLINK_NETFILTER`.
+    Netlink,
+}
+
+impl ConntrackSource {
+    /// Short name of the source.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Proc => "proc",
+            Self::Netlink => "netlink",
+        }
+    }
+}
+
+/// Why no conntrack source could be read.
+#[derive(Debug)]
+pub struct ConntrackUnreadable {
+    /// The error reading `/proc/net/nf_conntrack`.
+    pub proc: std::io::Error,
+    /// The error from the netlink dump, when the proc file was absent and the
+    /// dump was tried.
+    pub netlink: Option<std::io::Error>,
+}
+
+impl ConntrackUnreadable {
+    /// The error that stands for the whole failed read.
+    ///
+    /// When the dump was tried, its error is the one that decided the read, so
+    /// it sets the kind; the absent proc file is kept in the message. Only a
+    /// proc error that stopped the read before the dump stands alone.
+    fn into_error(self) -> std::io::Error {
+        match self.netlink {
+            Some(netlink) => std::io::Error::new(
+                netlink.kind(),
+                format!("proc: {}; netlink: {netlink}", self.proc),
+            ),
+            None => self.proc,
+        }
+    }
+}
+
+/// The conntrack reader the gateway uses, which also says which source
+/// answered.
+///
+/// The per-tick read and the startup probe both go through this type, so the
+/// probe cannot report a source the tick would not use. The queriers are type
+/// parameters so tests can substitute fakes.
+///
+/// The proc file is read first. Only when it is absent is the table dumped
+/// over netlink, and that is decided on every read: the file appears once
+/// `nf_conntrack` is loaded in the namespace, so a choice fixed at startup
+/// could keep using netlink on a kernel that has the file.
+pub struct SystemConntrack<P = ProcConntrack, N = super::conntrack::NetlinkConntrack> {
+    proc: P,
+    netlink: N,
+}
+
+impl<P: ConntrackQuerier, N: ConntrackQuerier> SystemConntrack<P, N> {
+    /// A reader over the given proc and netlink queriers.
+    pub fn new(proc: P, netlink: N) -> Self {
+        Self { proc, netlink }
+    }
+
+    /// Read conntrack once and say which source the snapshot came from.
+    ///
+    /// A proc error other than an absent file, such as a permission error, is
+    /// returned without trying netlink.
+    pub fn read(&self) -> Result<(ConntrackSource, ConntrackSnapshot), ConntrackUnreadable> {
+        match self.proc.snapshot() {
+            Ok(snapshot) => Ok((ConntrackSource::Proc, snapshot)),
+            Err(proc) if proc.kind() == std::io::ErrorKind::NotFound => {
+                match self.netlink.snapshot() {
+                    Ok(snapshot) => Ok((ConntrackSource::Netlink, snapshot)),
+                    Err(netlink) => Err(ConntrackUnreadable {
+                        proc,
+                        netlink: Some(netlink),
+                    }),
+                }
+            }
+            Err(proc) => Err(ConntrackUnreadable {
+                proc,
+                netlink: None,
+            }),
+        }
+    }
+}
+
+impl Default for SystemConntrack {
+    fn default() -> Self {
+        Self::new(ProcConntrack, super::conntrack::NetlinkConntrack)
+    }
+}
+
+impl<P: ConntrackQuerier, N: ConntrackQuerier> ConntrackQuerier for SystemConntrack<P, N> {
+    fn snapshot(&self) -> Result<ConntrackSnapshot, std::io::Error> {
+        self.read()
+            .map(|(_, snapshot)| snapshot)
+            .map_err(ConntrackUnreadable::into_error)
+    }
+}
+
+/// Outcome of the startup check for a readable conntrack source.
+#[derive(Debug)]
+pub enum ConntrackProbe {
+    /// Sessions can be read, from this source.
+    Found(ConntrackSource),
+    /// No source can be read, so every mapping reads zero sessions and session
+    /// pinning is off.
+    Missing(ConntrackUnreadable),
+}
+
+/// Read conntrack once, as a tick would, and report which source answered.
+pub fn probe_conntrack<P: ConntrackQuerier, N: ConntrackQuerier>(
+    reader: &SystemConntrack<P, N>,
+) -> ConntrackProbe {
+    match reader.read() {
+        Ok((source, _)) => ConntrackProbe::Found(source),
+        Err(e) => ConntrackProbe::Missing(e),
     }
 }
 
@@ -207,12 +336,12 @@ pub enum ReadReport {
 
 /// Remembers the last conntrack read outcome.
 ///
-/// A kernel built without `CONFIG_NF_CONNTRACK_PROCFS` has no
-/// `/proc/net/nf_conntrack` at all, so every read fails the same way and a
-/// per-tick warning would repeat for the life of the process. Warning on a
-/// change of outcome still separates "the source is unreadable" from "there
-/// are no sessions", which the pool could not distinguish before, without
-/// filling the log.
+/// When no source is readable, for example a kernel with no
+/// `/proc/net/nf_conntrack` whose netlink dump is refused, every read fails
+/// the same way and a per-tick warning would repeat for the life of the
+/// process. Warning on a change of outcome still separates "the source is
+/// unreadable" from "there are no sessions", which the pool could not
+/// distinguish before, without filling the log.
 #[derive(Debug, Default)]
 pub struct ConntrackReadLog {
     last: Option<Option<std::io::ErrorKind>>,
@@ -1133,6 +1262,132 @@ mod tests {
             log.observe(Some(ErrorKind::PermissionDenied)),
             ReadReport::Changed,
             "a different failure is a different outcome and is worth a line"
+        );
+    }
+
+    /// A conntrack querier that succeeds with an empty snapshot, or fails with
+    /// a fixed error kind.
+    struct FixedRead(Option<std::io::ErrorKind>);
+
+    impl ConntrackQuerier for FixedRead {
+        fn snapshot(&self) -> Result<ConntrackSnapshot, std::io::Error> {
+            match self.0 {
+                None => Ok(ConntrackSnapshot::default()),
+                Some(kind) => Err(kind.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn conntrack_probe_names_the_proc_source_when_the_proc_read_succeeds() {
+        let reader = SystemConntrack::new(FixedRead(None), NOT_CALLED);
+
+        match probe_conntrack(&reader) {
+            ConntrackProbe::Found(source) => {
+                assert_eq!(source, ConntrackSource::Proc);
+                assert_eq!(source.name(), "proc");
+            }
+            ConntrackProbe::Missing(e) => panic!("expected the proc source, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn conntrack_probe_reports_missing_with_the_error_when_the_proc_read_fails() {
+        let reader = SystemConntrack::new(
+            FixedRead(Some(std::io::ErrorKind::PermissionDenied)),
+            NOT_CALLED,
+        );
+
+        match probe_conntrack(&reader) {
+            ConntrackProbe::Missing(e) => {
+                assert_eq!(e.proc.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            ConntrackProbe::Found(source) => panic!("expected no source, got {source:?}"),
+        }
+    }
+
+    /// A netlink stand-in for tests where the dump must not be reached. It
+    /// fails with a kind no test expects, so reaching it shows in the result.
+    const NOT_CALLED: FixedRead = FixedRead(Some(std::io::ErrorKind::Unsupported));
+
+    /// A conntrack querier that reports one session to a fixed address.
+    struct OneSession(Ipv6Addr);
+
+    impl ConntrackQuerier for OneSession {
+        fn snapshot(&self) -> Result<ConntrackSnapshot, std::io::Error> {
+            Ok(ConntrackSnapshot::from_counts(HashMap::from([(self.0, 1)])))
+        }
+    }
+
+    #[test]
+    fn system_conntrack_falls_back_to_netlink_when_the_proc_file_is_absent() {
+        let addr: Ipv6Addr = "fd01::1".parse().unwrap();
+        let reader = SystemConntrack::new(
+            FixedRead(Some(std::io::ErrorKind::NotFound)),
+            OneSession(addr),
+        );
+
+        let (source, snapshot) = reader.read().expect("the netlink dump answered");
+
+        assert_eq!(source, ConntrackSource::Netlink);
+        assert_eq!(source.name(), "netlink");
+        assert_eq!(snapshot.sessions_for(addr), 1);
+    }
+
+    #[test]
+    fn system_conntrack_does_not_fall_back_on_a_proc_error_other_than_not_found() {
+        let addr: Ipv6Addr = "fd01::1".parse().unwrap();
+        let reader = SystemConntrack::new(
+            FixedRead(Some(std::io::ErrorKind::PermissionDenied)),
+            OneSession(addr),
+        );
+
+        let e = reader
+            .read()
+            .expect_err("a denied proc read is not a missing file");
+
+        assert_eq!(e.proc.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(e.netlink.is_none(), "netlink was not tried");
+        assert_eq!(
+            reader.snapshot().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn system_conntrack_prefers_proc_when_it_reads() {
+        let proc_addr: Ipv6Addr = "fd01::1".parse().unwrap();
+        let netlink_addr: Ipv6Addr = "fd01::2".parse().unwrap();
+        let reader = SystemConntrack::new(OneSession(proc_addr), OneSession(netlink_addr));
+
+        let (source, snapshot) = reader.read().expect("the proc file answered");
+
+        assert_eq!(source, ConntrackSource::Proc);
+        assert_eq!(snapshot.sessions_for(proc_addr), 1);
+        assert_eq!(snapshot.sessions_for(netlink_addr), 0);
+    }
+
+    #[test]
+    fn conntrack_probe_reports_both_errors_when_neither_source_reads() {
+        let reader = SystemConntrack::new(
+            FixedRead(Some(std::io::ErrorKind::NotFound)),
+            FixedRead(Some(std::io::ErrorKind::PermissionDenied)),
+        );
+
+        match probe_conntrack(&reader) {
+            ConntrackProbe::Missing(e) => {
+                assert_eq!(e.proc.kind(), std::io::ErrorKind::NotFound);
+                assert_eq!(
+                    e.netlink.as_ref().map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::PermissionDenied)
+                );
+            }
+            ConntrackProbe::Found(source) => panic!("expected no source, got {source:?}"),
+        }
+        // The per-tick read reports the error that decided it: the dump's.
+        assert_eq!(
+            reader.snapshot().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
         );
     }
 }

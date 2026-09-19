@@ -263,8 +263,13 @@ Timing:
   cached DNS responses.
 - **Tick interval**: the pool re-evaluates state every 10 s.
 
-Active session counts come from `/proc/net/nf_conntrack`: an entry
-counts as a session if its original destination is the virtual IP.
+Active session counts come from `/proc/net/nf_conntrack`, or, on a
+kernel without that file, from a dump of the IPv6 conntrack table over
+`NETLINK_NETFILTER`, the request `conntrack -L` makes. The choice is
+made on every tick, and the source is logged once at startup. Either
+way an entry counts once toward each distinct IPv6 destination among
+its original and reply tuples, so an entry counts as a session of a
+virtual IP whose address is its original destination.
 
 If the pool is exhausted, new DNS queries return `SERVFAIL`.
 Existing mappings are never evicted prematurely — the correctness of

@@ -101,11 +101,21 @@ if [ -n "$FEATURES" ]; then
     # from the default build of the same commit. It refuses --features with
     # --no-build for that reason, so the two cases cannot share one command.
     # The version still comes from the host, because the image has no git.
-    BUILD_CMD="packaging/debian/build-deb.sh --features '$FEATURES' --version '$VERSION' --output-dir /out"
+    BUILD_CMD="packaging/debian/build-deb.sh --features '$FEATURES' --version '$VERSION' --output-dir /out --name-file /name/deb"
 else
     BUILD_CMD="cargo build --release --locked
-        packaging/debian/build-deb.sh --no-build --version '$VERSION' --output-dir /out"
+        packaging/debian/build-deb.sh --no-build --version '$VERSION' --output-dir /out --name-file /name/deb"
 fi
+
+# The build names the package it produced rather than this script picking one
+# out of the output directory. The output directory is the caller's and may
+# already hold packages from earlier runs; a search there by name or by age
+# could return one of those, and a package that sorts higher by name was
+# returned in preference to the one just built. The name travels through a
+# directory of its own, created fresh for this run, so a name left by an
+# earlier run cannot be read and nothing extra is left in the output directory.
+NAME_DIR=$(mktemp -d)
+trap 'rm -rf "$NAME_DIR"' EXIT
 
 # The source is mounted read-only so a build cannot leave artifacts in the tree.
 # CARGO_TARGET_DIR and the registry live in named volumes, which is what makes a
@@ -115,6 +125,7 @@ VOL_SUFFIX="${FIPS_BUILD_IMAGE//[:\/]/-}"
 docker run --rm \
     -v "$REPO_ROOT":/src:ro \
     -v "$DEST_ABS":/out \
+    -v "$NAME_DIR":/name \
     -v "fips-deb-target-${VOL_SUFFIX}":/target \
     -v "fips-deb-registry-${VOL_SUFFIX}":/usr/local/cargo/registry \
     -e CARGO_TARGET_DIR=/target \
@@ -123,8 +134,21 @@ docker run --rm \
     "$IMAGE_TAG" \
     bash -euo pipefail -c "$BUILD_CMD" >&2
 
-DEB=$(find "$DEST_ABS" -maxdepth 1 -name "fips_*_*.deb" -newermt '-10 minutes' -print | sort | tail -1)
-[ -n "$DEB" ] || { echo "build-deb-container: no .deb was produced." >&2; exit 1; }
+DEB_NAME=""
+[ -f "$NAME_DIR/deb" ] && DEB_NAME=$(head -n 1 "$NAME_DIR/deb")
+[ -n "$DEB_NAME" ] || {
+    echo "build-deb-container: the build did not name its package" >&2
+    exit 1
+}
+if [[ "$DEB_NAME" == */* || "$DEB_NAME" != fips_*_*.deb ]]; then
+    echo "build-deb-container: the build named '$DEB_NAME', which is not a package file name" >&2
+    exit 1
+fi
+DEB="$DEST_ABS/$DEB_NAME"
+[ -f "$DEB" ] || {
+    echo "build-deb-container: the build named $DEB_NAME but $DEB does not exist" >&2
+    exit 1
+}
 
 # Check the artifact here rather than in one workflow, so every producer is
 # gated: the release, the CI job, a local run and packaging/Makefile all reach

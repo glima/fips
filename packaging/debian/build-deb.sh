@@ -2,7 +2,8 @@
 # Build a .deb package for FIPS using cargo-deb.
 #
 # Usage: ./build-deb.sh [--target <triple>] [--version <version>] [--no-build]
-#                       [--features <list>]
+#                       [--features <list>] [--output-dir <dir>]
+#                       [--name-file <path>]
 #
 # Prerequisites: cargo-deb (install with: cargo install cargo-deb)
 # Output: deploy/fips_<version>_<arch>.deb
@@ -26,6 +27,10 @@ Options:
   --output-dir <dir>  Where to put the finished .deb. Defaults to deploy/ under
                       the project root. Exists so the container build can write
                       to a mount and leave the source tree read-only.
+  --name-file <path>  Also write the finished package's file name (basename
+                      only) to <path>. The container build reads it so it
+                      never has to guess which .deb in the output directory
+                      this run produced.
   -h, --help          Show this help
 EOF
 }
@@ -35,6 +40,7 @@ VERSION_OVERRIDE=""
 NO_BUILD=0
 FEATURES=""
 DEST_DIR=""
+NAME_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -56,6 +62,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --output-dir)
             DEST_DIR="${2:?missing value for --output-dir}"
+            shift 2
+            ;;
+        --name-file)
+            NAME_FILE="${2:?missing value for --name-file}"
             shift 2
             ;;
         -h|--help)
@@ -182,6 +192,9 @@ fi
 
 cp "${DEB_FILE}" "${DEST_DIR}/"
 BASENAME=$(basename "${DEB_FILE}")
+if [[ -n "${NAME_FILE}" ]]; then
+    printf '%s\n' "${BASENAME}" > "${NAME_FILE}"
+fi
 echo "Package built: ${DEST_DIR}/${BASENAME}"
 echo ""
 echo "Install with: sudo dpkg -i ${DEST_DIR}/${BASENAME}"

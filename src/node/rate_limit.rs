@@ -93,11 +93,19 @@ impl TokenBucket {
     /// * `capacity` - Maximum number of tokens (burst capacity)
     /// * `refill_rate` - Tokens added per second
     pub fn with_params(capacity: u32, refill_rate: f64) -> Self {
+        Self::with_params_at(capacity, refill_rate, Instant::now())
+    }
+
+    /// Create a token bucket with custom parameters, full as of `now`.
+    ///
+    /// For a caller that keeps its own clock and passes the same clock's
+    /// readings to [`Self::try_acquire_at`].
+    pub fn with_params_at(capacity: u32, refill_rate: f64, now: Instant) -> Self {
         Self {
             capacity,
             tokens: capacity as f64,
             refill_rate,
-            last_refill: Instant::now(),
+            last_refill: now,
         }
     }
 
@@ -114,7 +122,20 @@ impl TokenBucket {
     /// Returns `true` if n tokens were available and consumed, `false` if
     /// rate limited (insufficient tokens).
     pub fn try_acquire_n(&mut self, n: u32) -> bool {
-        self.refill();
+        self.try_acquire_n_at(n, Instant::now())
+    }
+
+    /// Try to consume one token, refilling as of `now`.
+    ///
+    /// `now` must come from the same clock as every earlier reading this
+    /// bucket was given.
+    pub fn try_acquire_at(&mut self, now: Instant) -> bool {
+        self.try_acquire_n_at(1, now)
+    }
+
+    /// Try to consume n tokens, refilling as of `now`.
+    fn try_acquire_n_at(&mut self, n: u32, now: Instant) -> bool {
+        self.refill_at(now);
 
         if self.tokens >= n as f64 {
             self.tokens -= n as f64;
@@ -127,14 +148,14 @@ impl TokenBucket {
     /// Check if tokens are available without consuming them.
     #[cfg(test)]
     pub fn available(&mut self) -> bool {
-        self.refill();
+        self.refill_at(Instant::now());
         self.tokens >= 1.0
     }
 
     /// Get the current number of available tokens.
     #[cfg(test)]
     pub fn tokens(&mut self) -> f64 {
-        self.refill();
+        self.refill_at(Instant::now());
         self.tokens
     }
 
@@ -144,9 +165,8 @@ impl TokenBucket {
         self.capacity
     }
 
-    /// Refill tokens based on elapsed time.
-    fn refill(&mut self) {
-        let now = Instant::now();
+    /// Refill tokens based on the time elapsed up to `now`.
+    fn refill_at(&mut self, now: Instant) {
         let elapsed = now.duration_since(self.last_refill);
         let elapsed_secs = elapsed.as_secs_f64();
 
@@ -174,7 +194,7 @@ impl TokenBucket {
     /// estimated time until one token will be available.
     #[cfg(test)]
     pub fn time_until_available(&mut self) -> std::time::Duration {
-        self.refill();
+        self.refill_at(Instant::now());
 
         if self.tokens >= 1.0 {
             std::time::Duration::ZERO
@@ -458,6 +478,8 @@ pub struct SessionSetupRateLimiter {
     stranger: (u32, f64),
     /// Burst and refill rate for a new link's established bucket.
     established: (u32, f64),
+    /// Where the limiter reads the time. `Instant::now` outside tests.
+    clock: fn() -> Instant,
 }
 
 impl SessionSetupRateLimiter {
@@ -469,6 +491,7 @@ impl SessionSetupRateLimiter {
             buckets: HashMap::new(),
             stranger,
             established,
+            clock: Instant::now,
         }
     }
 
@@ -477,22 +500,22 @@ impl SessionSetupRateLimiter {
     /// Returns `false` when the class's bucket for that link is empty, in
     /// which case the caller must drop the message before doing any work.
     pub fn try_admit(&mut self, link_peer: &NodeAddr, class: Msg1Class) -> bool {
-        let now = Instant::now();
+        let now = (self.clock)();
         let stranger = self.stranger;
         let established = self.established;
         let link = self
             .buckets
             .entry(*link_peer)
             .or_insert_with(|| LinkBuckets {
-                stranger: TokenBucket::with_params(stranger.0, stranger.1),
-                established: TokenBucket::with_params(established.0, established.1),
+                stranger: TokenBucket::with_params_at(stranger.0, stranger.1, now),
+                established: TokenBucket::with_params_at(established.0, established.1, now),
                 seen: now,
             });
         link.seen = now;
 
         let admitted = match class {
-            Msg1Class::Stranger => link.stranger.try_acquire(),
-            Msg1Class::EstablishedLink => link.established.try_acquire(),
+            Msg1Class::Stranger => link.stranger.try_acquire_at(now),
+            Msg1Class::EstablishedLink => link.established.try_acquire_at(now),
         };
 
         if admitted {
@@ -500,6 +523,13 @@ impl SessionSetupRateLimiter {
                 .retain(|_, link| now.duration_since(link.seen) < SETUP_BUCKET_IDLE);
         }
         admitted
+    }
+
+    /// Read the time from `clock` instead of `Instant::now`, so a test can
+    /// drive the refill.
+    #[cfg(test)]
+    pub fn set_clock(&mut self, clock: fn() -> Instant) {
+        self.clock = clock;
     }
 
     /// Number of link peers currently holding buckets.
