@@ -117,6 +117,14 @@
 # A preempting CI worker maps 130/143 → "cancelled" (discard, do not record a
 # failing commit), 0 → green, any other non-zero → red.
 #
+# Host load annotation: every failed suite in the summary is followed by the
+# CPU pressure stall (/proc/pressure/cpu) over that suite's run and the peak
+# number of other CI runs' containers, labelled LOAD-DEGRADED at or above
+# CI_LOAD_THRESHOLD percent (testing/lib/load-annotate.py). It is context for
+# reading a red and changes no verdict or exit code. The samples go to
+# $FIPS_CI_LOAD_LOG if set (kept after the run), else to a per-run file that
+# teardown removes.
+#
 # ── CI parity invariant ─────────────────────────────────────────────────────
 # This local default suite set and the GitHub integration matrix
 # (.github/workflows/ci.yml) MUST run the same integration suites, EXCEPT for
@@ -331,6 +339,9 @@ OVERALL=0
 record() {
     local name="$1" rc="$2"
     RESULTS["$name"]=$rc
+    # A chaos suite's window is written by run_chaos, which runs once per
+    # scenario; record() runs twice for a parallel one (child and parent).
+    [[ "$name" == chaos-* ]] || load_mark end "$name"
     if [[ $rc -ne 0 ]]; then
         OVERALL=1
         fail "$name"
@@ -409,6 +420,38 @@ readonly CI_RUN_NAME_SUFFIX
 # while adding the cross-run prefix that scopes the reap.
 ci_project() { printf '%s_%s' "$CI_PROJECT_PREFIX" "$1"; }
 
+# ── Host load samples ─────────────────────────────────────────────────────
+#
+# Stall percent at or above which a failed suite is labelled LOAD-DEGRADED.
+# Measured 2026-09-19 on core-vm (12 CPUs): green chaos sets with no foreign
+# load ran at 4-11% CPU stall, and the one reproduced load-sensitive red
+# (churn-mixed-10 answering 9 of 10) ran at 63%, under 24 CPU hogs plus I/O.
+CI_LOAD_THRESHOLD=15
+if [[ -n "${FIPS_CI_LOAD_LOG:-}" ]]; then
+    CI_LOAD_LOG="$FIPS_CI_LOAD_LOG"
+    CI_LOAD_LOG_OWNED=0
+else
+    CI_LOAD_LOG="${TMPDIR:-/tmp}/fips-ci-load-${CI_RUN_ID}.log"
+    CI_LOAD_LOG_OWNED=1
+fi
+CI_LOAD_PID=""
+
+# Append one window line (begin/end <suite>, or barrier) to the load log.
+load_mark() { echo "$(date +%s.%N) $*" >> "$CI_LOAD_LOG" 2>/dev/null || true; }
+
+# Sample CPU pressure and foreign CI runs every 5 s until killed.
+load_sampler() {
+    local psi runs
+    load_mark barrier
+    while true; do
+        psi="$(awk '/^some/ { for (i = 1; i <= NF; i++) if ($i ~ /^total=/) { sub("total=", "", $i); print $i } }' /proc/pressure/cpu 2>/dev/null)"
+        runs="$(docker ps --filter "label=$CI_LABEL" --format '{{.Label "com.corganlabs.fips-ci.run"}}' 2>/dev/null \
+            | sort -u | grep -cvx -e "$CI_RUN_ID" -e '')"
+        echo "$(date +%s.%N) psi ${psi:-none} runs ${runs:-0} load1 $(cut -d' ' -f1 /proc/loadavg)" >> "$CI_LOAD_LOG"
+        sleep 5
+    done
+}
+
 # The name suffix one chaos scenario runs under. Its container names, its
 # generated-config directory and the token in its host veth names all derive
 # from this, so teardown recomputes it to know which interfaces are ours. Reads
@@ -427,6 +470,13 @@ ci_teardown() {
     [[ $CI_CLEANED -eq 1 ]] && return 0
     CI_CLEANED=1
     local run_status="${1:-1}"
+
+    # 0. The load sampler first, so it stops writing before its log goes.
+    if [[ -n "$CI_LOAD_PID" ]]; then
+        kill "$CI_LOAD_PID" 2>/dev/null || true
+        wait "$CI_LOAD_PID" 2>/dev/null || true
+    fi
+    [[ "$CI_LOAD_LOG_OWNED" -eq 1 ]] && rm -f "$CI_LOAD_LOG"
 
     # 1. Propagate to parallel chaos children and reap them (bounded).
     if [[ ${#CI_CHAOS_PIDS[@]} -gt 0 ]]; then
@@ -763,6 +813,7 @@ run_chaos() {
     local results="$SCRIPT_DIR/chaos/sim-results/ci$suffix"
     local -x FIPS_SIM_OUTPUT="$results"
 
+    load_mark begin "chaos-$name"
     info "[chaos/$name] Running simulation"
     if bash testing/chaos/scripts/chaos.sh "$@" 2>&1; then
         rc=0
@@ -771,6 +822,7 @@ run_chaos() {
         chaos_dump "$name" "$results"
     fi
 
+    load_mark end "chaos-$name"
     record "chaos-$name" $rc
 
     # record() ends in pass()/fail(), which are echoes, so it returns 0 for any
@@ -1490,6 +1542,9 @@ run_integration() {
         # All chaos children have been waited on; clear so a later signal does
         # not try to kill already-reaped PIDs.
         CI_CHAOS_PIDS=()
+        # The next sequential suite's window starts here, not at the last
+        # suite before the chaos block.
+        load_mark barrier
     fi
 
     # Sidecar
@@ -1587,10 +1642,13 @@ print_summary() {
         else
             failed=$((failed + 1))
             echo -e "  ${RED}✗${RESET} $name"
+            python3 "$SCRIPT_DIR/lib/load-annotate.py" "$CI_LOAD_LOG" \
+                --threshold "$CI_LOAD_THRESHOLD" "$name" 2>&1 | sed 's/^/      /'
         fi
     done
 
     echo ""
+    python3 "$SCRIPT_DIR/lib/load-annotate.py" "$CI_LOAD_LOG" --run 2>&1 | sed 's/^/  /'
     echo -e "  ${BOLD}Total: $total  Passed: $passed  Failed: $failed${RESET}"
     echo ""
 
@@ -1704,6 +1762,9 @@ main() {
 
     stage "FIPS Local CI"
     info "Project root: $PROJECT_ROOT"
+
+    load_sampler &
+    CI_LOAD_PID=$!
 
     # Above the mode branches deliberately, so --only, --test-only and
     # --build-only are gated too: a divergence invalidates any claim that a

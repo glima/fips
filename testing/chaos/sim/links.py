@@ -4,6 +4,11 @@ Simulates link failures by setting netem to 100% packet loss on the
 specific tc class for that peer. Requires the NetemManager to have
 already set up per-link classful qdiscs. Includes connectivity
 protection to prevent graph partitioning.
+
+The flap is recorded in the NetemManager's per-direction state
+(``held_down``) rather than here, so every path that re-installs a
+qdisc (a node restart's re-apply, a mutation) keeps the link down for
+the flap's declared length.
 """
 
 from __future__ import annotations
@@ -28,9 +33,6 @@ class LinkState:
     is_down: bool = False
     down_since: float | None = None
     restore_at: float | None = None
-    # Saved netem params to restore when link comes back up
-    saved_params_a: str | None = None  # tc args for a->b direction
-    saved_params_b: str | None = None  # tc args for b->a direction
 
 
 class LinkManager:
@@ -106,9 +108,8 @@ class LinkManager:
         a, b = edge
         state = self.link_states[edge]
 
-        # Save current netem params and apply 100% loss
-        state.saved_params_a = self._set_loss(a, b, "loss 100%")
-        state.saved_params_b = self._set_loss(b, a, "loss 100%")
+        self._set_held(a, b, True)
+        self._set_held(b, a, True)
 
         now = time.time()
         state.is_down = True
@@ -118,41 +119,64 @@ class LinkManager:
         log.info("Link DOWN: %s -- %s (restore in %.0fs)", a, b, duration)
 
     def _link_up(self, edge: tuple[str, str]):
-        """Restore link by reverting netem to saved params."""
+        """Restore link by re-installing each direction's current netem params.
+
+        The current params include any mutation recorded during the flap.
+        """
         a, b = edge
         state = self.link_states[edge]
 
-        # Restore previous netem params
-        if state.saved_params_a:
-            self._set_loss(a, b, state.saved_params_a)
-        if state.saved_params_b:
-            self._set_loss(b, a, state.saved_params_b)
+        self._set_held(a, b, False)
+        self._set_held(b, a, False)
 
         down_for = time.time() - state.down_since if state.down_since else 0
         state.is_down = False
         state.down_since = None
         state.restore_at = None
-        state.saved_params_a = None
-        state.saved_params_b = None
 
         log.info("Link UP: %s -- %s (was down %.0fs)", a, b, down_for)
 
-    def _set_loss(self, src_node: str, dst_node: str, netem_args: str) -> str | None:
-        """Set netem args on the link for src->dst. Returns the previous netem args.
+    def _set_held(self, src_node: str, dst_node: str, held: bool):
+        """Mark the src->dst direction held down (or not) and install it.
+
+        The flag is set whether or not the container is running, so a node
+        that restarts during or after the flap re-installs the right params.
+        Whether to issue tc now is decided by the live running check alone:
+        the NetemManager's down_nodes set is not a reliable liveness signal
+        (its only writers are the safety nets here and in _update_link, and
+        nothing clears it when a node restarts).
 
         Transport-aware: UDP links use tc class on eth0, Ethernet links
         use tc qdisc replace on the dedicated veth interface.
         """
         if not self.netem_mgr:
-            return None
-
-        # Skip if the node's container is down
-        if src_node in self.netem_mgr.down_nodes:
-            return None
+            return
 
         container = self.topology.container_name(src_node)
+        transport = self.topology.transport_for_edge(src_node, dst_node)
 
-        # Safety net: detect containers that crashed outside of NodeManager
+        if transport == "ethernet":
+            iface = veth_interface_name(src_node, dst_node)
+            state = self.netem_mgr.veth_states.get(container, {}).get(iface)
+            if state is None:
+                log.warning("No veth netem state for %s -> %s (%s)", src_node, dst_node, iface)
+                return
+            cmd = f"tc qdisc replace dev {iface} root netem "
+        else:
+            dest_ip = self.topology.nodes[dst_node].docker_ip
+            state = self.netem_mgr.states.get(container, {}).get(dest_ip)
+            if state is None:
+                log.warning("No netem state for %s -> %s", src_node, dst_node)
+                return
+            cmd = (
+                f"tc qdisc replace dev {IFACE} parent {state.class_id} "
+                f"handle {state.netem_handle} netem "
+            )
+
+        state.held_down = held
+
+        # Safety net: detect containers that crashed outside of NodeManager.
+        # The restart's setup_node installs state.tc_args() instead.
         if not is_container_running(container):
             log.debug(
                 "Container %s not running (unexpected), marking %s as down",
@@ -160,40 +184,9 @@ class LinkManager:
                 src_node,
             )
             self.netem_mgr.down_nodes.add(src_node)
-            return None
+            return
 
-        transport = self.topology.transport_for_edge(src_node, dst_node)
-
-        if transport == "ethernet":
-            # Ethernet: simple netem on veth
-            iface = veth_interface_name(src_node, dst_node)
-            veth_states = self.netem_mgr.veth_states.get(container, {})
-            veth_state = veth_states.get(iface)
-            if veth_state is None:
-                log.warning("No veth netem state for %s -> %s (%s)", src_node, dst_node, iface)
-                return None
-
-            prev_args = veth_state.params.to_tc_args()
-            cmd = f"tc qdisc replace dev {iface} root netem {netem_args}"
-            docker_exec_quiet(container, cmd)
-            return prev_args
-        else:
-            # IP-based (UDP/TCP): HTB class on eth0
-            dest_ip = self.topology.nodes[dst_node].docker_ip
-
-            states = self.netem_mgr.states.get(container, {})
-            link_state = states.get(dest_ip)
-            if link_state is None:
-                log.warning("No netem state for %s -> %s", src_node, dst_node)
-                return None
-
-            prev_args = link_state.params.to_tc_args()
-            cmd = (
-                f"tc qdisc replace dev {IFACE} parent {link_state.class_id} "
-                f"handle {link_state.netem_handle} netem {netem_args}"
-            )
-            docker_exec_quiet(container, cmd)
-            return prev_args
+        docker_exec_quiet(container, cmd + state.tc_args())
 
     def _would_disconnect(self, edge: tuple[str, str]) -> bool:
         """Check if removing this edge (plus currently-down edges) disconnects the graph."""

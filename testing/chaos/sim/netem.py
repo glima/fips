@@ -75,6 +75,14 @@ class LinkNetemState:
     ingress_rate_kbps: int = 0  # 0 = no ingress policing
     ingress_burst_bytes: int = 32000
     ingress_filter_prio: int = 0  # u32 filter priority for this peer
+    # Set while a link flap holds this direction down. `params` keeps the
+    # link's normal impairment, so every path that re-installs the qdisc asks
+    # tc_args() and a restart or mutation cannot end a flap early.
+    held_down: bool = False
+
+    def tc_args(self) -> str:
+        """Return the netem arguments this direction should carry now."""
+        return "loss 100%" if self.held_down else self.params.to_tc_args()
 
 
 @dataclass
@@ -84,6 +92,12 @@ class VethNetemState:
     container: str
     iface: str  # e.g., "ve-n01-n02"
     params: NetemParams = field(default_factory=NetemParams)
+    # See LinkNetemState.held_down.
+    held_down: bool = False
+
+    def tc_args(self) -> str:
+        """Return the netem arguments this direction should carry now."""
+        return "loss 100%" if self.held_down else self.params.to_tc_args()
 
 
 class NetemManager:
@@ -334,7 +348,7 @@ class NetemManager:
                 )
                 cmds.append(
                     f"tc qdisc add dev {IFACE} parent {state.class_id} "
-                    f"handle {state.netem_handle} netem {state.params.to_tc_args()}"
+                    f"handle {state.netem_handle} netem {state.tc_args()}"
                 )
                 prio = state.class_id.split(":")[1]
                 cmds.append(
@@ -398,7 +412,7 @@ class NetemManager:
         """Install a veth end's current netem parameters as its root qdisc."""
         cmd = (
             f"tc qdisc del dev {state.iface} root 2>/dev/null || true && "
-            f"tc qdisc add dev {state.iface} root netem {state.params.to_tc_args()}"
+            f"tc qdisc add dev {state.iface} root netem {state.tc_args()}"
         )
         result = docker_exec_quiet(state.container, cmd, timeout=10)
         if result is not None:
@@ -441,7 +455,11 @@ class NetemManager:
             self._update_link(a, b, params)
 
     def _update_link(self, node_a: str, node_b: str, params: NetemParams):
-        """Update netem on both directions of a link."""
+        """Update netem on both directions of a link.
+
+        A direction held down by a link flap only records the new params;
+        LinkManager installs them when the flap ends.
+        """
         transport = self.topology.transport_for_edge(node_a, node_b)
 
         for src, dst in [(node_a, node_b), (node_b, node_a)]:
@@ -466,6 +484,10 @@ class NetemManager:
                 state = veth_states.get(iface)
                 if state is None:
                     continue
+                if state.held_down:
+                    state.params = params
+                    log.debug("Deferred veth netem %s:%s until the flap ends", src, iface)
+                    continue
                 cmd = f"tc qdisc replace dev {iface} root netem {params.to_tc_args()}"
                 result = docker_exec_quiet(container, cmd)
                 if result is not None:
@@ -477,6 +499,10 @@ class NetemManager:
                 states = self.states.get(container, {})
                 state = states.get(dest_ip)
                 if state is None:
+                    continue
+                if state.held_down:
+                    state.params = params
+                    log.debug("Deferred netem %s -> %s until the flap ends", src, dst)
                     continue
                 cmd = (
                     f"tc qdisc replace dev {IFACE} parent {state.class_id} "
