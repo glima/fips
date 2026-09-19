@@ -20,6 +20,8 @@ This directory contains Arch Linux packaging files for two AUR packages:
 | `fips-dns.service` | Symlink to `../debian/fips-dns.service` |
 | `build-aur.sh` | Local `fips-git` build plus namcap validation (run by `make aur`) |
 | `patch-pkgbuild.sh` | Rewrites `pkgver`, `pkgrel`, `conflicts`, `options`, and `b2sums` in the PKGBUILD at publish time |
+| `await-package-runs.sh` | Holds the AUR publish until every `package-*.yml` run for the release tag has succeeded |
+| `test-await-package-runs.sh` | Fixture tests for `await-package-runs.sh`, run by the `aur-build` job |
 
 Both PKGBUILDs reference files from `packaging/debian/` (service files) and
 `packaging/common/` (config files) at build time. These are pulled from the

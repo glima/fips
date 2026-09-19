@@ -53,6 +53,9 @@
 #                          by --topology; empty = streams off.
 #   STREAM_LOSS_MARGIN_PCT rekey-vs-control loss margin (default 5).
 #   CONTROL_STREAM_SECS    quiet control-window length (default 12).
+#   CONTROL_MAX_ATTEMPTS   control windows measured before Phase 5b
+#                          abstains because every one saw a rekey
+#                          cutover or could not be checked (default 3).
 #   MESH_SIZE_WARMUP       Phase 7 bloom warmup, from mesh start, before
 #                          any estimate counts (default 300).
 #   MESH_SIZE_SETTLE       Phase 7 unbroken in-band window a node must
@@ -190,6 +193,14 @@ LOG_POLL_INTERVAL=2
 # as on mixed ones.
 STREAM_RATE_HZ=20
 CONTROL_STREAM_SECS="${CONTROL_STREAM_SECS:-12}" # quiet pre-rekey window
+# A control window that saw a rekey cutover, or whose cutover count could
+# not be read, is no baseline. Phase 1b re-measures it, after waiting for
+# the cutover count to hold still for CONTROL_QUIET_SECS (at most
+# CONTROL_QUIET_MAX) so the retry does not land in the same cluster of
+# cutovers, and Phase 5b abstains when no attempt comes out clean.
+CONTROL_MAX_ATTEMPTS="${CONTROL_MAX_ATTEMPTS:-3}"
+CONTROL_QUIET_SECS=5
+CONTROL_QUIET_MAX=30
 # 5% is 12 packets of the 240-packet control window and ~155 of the
 # ~3100-packet rekey window. On a path losing up to 6% (the range the
 # v0.4.2 netem runs baselined at, under `loss 2%` over several hops) the
@@ -526,6 +537,37 @@ count_log_pattern() {
     return 0
 }
 
+# Count completed FMP initiator rekey cutovers across all node logs.
+#
+# The pattern is a literal argument so the log-string guard can check it
+# against the daemon source. Prints the count, or `unreadable:<ctr>` with
+# status 1 when a node's logs cannot be read.
+fmp_cutover_count() {
+    count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped'
+    return $?
+}
+
+# Wait until the FMP cutover count has held unchanged for
+# CONTROL_QUIET_SECS, giving up after CONTROL_QUIET_MAX. An unreadable
+# count is treated as a change, so it never counts as quiet.
+wait_cutover_quiet() {
+    local start=$SECONDS still=$SECONDS last cur
+    last="$(fmp_cutover_count)" || last="unreadable"
+    while (( SECONDS - still < CONTROL_QUIET_SECS )); do
+        if (( SECONDS - start >= CONTROL_QUIET_MAX )); then
+            echo "    cutover count still moving after ${CONTROL_QUIET_MAX}s; measuring anyway"
+            return 1
+        fi
+        sleep 1
+        cur="$(fmp_cutover_count)" || cur="unreadable"
+        if [ "$cur" != "$last" ] || [ "$cur" = "unreadable" ]; then
+            last="$cur"
+            still=$SECONDS
+        fi
+    done
+    return 0
+}
+
 # Per-node count of a pattern.
 count_node_pattern() {
     local node="$1" pattern="$2"
@@ -765,25 +807,52 @@ echo ""
 # ── Phase 1b: data-plane control window (quiet, pre-rekey) ───────────
 #
 # Measure stream loss over a window with NO rekey cutover, as the control
-# baseline for the differential. Validated cutover-free by confirming the
-# FMP cutover count did not advance during the window. Then launch the
+# baseline for the differential. A window counts only when the FMP cutover
+# count was read before and after it and did not advance. A window that
+# saw a cutover, or could not be checked, is re-measured up to
+# CONTROL_MAX_ATTEMPTS times; if none is clean, Phase 5b abstains rather
+# than computing a verdict from a contaminated baseline. Then launch the
 # rekey-window streams, which run in the background across Phases 2-5 and
 # are collected/asserted in Phase 5b.
-control_contaminated=0
+control_abstain=0
 if [ "${#STREAM_PAIRS[@]}" -gt 0 ]; then
-    echo "Phase 1b: Data-plane control stream (${CONTROL_STREAM_SECS}s quiet window)"
-    pre_cut="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped')"
-    launch_streams CONTROL "$CONTROL_STREAM_SECS"
-    collect_streams
-    post_cut="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped')"
-    if [ "$post_cut" -ne "$pre_cut" ]; then
-        control_contaminated=1
-        echo "  WARN  a rekey cutover occurred during the control window — control loss may be contaminated"
+    echo "Phase 1b: Data-plane control stream (${CONTROL_STREAM_SECS}s quiet window, up to ${CONTROL_MAX_ATTEMPTS} attempts)"
+    control_ok=0
+    for ((attempt = 1; attempt <= CONTROL_MAX_ATTEMPTS; attempt++)); do
+        pre_rc=0
+        post_rc=0
+        pre_cut="$(fmp_cutover_count)" || pre_rc=$?
+        launch_streams CONTROL "$CONTROL_STREAM_SECS"
+        collect_streams
+        post_cut="$(fmp_cutover_count)" || post_rc=$?
+        if [ "$pre_rc" -ne 0 ] || ! [[ "$pre_cut" =~ ^[0-9]+$ ]]; then
+            why="cutover count unreadable ($pre_cut)"
+        elif [ "$post_rc" -ne 0 ] || ! [[ "$post_cut" =~ ^[0-9]+$ ]]; then
+            why="cutover count unreadable ($post_cut)"
+        elif [ "$post_cut" -ne "$pre_cut" ]; then
+            why="a rekey cutover occurred (+$((post_cut - pre_cut)))"
+        else
+            control_ok=1
+            echo "  control window accepted on attempt $attempt/$CONTROL_MAX_ATTEMPTS"
+            break
+        fi
+        if [ "$attempt" -lt "$CONTROL_MAX_ATTEMPTS" ]; then
+            echo "  control window attempt $attempt/$CONTROL_MAX_ATTEMPTS: $why; re-measuring"
+            wait_cutover_quiet || true
+        else
+            echo "  control window attempt $attempt/$CONTROL_MAX_ATTEMPTS: $why"
+        fi
+    done
+    if [ "$control_ok" -eq 0 ]; then
+        control_abstain=1
+        echo "  ABSTAIN  control window contaminated on all $CONTROL_MAX_ATTEMPTS attempts; Phase 5b will not return a verdict"
     fi
+    ctl_note=""
+    [ "$control_abstain" -eq 1 ] && ctl_note=" (last attempt, contaminated)"
     for sp in "${STREAM_PAIRS[@]}"; do
         read -r sf st <<< "$sp"
         key="$sf->$st"
-        echo "    control $key: tx=${STREAM_TX[CONTROL:$key]:-0} rx=${STREAM_RX[CONTROL:$key]:-0} loss=$(_loss_pct "${STREAM_TX[CONTROL:$key]:-0}" "${STREAM_RX[CONTROL:$key]:-0}")%"
+        echo "    control $key: tx=${STREAM_TX[CONTROL:$key]:-0} rx=${STREAM_RX[CONTROL:$key]:-0} loss=$(_loss_pct "${STREAM_TX[CONTROL:$key]:-0}" "${STREAM_RX[CONTROL:$key]:-0}")%$ctl_note"
     done
     echo "  Launching rekey-window streams (${REKEY_STREAM_SECS}s, spanning Phases 2-5)"
     launch_streams REKEY "$REKEY_STREAM_SECS"
@@ -863,6 +932,12 @@ if [ "${#STREAM_PAIRS[@]}" -gt 0 ]; then
             if (k <= c + m) print "PASS"; else print "FAIL"
         }')"
         delta="$(awk -v c="$cpct" -v k="$rpct" 'BEGIN{ if(c=="NA"||k=="NA") print "NA"; else printf "%+.1f", k-c }')"
+        # No clean control window: report the losses for reading, but
+        # compute no verdict from a contaminated baseline.
+        if [ "$control_abstain" -eq 1 ]; then
+            printf '    %-16s %11s %11s %8s  %s\n' "$key" "$cpct" "$rpct" "$delta" "ABSTAIN"
+            continue
+        fi
         printf '    %-16s %11s %11s %8s  %s\n' "$key" "$cpct" "$rpct" "$delta" "$verdict"
         if [ "$verdict" = "PASS" ]; then
             PASSED=$((PASSED + 1))
@@ -871,8 +946,11 @@ if [ "${#STREAM_PAIRS[@]}" -gt 0 ]; then
             INTEROP_FAILURES+=("[stream] $key ($(hop_label "$sf" "$st")): rekey-window loss ${rpct}% vs control ${cpct}% (+${STREAM_LOSS_MARGIN_PCT}% margin) -> $verdict")
         fi
     done
-    [ "${control_contaminated:-0}" -eq 1 ] && echo "    NOTE: control window saw a cutover; differential may understate rekey loss."
-    phase_result "Data-plane continuity across rekey"
+    if [ "$control_abstain" -eq 1 ]; then
+        echo "  ABSTAIN  Data-plane continuity across rekey: no uncontaminated control window in $CONTROL_MAX_ATTEMPTS attempts"
+    else
+        phase_result "Data-plane continuity across rekey"
+    fi
     echo ""
 fi
 
@@ -1077,6 +1155,13 @@ echo "=============================================================="
 
 # `${#arr[@]}` cannot be combined with `:-`; count into a plain var.
 INTEROP_FAILURE_COUNT="${#INTEROP_FAILURES[@]}"
+
+# An abstaining Phase 5b adds no check, so say so: otherwise a green run
+# reads as having covered data-plane continuity across rekey.
+if [ "${control_abstain:-0}" -eq 1 ]; then
+    echo ""
+    echo "NOTE: Phase 5b abstained (control window contaminated); its rekey-loss check did not run."
+fi
 
 if [ "$TOTAL_FAILED" -eq 0 ] && [ "$INTEROP_FAILURE_COUNT" -eq 0 ]; then
     echo ""

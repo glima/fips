@@ -39,9 +39,15 @@ jobs:
       - name: Install build and lint tooling
         run: |
           set -euo pipefail
-          pacman -Sy --noconfirm --needed base-devel namcap git curl
+          pacman -Sy --noconfirm --needed base-devel namcap git curl jq
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Test the publish gate
+        # Fixture tests for the script the publish job below waits with. They
+        # run here, on every trigger, so a change to the gate is exercised
+        # before a release tag depends on it.
+        run: bash packaging/aur/test-await-package-runs.sh
 
       - name: Resolve package version
         id: ver
@@ -136,11 +142,21 @@ jobs:
   # or a manual dispatch (packaging-only republish with explicit tag + pkgrel).
   # Branch pushes and pull requests build+lint above but never reach this job.
   # Gated on aur-build so a package that fails to build/lint is never published.
+  # It also waits for every package-*.yml run on the tag to succeed before it
+  # pushes: the AUR must not point at a tag whose release assets are still
+  # uploading or failed, and once it does, withdrawing the tag breaks the AUR
+  # package (its b2sum pins the tag's source archive).
   # ───────────────────────────────────────────────────────────────────────────
   aur-publish-fips:
     name: Publish fips to AUR
     needs: aur-build
     runs-on: ubuntu-latest
+    # Above the gate's own 60-minute budget, so the gate reports a timeout
+    # rather than the runner killing it.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
     if: >-
       github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push'
@@ -179,6 +195,26 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ steps.tag.outputs.tag }}
+
+      # The gate script comes from this workflow's own revision, not the tag:
+      # a dispatch republishing a tag cut before the gate existed would not
+      # find it in the tag's tree. The workflows it waits on still come from
+      # the tag's tree, which is what the tag push triggered.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: gate-src
+          sparse-checkout: packaging/aur
+
+      - name: Wait for the tag's package workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse 'HEAD^{commit}')
+          echo "Tag $TAG is at $SHA"
+          SHA="$SHA" WORKFLOW_DIR=.github/workflows \
+            bash gate-src/packaging/aur/await-package-runs.sh
 
       - name: Patch PKGBUILD with pkgver, pkgrel, conflicts, and b2sums
         env:

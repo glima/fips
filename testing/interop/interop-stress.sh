@@ -19,8 +19,13 @@
 #         -> the version under test is unstable even against itself.
 #
 # A sub-100% pass rate under loss is EXPECTED and is not, by itself, a
-# failure. This script exits non-zero ONLY for the interop-regression
-# signal (mixed-only failures).
+# failure. This script exits 1 for the interop-regression signal
+# (mixed-only failures) and 3 when a failed rep's per-node logs could not
+# all be saved, so its diagnostics are incomplete.
+#
+# Every rep runs with FIPS_INTEROP_KEEP_UP=1, because whether a rep failed
+# is known only after the driver exits. The loop saves a failed rep's
+# per-node logs and then tears the mesh down itself.
 #
 # Reps run SERIALLY — interop-test.sh uses fixed container names and a
 # fixed Docker network, so two reps must never overlap.
@@ -52,7 +57,10 @@
 #
 # Artifacts (per invocation): <runs-base>/.stress-runs/<UTC-ts>/
 #   rep-NN/driver.log        full interop-test.sh output for that rep.
-#   rep-NN/docker-<node>.log per-container `docker logs` (FAILED reps only).
+#   rep-NN/docker-<container>.log
+#                            per-container `docker logs` (FAILED reps only).
+#                            A failed rep with fewer of these than nodes
+#                            makes the run exit 3.
 #   summary.txt              the final aggregate report.
 
 set -uo pipefail
@@ -80,6 +88,65 @@ else
 fi
 
 RUNS_BASE="$INTEROP_RUNS_BASE/.stress-runs"
+# The driver's generated mesh (same paths as interop-test.sh), read for the
+# expected container set and used to tear a kept-up rep down.
+GEN_DIR="$INTEROP_RUNS_BASE/generated-configs"
+COMPOSE_FILE="$GEN_DIR/docker-compose.generated.yml"
+NODES_ENV="$GEN_DIR/nodes.env"
+
+# Save every node's `docker logs` into a failed rep's directory.
+#
+# The expected containers come from the generated manifest rather than
+# from `docker ps`: an empty `docker ps` result is how a harvest that saved
+# nothing used to pass without a word. A container counts only when
+# `docker logs` succeeded and wrote a non-empty file. Returns 0 only when
+# every expected container was saved and there was at least one.
+harvest_rep() {
+    local rep_dir="$1" containers tok ctr n=0 k=0
+    local missing=()
+    # A subshell, so the manifest's variables stay out of the loop.
+    # shellcheck disable=SC1090
+    containers="$( [ -f "$NODES_ENV" ] && . "$NODES_ENV" \
+        && printf '%s' "${INTEROP_NODE_CONTAINERS:-}" )" || containers=""
+    for tok in $containers; do
+        ctr="${tok#*:}"
+        n=$((n + 1))
+        if docker logs "$ctr" >"$rep_dir/docker-$ctr.log" 2>&1 \
+            && [ -s "$rep_dir/docker-$ctr.log" ]; then
+            k=$((k + 1))
+        else
+            missing+=("$ctr")
+        fi
+    done
+    echo "       harvest: $k of $n per-node logs written"
+    if [ "$n" -eq 0 ]; then
+        echo "       HARVEST FAILED: no manifest / empty container list ($NODES_ENV)"
+        return 1
+    fi
+    if [ "$k" -lt "$n" ]; then
+        echo "       HARVEST FAILED: $k of $n; missing: ${missing[*]}"
+        return 1
+    fi
+    return 0
+}
+
+# Tear down a rep's kept-up mesh. A failure is loud but not fatal: the
+# next rep's Phase 0 also brings the mesh down before starting.
+teardown_rep() {
+    local rc left
+    docker compose -f "$COMPOSE_FILE" down --volumes --remove-orphans \
+        >/dev/null 2>&1
+    rc=$?
+    MESH_UP=0
+    if [ "$rc" -ne 0 ]; then
+        echo "       WARN: teardown failed ($rc)"
+    fi
+    left="$(docker ps -a --filter 'name=fips-interop-' --format '{{.Names}}' 2>/dev/null)"
+    if [ -n "$left" ]; then
+        echo "       WARN: containers remain after teardown: $(echo "$left" | tr '\n' ' ')"
+    fi
+    return "$rc"
+}
 
 # ── Args ─────────────────────────────────────────────────────────────
 
@@ -171,6 +238,13 @@ RUN_TS="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
 RUN_DIR="$RUNS_BASE/$RUN_TS"
 mkdir -p "$RUN_DIR"
 
+# A rep runs kept up, so an interrupted or aborted loop must still take
+# its mesh down. The INT and TERM traps exit, which runs the EXIT trap.
+MESH_UP=0
+trap '[ "$MESH_UP" -eq 1 ] && teardown_rep' EXIT
+trap 'echo ""; echo "Interrupted"; exit 130' INT
+trap 'echo ""; echo "Terminated"; exit 143' TERM
+
 echo "=============================================================="
 echo " FIPS Interop Netem Stress Loop"
 echo "=============================================================="
@@ -186,6 +260,14 @@ echo ""
 PASS_COUNT=0
 FAIL_COUNT=0
 FAILED_REPS=()
+# Failed reps whose per-node logs were not all saved.
+HARVEST_FAILS=0
+HARVEST_FAILED_REPS=()
+# Phase 5b outcomes over the reps that measured a control window (Phase
+# 1b ran): reps that abstained, and reps that re-measured at least once.
+STREAM_REPS=0
+ABSTAIN_REPS=0
+REMEASURE_REPS=0
 # Per-kind connectivity-failure tallies, summed across all failed reps.
 MIXED_FAILS=0
 SAME_FAILS=0
@@ -199,10 +281,26 @@ for ((rep = 1; rep <= REPS; rep++)); do
     echo "── $rep_id / $REPS ──────────────────────────────────────────"
 
     # Run the driver, capturing full output and exit code. Netem is
-    # passed through the environment; interop-test.sh applies it.
-    FIPS_INTEROP_NETEM="${FIPS_INTEROP_NETEM:-}" \
+    # passed through the environment; interop-test.sh applies it. The
+    # mesh is kept up so a failed rep can be harvested below.
+    MESH_UP=1
+    FIPS_INTEROP_KEEP_UP=1 FIPS_INTEROP_NETEM="${FIPS_INTEROP_NETEM:-}" \
         bash "$DRIVER" "${DRIVER_ARGS[@]}" >"$driver_log" 2>&1
     rc=$?
+
+    # Tallied for every rep whatever its verdict: abstaining is the absence
+    # of a verdict rather than a failure, so without this count a run whose
+    # Phase 5b always abstains would pass unnoticed.
+    if grep -q '^Phase 1b: ' "$driver_log"; then
+        STREAM_REPS=$((STREAM_REPS + 1))
+        if grep -q '^  ABSTAIN  Data-plane continuity' "$driver_log"; then
+            ABSTAIN_REPS=$((ABSTAIN_REPS + 1))
+            echo "  Phase 5b abstained (no clean control window)"
+        fi
+        if grep -q 'control window attempt .*re-measuring' "$driver_log"; then
+            REMEASURE_REPS=$((REMEASURE_REPS + 1))
+        fi
+    fi
 
     if [ "$rc" -eq 0 ]; then
         PASS_COUNT=$((PASS_COUNT + 1))
@@ -212,14 +310,11 @@ for ((rep = 1; rep <= REPS; rep++)); do
         FAILED_REPS+=("$rep_id")
         echo "  FAIL (exit $rc)"
 
-        # Preserve each failed container's full docker logs. The driver
-        # uses fixed container names fips-interop-<nodeid>; harvest every
-        # container matching that prefix that still exists.
-        while read -r ctr; do
-            [ -n "$ctr" ] || continue
-            docker logs "$ctr" >"$rep_dir/docker-${ctr}.log" 2>&1 || true
-        done < <(docker ps -a --filter 'name=fips-interop-' \
-                    --format '{{.Names}}' 2>/dev/null)
+        # Preserve each node's full docker logs before the teardown below.
+        if ! harvest_rep "$rep_dir"; then
+            HARVEST_FAILS=$((HARVEST_FAILS + 1))
+            HARVEST_FAILED_REPS+=("$rep_id")
+        fi
 
         # Tally connectivity failures by pair kind, reusing the
         # pair-attributed lines interop-test.sh prints. Each line is
@@ -230,6 +325,8 @@ for ((rep = 1; rep <= REPS; rep++)); do
         SAME_FAILS=$((SAME_FAILS + s))
         echo "       connectivity-failure lines: mixed=$m same=$s"
     fi
+
+    teardown_rep
 done
 
 echo ""
@@ -285,6 +382,10 @@ else
     VERDICT="NO connectivity-pair failures recorded, but $FAIL_COUNT rep(s) still"
     VERDICT2="failed — on non-connectivity signatures (global-health log patterns or a missing rekey). Check the per-rep driver logs."
 fi
+# A regression keeps precedence; otherwise missing diagnostics fail the run.
+if [ "$EXIT_CODE" -eq 0 ] && [ "$HARVEST_FAILS" -gt 0 ]; then
+    EXIT_CODE=3
+fi
 
 {
     echo "=============================================================="
@@ -302,6 +403,12 @@ fi
     if [ "${#FAILED_REPS[@]}" -gt 0 ]; then
         echo "Failed reps: ${FAILED_REPS[*]}"
     fi
+    if [ "$HARVEST_FAILS" -gt 0 ]; then
+        echo "Harvest    : $HARVEST_FAILS failed rep(s) with incomplete per-node logs: ${HARVEST_FAILED_REPS[*]}"
+    fi
+    if [ "$STREAM_REPS" -gt 0 ]; then
+        echo "Phase 5b   : abstained in $ABSTAIN_REPS of $STREAM_REPS reps; re-measured in $REMEASURE_REPS of $STREAM_REPS reps"
+    fi
     echo ""
     echo "-- Connectivity-failure attribution (summed over failed reps) --"
     echo "  mixed-version : $MIXED_FAILS failure(s) over $MIXED_PAIRS mixed pairs x $REPS reps"
@@ -315,6 +422,9 @@ fi
     if [ "$EXIT_CODE" -eq 0 ]; then
         echo "Exit 0: no interop-regression signal (a sub-100% rate under loss"
         echo "        is expected and is not by itself a failure)."
+    elif [ "$EXIT_CODE" -eq 3 ]; then
+        echo "Exit 3: per-node logs missing for a failed rep; the run's"
+        echo "        diagnostics are incomplete."
     else
         echo "Exit 1: interop-regression signal present."
     fi
